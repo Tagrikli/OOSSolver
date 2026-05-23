@@ -1,20 +1,21 @@
 """Random redistribution of pallets across shelves.
 
-Two-stage algorithm:
+Algorithm:
   1. Distribute every pallet uniformly at random across all shelf slots
      (each pallet starts as empty).
-  2. Place big items: pick `round(big_shelves_total_cap * fullness)` random
-     empty pallets that landed on big shelves and convert them to big. If
-     fewer empties on big shelves than requested, place what we can and
-     stop.
-  3. Place small items: count remaining empties system-wide, take
-     `round(remaining_empties * fullness)` of them at random (any shelf
-     class) and convert to small.
+  2. Pick `round(N * fullness)` pallets uniformly at random without
+     replacement, where N = total pallet count. These get content; the
+     rest stay empty.
+  3. For each chosen pallet, assign content based on its shelf:
+       - small shelf → small item (only legal content)
+       - big shelf   → coin-flip between big and small
 
-This yields a genuinely random depth distribution — big/small/empty are
-interleaved at random heights in each stack rather than being layered (the
-old algorithm placed bigs first into big shelves, then smalls, then empties,
-which produced an "empties-on-top, bigs-on-bottom" artifact).
+Crucially, "fullness" here means "fraction of pallets that are non-empty,"
+independent of big/small ratio. Big shelves can hold smalls — this is what
+makes the buffer-on-target maneuver actually possible at high fullness:
+some smalls naturally land on big shelves, creating both clearing
+opportunities (A in the shaping reward) and slack distinct from empty
+slots.
 
 Carrier loads are cleared as part of the shuffle — the post-shuffle state
 mirrors the natural initial condition (all pallets sitting on shelves, no
@@ -46,9 +47,10 @@ def shuffle_state(
 
     Args:
         facility: target facility — mutated in place.
-        fullness: in [0, 1]. Big items fill `round(big_cap * fullness)` of
-            big-shelf slots; small items then fill `round(rem_empty *
-            fullness)` of the remaining system-wide empties.
+        fullness: in [0, 1]. Fraction of pallets that get non-empty
+            contents. For each filled pallet on a big shelf, content is
+            big-vs-small by a fair coin; pallets on small shelves are
+            always small (only legal content).
         rng: numpy Generator. If None, uses `facility.rng`.
         require_solvable: if True, rejects layouts where some big shelf's
             worst-case (representative) target is genuinely unreachable and
@@ -140,42 +142,26 @@ def _place_pallets(
             Pallet(id=pid, contents="empty")
         )
 
-    # 4. Place big items. Target count = round(big_cap * fullness). Candidate
-    #    pool = every (currently empty) pallet that landed on a big shelf.
-    #    If pool is smaller than target, just convert all candidates.
-    big_shelf_ids = {
-        sid for sid, s in facility.topology.shelves.items()
-        if s.size_class == "big"
-    }
-    big_cap = sum(
-        s.capacity
-        for sid, s in facility.topology.shelves.items()
-        if sid in big_shelf_ids
-    )
-    n_big_target = int(round(big_cap * fullness))
-
-    big_candidates: list[tuple[str, int]] = []  # (shelf_id, depth_index)
-    for sid in big_shelf_ids:
-        for i, p in enumerate(facility.state.shelves[sid].stack):
-            if p.is_empty:
-                big_candidates.append((sid, i))
-    rng.shuffle(big_candidates)
-    for sid, idx in big_candidates[:n_big_target]:
-        old = facility.state.shelves[sid].stack[idx]
-        facility.state.shelves[sid].stack[idx] = Pallet(id=old.id, contents="big")
-
-    # 5. Place small items. Target count = round(remaining_empty * fullness).
-    #    Pool = every still-empty pallet across the system (any shelf class).
-    remaining_empties: list[tuple[str, int]] = []
+    # 4. Pick `round(N * fullness)` pallet positions uniformly at random
+    #    without replacement, then assign content per the shelf's size class.
+    #    Pallets on small shelves only support smalls; big-shelf pallets get
+    #    a fair coin flip between big and small. This lets smalls organically
+    #    appear on big shelves at high fullness — the slack that makes the
+    #    buffer-on-target maneuver possible.
+    all_positions: list[tuple[str, int]] = []
     for sid, ss in facility.state.shelves.items():
-        for i, p in enumerate(ss.stack):
-            if p.is_empty:
-                remaining_empties.append((sid, i))
-    n_small_target = int(round(len(remaining_empties) * fullness))
-    rng.shuffle(remaining_empties)
-    for sid, idx in remaining_empties[:n_small_target]:
+        for i in range(len(ss.stack)):
+            all_positions.append((sid, i))
+    n_to_fill = int(round(len(all_positions) * fullness))
+    rng.shuffle(all_positions)
+    for sid, idx in all_positions[:n_to_fill]:
+        size_class = facility.topology.shelves[sid].size_class
+        if size_class == "small":
+            contents = "small"
+        else:  # big shelf — fair coin flip
+            contents = "big" if rng.random() < 0.5 else "small"
         old = facility.state.shelves[sid].stack[idx]
-        facility.state.shelves[sid].stack[idx] = Pallet(id=old.id, contents="small")
+        facility.state.shelves[sid].stack[idx] = Pallet(id=old.id, contents=contents)
 
 
 # ---------------------------------------------------------------------------
