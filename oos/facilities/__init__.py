@@ -2,6 +2,7 @@
 
 from typing import Callable
 
+from oos.facilities.big_retr import make_facility as make_big_retr_facility
 from oos.facilities.dev import make_facility as make_dev_facility
 from oos.facilities.dibaji import make_facility as make_dibaji_facility
 from oos.facilities.medipol import make_facility as make_medipol_facility
@@ -15,6 +16,7 @@ FacilityFactory = Callable[[], tuple[Topology, SeedingConfig]]
 FACILITIES: dict[str, FacilityFactory] = {
     "dev": make_dev_facility,
     "tiny": make_tiny_facility,
+    "big_retr": make_big_retr_facility,
     "dibaji": make_dibaji_facility,
     "medipol": make_medipol_facility,
     # Each call returns a fresh layout (wall-clock-seeded). The viz can
