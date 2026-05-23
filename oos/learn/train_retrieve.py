@@ -82,75 +82,16 @@ def _reward_config(args: argparse.Namespace) -> RewardConfig:
     )
 
 
-@dataclasses.dataclass(frozen=True)
-class CurriculumPhase:
-    """One step of the manual easy→hard schedule.
-
-    Scope progresses room-owning → non-room-owning → all, with depth ramping
-    0..N inside each scope. Fullness window can be narrower on easy phases.
-    """
-    name: str
-    target_scope: TargetScope
-    max_depth: int | None
-    fullness_min: float
-    fullness_max: float
-
-
-# Scope+depth curriculum (default for multi-room facilities like medipol).
-# Trains room-owning shelves first (no handoff), then non-room (handoff
-# required), then the union — each scope ramping depth 0 → 4.
-SCOPE_DEPTH_CURRICULUM: tuple[CurriculumPhase, ...] = (
-    CurriculumPhase("rs_d0",  "room_owning",      0,    0.3, 0.5),
-    CurriculumPhase("rs_d1",  "room_owning",      1,    0.3, 0.6),
-    CurriculumPhase("rs_d2",  "room_owning",      2,    0.4, 0.7),
-    CurriculumPhase("rs_d3",  "room_owning",      3,    0.4, 0.8),
-    CurriculumPhase("rs_d4",  "room_owning",      4,    0.5, 0.9),
-    CurriculumPhase("nr_d0",  "non_room_owning",  0,    0.3, 0.5),
-    CurriculumPhase("nr_d1",  "non_room_owning",  1,    0.3, 0.6),
-    CurriculumPhase("nr_d2",  "non_room_owning",  2,    0.4, 0.7),
-    CurriculumPhase("nr_d3",  "non_room_owning",  3,    0.4, 0.8),
-    CurriculumPhase("nr_d4",  "non_room_owning",  4,    0.5, 0.9),
-    CurriculumPhase("any",    "all",              None, 0.5, 1.0),
-)
-
-# Depth-only curriculum for facilities where the scope split doesn't apply
-# (e.g. dibaji — single carrier, all shelves room-owning). Just ramps depth
-# from 0 to "any" without filtering by carrier kind.
-DEPTH_ONLY_CURRICULUM: tuple[CurriculumPhase, ...] = (
-    CurriculumPhase("d0",   "all",  0,    0.3, 0.5),
-    CurriculumPhase("d1",   "all",  1,    0.3, 0.6),
-    CurriculumPhase("d2",   "all",  2,    0.4, 0.7),
-    CurriculumPhase("d3",   "all",  3,    0.4, 0.8),
-    CurriculumPhase("d4",   "all",  4,    0.5, 0.9),
-    CurriculumPhase("any",  "all",  None, 0.5, 1.0),
-)
-
-CURRICULUM_PRESETS: dict[str, tuple[CurriculumPhase, ...]] = {
-    "scope_depth": SCOPE_DEPTH_CURRICULUM,
-    "depth_only":  DEPTH_ONLY_CURRICULUM,
-}
-
-# Back-compat alias for code that imported the old name.
-DEFAULT_CURRICULUM = SCOPE_DEPTH_CURRICULUM
-
-
 def _retrieve_config(
     args: argparse.Namespace, fullness: float,
-    phase: CurriculumPhase | None = None,
 ) -> RetrieveOnlyConfig:
-    """Build a RetrieveOnlyConfig with the per-iteration sampled fullness.
-
-    When `phase` is provided, its scope/max_depth override the static args
-    (used by the curriculum controller).
-    """
-    scope: TargetScope = phase.target_scope if phase is not None else "all"
-    max_depth = phase.max_depth if phase is not None else None
+    """Build a RetrieveOnlyConfig with the per-iteration sampled fullness."""
     return RetrieveOnlyConfig(
         fullness=fullness,
         failure_penalty=args.failure_penalty,
         target_deepest=args.target_deepest,
-        max_depth=max_depth,
-        target_scope=scope,
+        max_depth=None,
+        target_scope="all",
         require_solvable=args.require_solvable,
         idle_while_pending_penalty=args.idle_while_pending_penalty,
         useless_take_give_penalty=args.useless_take_give_penalty,
@@ -159,12 +100,11 @@ def _retrieve_config(
 
 def _build_env(
     args: argparse.Namespace, fullness: float,
-    phase: "CurriculumPhase | None" = None,
 ) -> RetrieveOnlyEnv:
     """Single-env mode: build a RetrieveOnlyEnv on the chosen named facility."""
     return RetrieveOnlyEnv(
         facility_factory=get_facility(args.facility),
-        retrieve_only_config=_retrieve_config(args, fullness, phase),
+        retrieve_only_config=_retrieve_config(args, fullness),
         experiment_config=_experiment_config(args),
         reward_config=_reward_config(args),
     )
@@ -249,40 +189,14 @@ def main() -> None:
                         "the noise of unsolvable episodes from training.")
     p.add_argument("--no-require-solvable", dest="require_solvable",
                    action="store_false")
-    # Curriculum (manual easy→hard schedule). When on, the configured phase
-    # overrides --fullness-min/--fullness-max and target scope/depth caps.
-    p.add_argument("--curriculum", dest="curriculum",
-                   action="store_true", default=True,
-                   help="Enable the manual phase curriculum (default on).")
-    p.add_argument("--no-curriculum", dest="curriculum", action="store_false")
-    p.add_argument("--curriculum-advance-threshold", type=float, default=0.80,
-                   help="Windowed success rate that triggers phase advancement. "
-                        "Higher = stricter mastery before graduating.")
-    p.add_argument("--curriculum-window", type=int, default=5,
-                   help="Number of recent iterations averaged for the "
-                        "advancement decision. Smaller = more responsive but "
-                        "noisier; larger = smoother but slower to react.")
-    p.add_argument("--curriculum-min-iters-per-phase", type=int, default=3,
-                   help="Hold each phase at least this many iterations "
-                        "before considering advancement (hysteresis).")
-    p.add_argument("--curriculum-start-phase", type=int, default=0,
-                   help="0-indexed phase to start from. Useful when resuming "
-                        "into a later phase manually.")
-    p.add_argument("--curriculum-preset", type=str, default="scope_depth",
-                   choices=sorted(CURRICULUM_PRESETS.keys()),
-                   help="Which phase schedule to use. 'scope_depth' (default) "
-                        "ramps both target scope (room-owning → non-room → "
-                        "all) and depth — best for multi-room facilities like "
-                        "medipol. 'depth_only' ramps depth only — use for "
-                        "single-carrier / single-room facilities like dibaji "
-                        "where the scope split is meaningless.")
-    # TSCL (Teacher-Student Curriculum Learning). When `--tscl` is on, the
-    # phase machinery is overridden — the bandit picks (fullness_bin, max_depth)
-    # per iteration based on per-arm absolute learning progress (|ALP|).
-    # See oos.learn.tscl for the algorithm.
+    # TSCL (Teacher-Student Curriculum Learning). The bandit picks
+    # (fullness_bin, max_depth, shelf_size) per iteration based on per-arm
+    # absolute learning progress (|ALP|). See oos.learn.tscl for the algorithm.
     p.add_argument("--tscl", action="store_true",
                    help="Use TSCL bandit to pick (fullness, max_depth) per "
-                        "iteration. Overrides --curriculum / phase logic.")
+                        "iteration. When off, fullness is sampled uniformly "
+                        "from [--fullness-min, --fullness-max] with no scope/"
+                        "depth filtering.")
     p.add_argument("--tscl-fullness-min", type=float, default=0.3,
                    help="Lower bound of the fullness axis (inclusive).")
     p.add_argument("--tscl-fullness-max", type=float, default=1.0,
@@ -403,12 +317,8 @@ def main() -> None:
     np.random.seed(args.seed)
     device = torch.device(args.device)
 
-    # Curriculum state. When enabled, current_phase overrides the static
-    # fullness bounds and supplies target_scope/max_depth filters. Advancement
-    # is decided after each iteration based on a windowed success rate.
-    # TSCL is mutually exclusive with the phase curriculum: when on, the
-    # bandit owns task-parameter selection entirely. Build the teacher up
-    # front; phase machinery is then short-circuited below.
+    # TSCL teacher: when on, the bandit owns per-iteration task-parameter
+    # selection (fullness bin, exact depth, shelf-size class).
     tscl_teacher: TSCLTeacher | None = None
     if args.tscl:
         depths = tuple(
@@ -437,45 +347,14 @@ def main() -> None:
             f"window={args.tscl_window} temp={args.tscl_temperature} "
             f"eps={args.tscl_eps} diff_w={args.tscl_difficulty_weight}"
         )
-        if args.curriculum:
-            print("[train_retrieve] (TSCL overrides phase curriculum)")
-
-    curriculum_schedule = CURRICULUM_PRESETS[args.curriculum_preset]
-    if args.curriculum and tscl_teacher is None:
-        if not (0 <= args.curriculum_start_phase < len(curriculum_schedule)):
-            raise ValueError(
-                f"--curriculum-start-phase must be in [0, "
-                f"{len(curriculum_schedule)-1}]"
-            )
-        cur_phase_idx = args.curriculum_start_phase
-        cur_phase: CurriculumPhase | None = curriculum_schedule[cur_phase_idx]
-        iters_in_phase = 0
-        recent_succ_window: list[float] = []
-        print(
-            f"[train_retrieve] curriculum ON  preset={args.curriculum_preset} "
-            f"start={cur_phase.name} "
-            f"(phase {cur_phase_idx+1}/{len(curriculum_schedule)}) "
-            f"advance@succ≥{args.curriculum_advance_threshold:.2f} "
-            f"window={args.curriculum_window}"
-        )
-    else:
-        cur_phase_idx = -1
-        cur_phase = None
-        iters_in_phase = 0
-        recent_succ_window = []
 
     fullness_rng = np.random.default_rng(args.seed)
 
     def _sample_fullness() -> float:
-        lo, hi = (
-            (cur_phase.fullness_min, cur_phase.fullness_max)
-            if cur_phase is not None
-            else (args.fullness_min, args.fullness_max)
-        )
-        return float(fullness_rng.uniform(lo, hi))
+        return float(fullness_rng.uniform(args.fullness_min, args.fullness_max))
 
     initial_fullness = _sample_fullness()
-    env = _build_env(args, initial_fullness, cur_phase)
+    env = _build_env(args, initial_fullness)
     topo, _ = get_facility(args.facility)()
     collator = GraphCollator(topo)
     n_max = env.action_space.n
@@ -526,7 +405,7 @@ def main() -> None:
             reward_config=_reward_config(args),
             base_seed=args.seed,
             facility_name=args.facility,
-            retrieve_only_config=_retrieve_config(args, initial_fullness, cur_phase),
+            retrieve_only_config=_retrieve_config(args, initial_fullness),
         )
         print(f"[train_retrieve] vec_env started with {args.n_envs} workers")
     else:
@@ -573,7 +452,7 @@ def main() -> None:
         if vec_env is not None:
             vec_env.close()
         if env is None:
-            env = _build_env(args, _sample_fullness(), cur_phase)
+            env = _build_env(args, _sample_fullness())
         print(
             f"[eval] running {args.eval_episodes} episodes "
             f"({'argmax' if args.eval_deterministic else 'sampled'}) on "
@@ -589,7 +468,7 @@ def main() -> None:
         t_eval = time.time()
         while n_total < args.eval_episodes:
             # Re-sample fullness per episode just like training does.
-            env._retrieve_cfg = _retrieve_config(args, _sample_fullness(), cur_phase)
+            env._retrieve_cfg = _retrieve_config(args, _sample_fullness())
             obs, info = env.reset(seed=args.seed + n_total)
             ep_return = 0.0
             ep_len = 0
@@ -668,7 +547,7 @@ def main() -> None:
             )
         else:
             cur_fullness = _sample_fullness()
-            cur_roc = _retrieve_config(args, cur_fullness, cur_phase)
+            cur_roc = _retrieve_config(args, cur_fullness)
 
         if use_vec:
             vec_env.set_retrieve_config(cur_roc)
@@ -793,47 +672,6 @@ def main() -> None:
                 f" tscl=arm{tscl_arm_idx:02d}({arm.label()})"
             )
 
-        # Curriculum advancement: gate on a windowed success rate. Hysteresis
-        # ensures every phase gets at least N iterations of training data
-        # before the controller decides to graduate.
-        phase_str = ""
-        if cur_phase is not None:
-            if tb_log_this_iter:
-                writer.add_scalar("curriculum/phase_idx", cur_phase_idx, total_env_steps)
-                writer.add_scalar(
-                    "curriculum/max_depth",
-                    -1 if cur_phase.max_depth is None else cur_phase.max_depth,
-                    total_env_steps,
-                )
-            iters_in_phase += 1
-            if ep_returns_all:
-                recent_succ_window.append(success_rate)
-                recent_succ_window = recent_succ_window[-args.curriculum_window:]
-            window_ready = len(recent_succ_window) >= args.curriculum_window
-            window_mean = (
-                float(np.mean(recent_succ_window)) if recent_succ_window else 0.0
-            )
-            if tb_log_this_iter:
-                writer.add_scalar("curriculum/window_succ", window_mean, total_env_steps)
-            can_advance = (
-                window_ready
-                and iters_in_phase >= args.curriculum_min_iters_per_phase
-                and window_mean >= args.curriculum_advance_threshold
-                and cur_phase_idx + 1 < len(curriculum_schedule)
-            )
-            if can_advance:
-                prev_name = cur_phase.name
-                cur_phase_idx += 1
-                cur_phase = curriculum_schedule[cur_phase_idx]
-                iters_in_phase = 0
-                recent_succ_window = []
-                print(
-                    f"           ↳ curriculum advance: {prev_name} → "
-                    f"{cur_phase.name} (phase {cur_phase_idx+1}/"
-                    f"{len(curriculum_schedule)}, window succ={window_mean:.2f})"
-                )
-            phase_str = f" phase={cur_phase.name}"
-
         wall = time.time() - t0
         succ_str = (
             f" succ={success_rate*100:5.1f}%" if ep_returns_all else ""
@@ -848,7 +686,7 @@ def main() -> None:
             f"pi_loss={metrics.policy_loss:+.3f} v_loss={metrics.value_loss:.2f} "
             f"ent={metrics.entropy:.3f} kl={metrics.approx_kl:+.4f} "
             f"clipfrac={metrics.clip_fraction:.2f} ev={metrics.explained_variance:+.2f}"
-            f"{tscl_str}{phase_str}{layout_str} "
+            f"{tscl_str}{layout_str} "
             f"({collect_secs:.1f}s+{update_secs:.1f}s, wall={wall:.0f}s)"
         )
 
@@ -874,9 +712,9 @@ def main() -> None:
         #     samples). Robust to which arm the bandit happened to sample
         #     recently; rises only when the policy genuinely improves on
         #     its hardest currently-tracked arm.
-        #   - TSCL off → windowed mean across recent iters (the original
-        #     metric). With a fixed phase curriculum this is comparable
-        #     across iterations.
+        #   - TSCL off → windowed mean across recent iters. Noisier than the
+        #     worst-arm signal but the only thing available without per-arm
+        #     bookkeeping.
         candidate_metric: float | None = None
         metric_label = ""
         if tscl_teacher is not None:
