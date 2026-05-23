@@ -95,6 +95,7 @@ def _retrieve_config(
         require_solvable=args.require_solvable,
         idle_while_pending_penalty=args.idle_while_pending_penalty,
         useless_take_give_penalty=args.useless_take_give_penalty,
+        big_shelf_clearing_weight=args.big_shelf_clearing_weight,
         disable_wait=args.disable_wait,
     )
 
@@ -179,6 +180,13 @@ def main() -> None:
                    help="Penalty per (take from shelf S → give to shelf S) "
                         "cycle on the same carrier. Opt-in (default 0); "
                         "discourages no-op shuffles.")
+    p.add_argument("--big-shelf-clearing-weight", type=float, default=0.0,
+                   help="Reward for clearing small/empty items out of OTHER "
+                        "big shelves when the target lives on a big shelf "
+                        "and the other-bigs lack capacity for its blockers. "
+                        "Amount = w * (A_before - A_after) where A = small+"
+                        "empty count in non-target big shelves; fires only "
+                        "when B > C (blockers > free slots). 0 disables.")
     p.add_argument("--disable-wait", action="store_true",
                    help="Mask out the WAIT action so the policy literally "
                         "can't pick it. Use when the agent has fallen into "
@@ -551,6 +559,7 @@ def main() -> None:
                 require_solvable=args.require_solvable,
                 idle_while_pending_penalty=args.idle_while_pending_penalty,
                 useless_take_give_penalty=args.useless_take_give_penalty,
+                big_shelf_clearing_weight=args.big_shelf_clearing_weight,
                 disable_wait=args.disable_wait,
             )
         else:

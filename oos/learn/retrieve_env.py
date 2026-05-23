@@ -85,6 +85,23 @@ class RetrieveOnlyConfig:
     # Penalty per (take from shelf S → give to shelf S) cycle on the same
     # carrier without an intervening useful move. Opt-in (default 0).
     useless_take_give_penalty: float = 0.0
+    # When the target lives on a big shelf and there isn't enough capacity
+    # in OTHER big shelves to hold its big blockers, the agent must first
+    # free space on other big shelves. The natural way to free space is to
+    # remove items that don't belong there: small items (which fit on small
+    # shelves too) and empty pallets (which occupy a slot for no reason).
+    #
+    # Let:
+    #   A = count of (small items + empty pallets) sitting in big shelves
+    #       other than the target's shelf
+    #   B = count of big blockers above the target on the target's shelf
+    #   C = empty slots (capacity slack) in big shelves other than the target's
+    #
+    # Reward fires when B > C (capacity-constrained) AND A decreased over
+    # the step (agent freed a slot). Amount = weight * (A_before - A_after).
+    # When B <= C the shelf situation is already feasible without this
+    # maneuver, so we don't shape it. 0.0 disables.
+    big_shelf_clearing_weight: float = 0.0
     # Hard-disable the WAIT action by zeroing it in the action mask. When on,
     # the policy literally cannot choose WAIT — forces the agent to take a
     # real action every decision instant. Useful when WAIT has become a sink
@@ -215,12 +232,39 @@ class RetrieveOnlyEnv(OOSEnv):
                     useless_tg_penalty = -cfg.useless_take_give_penalty
                 self._last_take_shelf.pop(querying_carrier, None)
 
+        # Big-shelf-clearing precheck: snapshot (A, B, C) *before* the step so
+        # we can compute A's change after and decide whether to fire shaping.
+        abc_before = (
+            self._compute_big_shelf_abc()
+            if cfg.big_shelf_clearing_weight != 0.0
+            else None
+        )
+
         # ---- step ----
         obs, reward, terminated, truncated, info = super().step(action)
         facility = self._ctx.facility  # type: ignore[union-attr]
         self._apply_action_mask_overrides(obs, info)
 
-        reward = float(reward) + idle_pending_penalty + useless_tg_penalty
+        big_shelf_clearing_reward = 0.0
+        if abc_before is not None:
+            a_before, b_before, c_before = abc_before
+            abc_after = self._compute_big_shelf_abc()
+            # Fire only when (a) we're still in the capacity-constrained regime
+            # B > C as of pre-step, and (b) the action actually freed slots
+            # (A_after < A_before). Use a_before's value relative to a_after; if
+            # the target left the shelf mid-step (abc_after is None), use 0.
+            a_after = abc_after[0] if abc_after is not None else 0
+            if b_before > c_before and a_after < a_before:
+                big_shelf_clearing_reward = (
+                    cfg.big_shelf_clearing_weight * (a_before - a_after)
+                )
+
+        reward = (
+            float(reward)
+            + idle_pending_penalty
+            + useless_tg_penalty
+            + big_shelf_clearing_reward
+        )
 
         # Early termination: the target retrieve was just served → queue
         # contains no Retrieve tasks → episode is done with success.
@@ -240,8 +284,61 @@ class RetrieveOnlyEnv(OOSEnv):
         # Expose the shaping signals on info so the user can audit them.
         info["shaping/idle_pending"] = idle_pending_penalty
         info["shaping/useless_take_give"] = useless_tg_penalty
+        info["shaping/big_shelf_clearing"] = big_shelf_clearing_reward
 
         return obs, float(reward), terminated, truncated, info
+
+    def _compute_big_shelf_abc(self) -> "tuple[int, int, int] | None":
+        """Compute (A, B, C) for the big-shelf-clearing shaping signal.
+
+        Returns None if the target isn't on a big shelf (signal doesn't apply).
+        """
+        if self._target_pallet_id is None:
+            return None
+        facility = self._ctx.facility  # type: ignore[union-attr]
+        topo = facility.topology
+        state = facility.state
+
+        # Find the shelf hosting the target and the target's index in the stack.
+        target_shelf_id: str | None = None
+        target_index: int = -1
+        for sid, sh in state.shelves.items():
+            for i, p in enumerate(sh.stack):
+                if p.id == self._target_pallet_id:
+                    target_shelf_id = sid
+                    target_index = i
+                    break
+            if target_shelf_id is not None:
+                break
+        # If the target isn't on a shelf right now (e.g. already on a carrier),
+        # the shaping is N/A.
+        if target_shelf_id is None:
+            return None
+        # Signal only applies when target lives on a big shelf.
+        if topo.shelves[target_shelf_id].size_class != "big":
+            return None
+
+        # B = big pallets above the target on its shelf. "Above" = higher index
+        # in the stack list (list[-1] is the top).
+        target_stack = state.shelves[target_shelf_id].stack
+        b = sum(
+            1 for p in target_stack[target_index + 1:]
+            if p.contents == "big"
+        )
+
+        # A and C aggregate over OTHER big shelves.
+        a = 0
+        c = 0
+        for sid, sh in state.shelves.items():
+            if sid == target_shelf_id:
+                continue
+            if topo.shelves[sid].size_class != "big":
+                continue
+            for p in sh.stack:
+                if p.contents in ("small", "empty"):
+                    a += 1
+            c += topo.shelves[sid].capacity - len(sh.stack)
+        return a, b, c
 
     def _apply_action_mask_overrides(self, obs: dict, info: dict) -> None:
         """Zero positions in obs['action_mask'] for actions disabled by config.
