@@ -41,6 +41,7 @@ def shuffle_state(
     rng: np.random.Generator | None = None,
     require_solvable: bool = False,
     max_solvable_retries: int = 200,
+    prioritize_big: bool = False,
 ) -> None:
     """Redistribute every pallet in `facility` to a random shelf slot with
     random contents.
@@ -60,6 +61,12 @@ def shuffle_state(
         max_solvable_retries: safety bound on the rejection loop. After this
             many tries we accept the last layout even if unsolvable (so
             training doesn't spin forever on a pathological config).
+        prioritize_big: if True, fill big-shelf slots first when
+            distributing pallets to slots (within size class, slot order is
+            still random). Concentrates the available pallets onto big
+            shelves first; small shelves only get pallets if big-shelf
+            slots run out. Useful for forcing dense big-shelf scenarios
+            without raising fullness.
 
     The total number of pallets is conserved; only their distribution and
     contents change.
@@ -88,7 +95,7 @@ def shuffle_state(
     attempts = 0
     while True:
         attempts += 1
-        _place_pallets(facility, pallet_ids, fullness, rng)
+        _place_pallets(facility, pallet_ids, fullness, rng, prioritize_big)
         if not require_solvable:
             return
         if _layout_is_solvable(facility):
@@ -104,6 +111,7 @@ def _place_pallets(
     pallet_ids: list[int],
     fullness: float,
     rng: np.random.Generator,
+    prioritize_big: bool = False,
 ) -> None:
     """One attempt at the two-stage random placement (steps 2..5).
 
@@ -128,13 +136,23 @@ def _place_pallets(
     if facility.auto_arrivals_enabled:
         facility._schedule_next_arrival()
 
-    # 3. Distribute pallets uniformly across all available shelf slots, all
-    #    starting as empty. `all_slots` is a multiset: each shelf id appears
-    #    `capacity` times; shuffled and truncated to the pallet count.
-    all_slots: list[str] = []
+    # 3. Distribute pallets to shelf slots, all starting as empty.
+    #    Uniform mode: build one multiset of all (shelf_id × capacity) slots
+    #    and shuffle. Prioritize-big mode: build big-shelf slots and small-
+    #    shelf slots as two separate buckets, shuffle each, then concatenate
+    #    big-first so the first N pallets land on big shelves preferentially.
+    big_slots: list[str] = []
+    small_slots: list[str] = []
     for sid, s in facility.topology.shelves.items():
-        all_slots.extend([sid] * s.capacity)
-    rng.shuffle(all_slots)
+        bucket = big_slots if s.size_class == "big" else small_slots
+        bucket.extend([sid] * s.capacity)
+    if prioritize_big:
+        rng.shuffle(big_slots)
+        rng.shuffle(small_slots)
+        all_slots = big_slots + small_slots
+    else:
+        all_slots = big_slots + small_slots
+        rng.shuffle(all_slots)
     ids = list(pallet_ids)
     rng.shuffle(ids)
     for pid, target_sid in zip(ids, all_slots):

@@ -75,6 +75,11 @@ class RetrieveOnlyConfig:
     # (no feasible dig sequence exists given size constraints) and re-roll
     # until a solvable one appears. See `_layout_is_solvable` in shuffle.py.
     require_solvable: bool = False
+    # If True, the shuffler fills big-shelf slots first when distributing
+    # pallets. Concentrates layouts onto big shelves at moderate fullness —
+    # makes buffer-on-target scenarios more likely without cranking fullness
+    # to 1.0. Off by default. See `shuffle_state(prioritize_big=)`.
+    prioritize_big: bool = False
     # Extra shaping signals applied on top of the base reward (see
     # `compute_reward` in oos/env/reward.py).
     #
@@ -180,6 +185,7 @@ class RetrieveOnlyEnv(OOSEnv):
                 fullness=self._retrieve_cfg.fullness,
                 rng=rng,
                 require_solvable=self._retrieve_cfg.require_solvable,
+                prioritize_big=self._retrieve_cfg.prioritize_big,
             )
             target_id = self._pick_target_pallet(rng)
         self._target_pallet_id = target_id
@@ -365,6 +371,12 @@ class RetrieveOnlyEnv(OOSEnv):
             shelf the querying carrier just took from. That's always a
             useless cycle, so it's hard-illegal rather than a soft penalty.
 
+        Safety: if applying the overrides would leave the mask with zero
+        legal actions, we abort and keep the original mask. An all-zero
+        mask crashes downstream (softmax over -inf logits → NaN), and
+        forcing the agent to pick a "useless" action on a borderline
+        state is strictly better than crashing the rollout.
+
         Entries stay in `decoder.entries` at their original indices so
         action decoding still works; the policy just never picks them
         because the mask forces logit=-inf at those positions.
@@ -378,6 +390,9 @@ class RetrieveOnlyEnv(OOSEnv):
         last_take = (
             self._last_take_shelf.get(qc) if qc is not None else None
         )
+
+        # Compute the would-be mask in-place on a copy so we can roll back.
+        original = mask.copy()
         for i, e in enumerate(entries):
             if disable_wait and e.type == ActionType.WAIT:
                 mask[i] = 0
@@ -387,6 +402,10 @@ class RetrieveOnlyEnv(OOSEnv):
                 and e.target == last_take
             ):
                 mask[i] = 0
+        if int(mask.sum()) == 0:
+            # Overrides would mask everything; restore the original mask so
+            # the policy has at least one legal action to pick.
+            mask[:] = original
 
     # ------------------------------------------------------------------
     # Shaping-signal helpers

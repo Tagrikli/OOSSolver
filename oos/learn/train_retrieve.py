@@ -97,6 +97,7 @@ def _retrieve_config(
         big_shelf_clearing_weight=args.big_shelf_clearing_weight,
         big_shelf_clearing_depth_weight=args.big_shelf_clearing_depth_weight,
         disable_wait=args.disable_wait,
+        prioritize_big=args.prioritize_big,
     )
 
 
@@ -207,6 +208,11 @@ def main() -> None:
                         "the noise of unsolvable episodes from training.")
     p.add_argument("--no-require-solvable", dest="require_solvable",
                    action="store_false")
+    p.add_argument("--prioritize-big", action="store_true",
+                   help="When shuffling, fill big-shelf slots before small-"
+                        "shelf slots. Concentrates pallets onto big shelves "
+                        "so buffer-on-target scenarios arise at lower "
+                        "fullness. Off by default.")
     # TSCL (Teacher-Student Curriculum Learning). The bandit picks
     # (fullness_bin, max_depth, shelf_size) per iteration based on per-arm
     # absolute learning progress (|ALP|). See oos.learn.tscl for the algorithm.
@@ -564,6 +570,7 @@ def main() -> None:
                 big_shelf_clearing_weight=args.big_shelf_clearing_weight,
                 big_shelf_clearing_depth_weight=args.big_shelf_clearing_depth_weight,
                 disable_wait=args.disable_wait,
+                prioritize_big=args.prioritize_big,
             )
         else:
             cur_fullness = _sample_fullness()
