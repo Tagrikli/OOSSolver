@@ -354,6 +354,11 @@ def main() -> None:
     p.add_argument("--run-name", type=str, default=None)
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--ckpt-every", type=int, default=50)
+    p.add_argument("--tb-log-every", type=int, default=5,
+                   help="Iterations between TensorBoard scalar dumps. TB "
+                        "fsync dominates wall-clock at log_every=1; raise "
+                        "this when training is fast or you don't need "
+                        "per-iter granularity. Last iter always logs.")
     p.add_argument("--device", type=str, default="cpu")
     # Parallelism.
     p.add_argument("--n-envs", type=int, default=1)
@@ -726,26 +731,31 @@ def main() -> None:
         mean_reward = float(np.mean(rewards_all)) if rewards_all else 0.0
         mean_value = float(np.mean(values_all)) if values_all else 0.0
 
-        writer.add_scalar("rollout/mean_reward", mean_reward, total_env_steps)
-        writer.add_scalar("rollout/mean_value", mean_value, total_env_steps)
-        if ep_returns_all:
-            writer.add_scalar("episode/mean_return", mean_ret, total_env_steps)
-            writer.add_scalar("episode/mean_length", mean_len, total_env_steps)
-            writer.add_scalar("episode/mean_completions", mean_comp, total_env_steps)
-            writer.add_scalar("episode/n_completed", len(ep_returns_all), total_env_steps)
-            writer.add_scalar("retrieve/success_rate", success_rate, total_env_steps)
-        writer.add_scalar("ppo/policy_loss", metrics.policy_loss, total_env_steps)
-        writer.add_scalar("ppo/value_loss", metrics.value_loss, total_env_steps)
-        writer.add_scalar("ppo/entropy", metrics.entropy, total_env_steps)
-        writer.add_scalar("ppo/approx_kl", metrics.approx_kl, total_env_steps)
-        writer.add_scalar("ppo/clip_fraction", metrics.clip_fraction, total_env_steps)
-        writer.add_scalar("ppo/explained_variance", metrics.explained_variance, total_env_steps)
-        writer.add_scalar("time/collect_secs", collect_secs, total_env_steps)
-        writer.add_scalar("time/update_secs", update_secs, total_env_steps)
-        writer.add_scalar("layout/fullness", cur_fullness, total_env_steps)
-        writer.add_scalar("layout/n_carriers", len(collator.carrier_ids), total_env_steps)
-        writer.add_scalar("layout/n_shelves", len(collator.shelf_ids), total_env_steps)
-        writer.add_scalar("layout/n_rooms", len(collator.room_ids), total_env_steps)
+        tb_log_this_iter = (
+            it % max(1, args.tb_log_every) == 0
+            or it == args.total_iterations - 1
+        )
+        if tb_log_this_iter:
+            writer.add_scalar("rollout/mean_reward", mean_reward, total_env_steps)
+            writer.add_scalar("rollout/mean_value", mean_value, total_env_steps)
+            if ep_returns_all:
+                writer.add_scalar("episode/mean_return", mean_ret, total_env_steps)
+                writer.add_scalar("episode/mean_length", mean_len, total_env_steps)
+                writer.add_scalar("episode/mean_completions", mean_comp, total_env_steps)
+                writer.add_scalar("episode/n_completed", len(ep_returns_all), total_env_steps)
+                writer.add_scalar("retrieve/success_rate", success_rate, total_env_steps)
+            writer.add_scalar("ppo/policy_loss", metrics.policy_loss, total_env_steps)
+            writer.add_scalar("ppo/value_loss", metrics.value_loss, total_env_steps)
+            writer.add_scalar("ppo/entropy", metrics.entropy, total_env_steps)
+            writer.add_scalar("ppo/approx_kl", metrics.approx_kl, total_env_steps)
+            writer.add_scalar("ppo/clip_fraction", metrics.clip_fraction, total_env_steps)
+            writer.add_scalar("ppo/explained_variance", metrics.explained_variance, total_env_steps)
+            writer.add_scalar("time/collect_secs", collect_secs, total_env_steps)
+            writer.add_scalar("time/update_secs", update_secs, total_env_steps)
+            writer.add_scalar("layout/fullness", cur_fullness, total_env_steps)
+            writer.add_scalar("layout/n_carriers", len(collator.carrier_ids), total_env_steps)
+            writer.add_scalar("layout/n_shelves", len(collator.shelf_ids), total_env_steps)
+            writer.add_scalar("layout/n_rooms", len(collator.room_ids), total_env_steps)
 
         # TSCL post-iter book-keeping. Record this iter's success rate as
         # the picked arm's reward, then optionally dump per-arm stats to TB.
@@ -754,12 +764,13 @@ def main() -> None:
             if ep_returns_all:
                 tscl_teacher.record(tscl_arm_idx, success_rate)
             arm = tscl_teacher.arms[tscl_arm_idx]
-            writer.add_scalar("tscl/picked_arm", tscl_arm_idx, total_env_steps)
-            writer.add_scalar("tscl/picked_fullness", cur_fullness, total_env_steps)
-            writer.add_scalar("tscl/picked_max_depth", arm.max_depth, total_env_steps)
-            writer.add_scalar(
-                "tscl/picked_alp", tscl_teacher.alp(tscl_arm_idx), total_env_steps,
-            )
+            if tb_log_this_iter:
+                writer.add_scalar("tscl/picked_arm", tscl_arm_idx, total_env_steps)
+                writer.add_scalar("tscl/picked_fullness", cur_fullness, total_env_steps)
+                writer.add_scalar("tscl/picked_max_depth", arm.max_depth, total_env_steps)
+                writer.add_scalar(
+                    "tscl/picked_alp", tscl_teacher.alp(tscl_arm_idx), total_env_steps,
+                )
             if it % max(1, args.tscl_log_every) == 0:
                 for i, a in enumerate(tscl_teacher.arms):
                     label = a.label()
@@ -787,12 +798,13 @@ def main() -> None:
         # before the controller decides to graduate.
         phase_str = ""
         if cur_phase is not None:
-            writer.add_scalar("curriculum/phase_idx", cur_phase_idx, total_env_steps)
-            writer.add_scalar(
-                "curriculum/max_depth",
-                -1 if cur_phase.max_depth is None else cur_phase.max_depth,
-                total_env_steps,
-            )
+            if tb_log_this_iter:
+                writer.add_scalar("curriculum/phase_idx", cur_phase_idx, total_env_steps)
+                writer.add_scalar(
+                    "curriculum/max_depth",
+                    -1 if cur_phase.max_depth is None else cur_phase.max_depth,
+                    total_env_steps,
+                )
             iters_in_phase += 1
             if ep_returns_all:
                 recent_succ_window.append(success_rate)
@@ -801,7 +813,8 @@ def main() -> None:
             window_mean = (
                 float(np.mean(recent_succ_window)) if recent_succ_window else 0.0
             )
-            writer.add_scalar("curriculum/window_succ", window_mean, total_env_steps)
+            if tb_log_this_iter:
+                writer.add_scalar("curriculum/window_succ", window_mean, total_env_steps)
             can_advance = (
                 window_ready
                 and iters_in_phase >= args.curriculum_min_iters_per_phase
