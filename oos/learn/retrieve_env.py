@@ -144,10 +144,6 @@ class RetrieveOnlyEnv(OOSEnv):
         )
         self._retrieve_cfg = retrieve_only_config or RetrieveOnlyConfig()
         self._target_pallet_id: int | None = None
-        # Per-episode shaping-signal trackers — reset in `reset()`.
-        # _last_take_shelf: maps carrier_id → last shelf taken from, used to
-        # detect useless take→give on the same shelf. Cleared on a Give.
-        self._last_take_shelf: dict[str, str] = {}
 
     # ------------------------------------------------------------------
 
@@ -199,9 +195,6 @@ class RetrieveOnlyEnv(OOSEnv):
         # returned obs matches what's actually legal post-shuffle.
         self.refresh_decision_context()
 
-        # Reset shaping-signal trackers for the new episode.
-        self._last_take_shelf = {}
-
         obs, info = self._observation_for_current(
             facility, dt=0.0, completions=[], arrivals=[]
         )
@@ -231,16 +224,6 @@ class RetrieveOnlyEnv(OOSEnv):
             and any(isinstance(t, Retrieve) for t in facility.queue.pending)
         ):
             idle_pending_penalty = -cfg.idle_while_pending_penalty
-
-        # Per-carrier "last shelf taken from" tracking. This is consumed by
-        # `_apply_action_mask_overrides` to zero out the GIVE-back-to-same-
-        # shelf action in the next obs's mask — a useless cycle that the
-        # policy shouldn't be allowed to learn as a stalling tactic.
-        if chosen_entry is not None and chosen_entry.target is not None:
-            if chosen_entry.type == ActionType.TAKE:
-                self._last_take_shelf[querying_carrier] = chosen_entry.target
-            elif chosen_entry.type == ActionType.GIVE:
-                self._last_take_shelf.pop(querying_carrier, None)
 
         # Big-shelf-clearing precheck: snapshot (A, B, C, D) *before* the step
         # so we can compute deltas after and decide whether to fire shaping.
@@ -362,49 +345,25 @@ class RetrieveOnlyEnv(OOSEnv):
         return a, b, c, d
 
     def _apply_action_mask_overrides(self, obs: dict, info: dict) -> None:
-        """Zero positions in obs['action_mask'] for actions we never want
-        the policy to consider.
+        """Zero out WAIT positions in obs['action_mask'] when `disable_wait`
+        is on. The immediate-undo mask (give-back-to-take / take-from-give)
+        is enforced at the engine layer in `enumerate_actions`, so it's
+        already absent from the entries and mask here.
 
-        Two overrides:
-          - `disable_wait` (optional): zero every WAIT entry.
-          - Unconditional: zero any GIVE entry whose target is the same
-            shelf the querying carrier just took from. That's always a
-            useless cycle, so it's hard-illegal rather than a soft penalty.
-
-        Safety: if applying the overrides would leave the mask with zero
-        legal actions, we abort and keep the original mask. An all-zero
-        mask crashes downstream (softmax over -inf logits → NaN), and
-        forcing the agent to pick a "useless" action on a borderline
-        state is strictly better than crashing the rollout.
-
-        Entries stay in `decoder.entries` at their original indices so
-        action decoding still works; the policy just never picks them
-        because the mask forces logit=-inf at those positions.
+        Safety: if zeroing WAIT would leave no legal actions, we revert.
+        An all-zero mask crashes downstream (softmax over -inf → NaN).
         """
+        if not self._retrieve_cfg.disable_wait:
+            return
         entries = info.get("action_entries", [])
         mask = obs.get("action_mask")
         if mask is None or not len(entries):
             return
-        disable_wait = self._retrieve_cfg.disable_wait
-        qc = self._ctx.querying_carrier if self._ctx is not None else None
-        last_take = (
-            self._last_take_shelf.get(qc) if qc is not None else None
-        )
-
-        # Compute the would-be mask in-place on a copy so we can roll back.
         original = mask.copy()
         for i, e in enumerate(entries):
-            if disable_wait and e.type == ActionType.WAIT:
-                mask[i] = 0
-            elif (
-                last_take is not None
-                and e.type == ActionType.GIVE
-                and e.target == last_take
-            ):
+            if e.type == ActionType.WAIT:
                 mask[i] = 0
         if int(mask.sum()) == 0:
-            # Overrides would mask everything; restore the original mask so
-            # the policy has at least one legal action to pick.
             mask[:] = original
 
     # ------------------------------------------------------------------

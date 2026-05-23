@@ -73,15 +73,23 @@ def enumerate_actions(
     cs = state.carriers[carrier]
 
     # TAKE: any accessible non-empty shelf when carrier is unloaded.
+    # Mask out TAKE from the shelf this carrier just gave to — that's an
+    # immediate undo cycle and is never useful.
     if cs.load is None:
         for sid in topo.accessible_shelves[carrier]:
+            if sid == cs.last_give_shelf:
+                continue
             cmd = Take(carrier_id=carrier, shelf_id=sid)
             if _ok(cmd, state, topo):
                 entries.append(ActionEntry(ActionType.TAKE, sid))
 
     # GIVE: any accessible shelf with capacity and size compat, when loaded.
+    # Mask out GIVE back to the shelf this carrier just took from — same
+    # rationale as above (immediate undo).
     if cs.load is not None:
         for sid in topo.accessible_shelves[carrier]:
+            if sid == cs.last_take_shelf:
+                continue
             cmd = Give(carrier_id=carrier, shelf_id=sid)
             if _ok(cmd, state, topo):
                 entries.append(ActionEntry(ActionType.GIVE, sid))

@@ -56,6 +56,15 @@ class CarrierState:
     # "who needs a decision at this instant?". Cleared whenever any
     # scheduler event fires, so the carrier is re-queried on world change.
     voluntarily_idle: bool = False
+    # Last shelf this carrier took from / gave to, used to mask out
+    # immediate-undo cycles in `enumerate_actions`:
+    #   - GIVE back to last_take_shelf  → blocked (undoes the take)
+    #   - TAKE from last_give_shelf     → blocked (undoes the give)
+    # Each side clears the other when it fires (a TAKE clears last_give,
+    # a GIVE clears last_take), so the constraint never blocks legitimate
+    # multi-step sequences. Cleared on shuffle/reset.
+    last_take_shelf: Optional[str] = None
+    last_give_shelf: Optional[str] = None
 
     @property
     def is_idle(self) -> bool:

@@ -155,6 +155,11 @@ class Give(Command):
         assert cs.load is not None
         ss.stack.append(cs.load)
         cs.load = None
+        # Track for the immediate-undo mask in enumerate_actions: this give
+        # makes TAKE-from-this-shelf an undo; clear the take-side tracker
+        # since the previous take (if any) is now logically resolved.
+        cs.last_give_shelf = self.shelf_id
+        cs.last_take_shelf = None
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +211,10 @@ class Take(Command):
         ss = state.shelves[self.shelf_id]
         cs.position = s.position_for[self.carrier_id]
         cs.load = ss.stack.pop()
+        # Track for the immediate-undo mask in enumerate_actions: this take
+        # makes GIVE-back-to-this-shelf an undo; clear the give-side tracker.
+        cs.last_take_shelf = self.shelf_id
+        cs.last_give_shelf = None
 
 
 # ---------------------------------------------------------------------------

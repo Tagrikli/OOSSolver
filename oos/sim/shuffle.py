@@ -130,6 +130,8 @@ def _place_pallets(
         cs.command_started_at = None
         cs.command_start_position = None
         cs.voluntarily_idle = False
+        cs.last_take_shelf = None
+        cs.last_give_shelf = None
     for rs in facility.state.rooms.values():
         rs.customer_interaction_until = None
     facility.scheduler = Scheduler()
