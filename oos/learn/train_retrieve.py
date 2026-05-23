@@ -234,7 +234,7 @@ def main() -> None:
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--vf-coef", type=float, default=0.5)
-    p.add_argument("--ent-coef", type=float, default=0.05)
+    p.add_argument("--ent-coef", type=float, default=0.01)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--n-epochs", type=int, default=4)
     p.add_argument("--minibatch-size", type=int, default=256)
