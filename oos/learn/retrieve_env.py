@@ -82,9 +82,6 @@ class RetrieveOnlyConfig:
     # — small per-step nudge that prevents the do-nothing trap (sitting at
     # a room is no longer free when there's pending work).
     idle_while_pending_penalty: float = 5.0
-    # Penalty per (take from shelf S → give to shelf S) cycle on the same
-    # carrier without an intervening useful move. Opt-in (default 0).
-    useless_take_give_penalty: float = 0.0
     # When the target lives on a big shelf and there isn't enough capacity
     # in OTHER big shelves to hold its big blockers, the agent must first
     # free space on other big shelves. The natural way to free space is to
@@ -229,17 +226,14 @@ class RetrieveOnlyEnv(OOSEnv):
         ):
             idle_pending_penalty = -cfg.idle_while_pending_penalty
 
-        # Useless take→give precheck. We track per-carrier "last shelf taken
-        # from" and fire the penalty when this carrier gives back to the
-        # same shelf. Cleared on either side of the cycle to avoid stale state.
-        useless_tg_penalty = 0.0
-        if cfg.useless_take_give_penalty != 0.0 and chosen_entry is not None:
-            if chosen_entry.type == ActionType.TAKE and chosen_entry.target is not None:
+        # Per-carrier "last shelf taken from" tracking. This is consumed by
+        # `_apply_action_mask_overrides` to zero out the GIVE-back-to-same-
+        # shelf action in the next obs's mask — a useless cycle that the
+        # policy shouldn't be allowed to learn as a stalling tactic.
+        if chosen_entry is not None and chosen_entry.target is not None:
+            if chosen_entry.type == ActionType.TAKE:
                 self._last_take_shelf[querying_carrier] = chosen_entry.target
-            elif chosen_entry.type == ActionType.GIVE and chosen_entry.target is not None:
-                last = self._last_take_shelf.get(querying_carrier)
-                if last is not None and last == chosen_entry.target:
-                    useless_tg_penalty = -cfg.useless_take_give_penalty
+            elif chosen_entry.type == ActionType.GIVE:
                 self._last_take_shelf.pop(querying_carrier, None)
 
         # Big-shelf-clearing precheck: snapshot (A, B, C, D) *before* the step
@@ -278,7 +272,6 @@ class RetrieveOnlyEnv(OOSEnv):
         reward = (
             float(reward)
             + idle_pending_penalty
-            + useless_tg_penalty
             + big_shelf_clearing_reward
             + big_shelf_clearing_depth_reward
         )
@@ -300,7 +293,6 @@ class RetrieveOnlyEnv(OOSEnv):
 
         # Expose the shaping signals on info so the user can audit them.
         info["shaping/idle_pending"] = idle_pending_penalty
-        info["shaping/useless_take_give"] = useless_tg_penalty
         info["shaping/big_shelf_clearing"] = big_shelf_clearing_reward
         info["shaping/big_shelf_clearing_depth"] = big_shelf_clearing_depth_reward
 
@@ -364,20 +356,36 @@ class RetrieveOnlyEnv(OOSEnv):
         return a, b, c, d
 
     def _apply_action_mask_overrides(self, obs: dict, info: dict) -> None:
-        """Zero positions in obs['action_mask'] for actions disabled by config.
+        """Zero positions in obs['action_mask'] for actions we never want
+        the policy to consider.
 
-        Currently handles `disable_wait`. The entry stays in `decoder.entries`
-        at its original index so action decoding still works; the policy just
-        never picks it because the mask forces logit=-inf at that position.
+        Two overrides:
+          - `disable_wait` (optional): zero every WAIT entry.
+          - Unconditional: zero any GIVE entry whose target is the same
+            shelf the querying carrier just took from. That's always a
+            useless cycle, so it's hard-illegal rather than a soft penalty.
+
+        Entries stay in `decoder.entries` at their original indices so
+        action decoding still works; the policy just never picks them
+        because the mask forces logit=-inf at those positions.
         """
-        if not self._retrieve_cfg.disable_wait:
-            return
         entries = info.get("action_entries", [])
         mask = obs.get("action_mask")
         if mask is None or not len(entries):
             return
+        disable_wait = self._retrieve_cfg.disable_wait
+        qc = self._ctx.querying_carrier if self._ctx is not None else None
+        last_take = (
+            self._last_take_shelf.get(qc) if qc is not None else None
+        )
         for i, e in enumerate(entries):
-            if e.type == ActionType.WAIT:
+            if disable_wait and e.type == ActionType.WAIT:
+                mask[i] = 0
+            elif (
+                last_take is not None
+                and e.type == ActionType.GIVE
+                and e.target == last_take
+            ):
                 mask[i] = 0
 
     # ------------------------------------------------------------------

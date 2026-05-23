@@ -94,7 +94,6 @@ def _retrieve_config(
         target_scope="all",
         require_solvable=args.require_solvable,
         idle_while_pending_penalty=args.idle_while_pending_penalty,
-        useless_take_give_penalty=args.useless_take_give_penalty,
         big_shelf_clearing_weight=args.big_shelf_clearing_weight,
         big_shelf_clearing_depth_weight=args.big_shelf_clearing_depth_weight,
         disable_wait=args.disable_wait,
@@ -177,10 +176,6 @@ def main() -> None:
                         "pending. Default 5.0 — small per-step nudge that "
                         "prevents the do-nothing trap (sitting at a room is "
                         "no longer free when there's pending work).")
-    p.add_argument("--useless-take-give-penalty", type=float, default=0.0,
-                   help="Penalty per (take from shelf S → give to shelf S) "
-                        "cycle on the same carrier. Opt-in (default 0); "
-                        "discourages no-op shuffles.")
     p.add_argument("--big-shelf-clearing-weight", type=float, default=0.0,
                    help="Reward for clearing small/empty items out of OTHER "
                         "big shelves when the target lives on a big shelf "
@@ -566,7 +561,6 @@ def main() -> None:
                 target_size=arm.shelf_size,  # type: ignore[arg-type]
                 require_solvable=args.require_solvable,
                 idle_while_pending_penalty=args.idle_while_pending_penalty,
-                useless_take_give_penalty=args.useless_take_give_penalty,
                 big_shelf_clearing_weight=args.big_shelf_clearing_weight,
                 big_shelf_clearing_depth_weight=args.big_shelf_clearing_depth_weight,
                 disable_wait=args.disable_wait,
