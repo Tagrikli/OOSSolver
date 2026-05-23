@@ -254,7 +254,7 @@ class VizApp:
                             picker.move(1)
                         elif event.key == pygame.K_d:
                             picker.deterministic = not picker.deterministic
-                        elif event.key == pygame.K_m:
+                        elif event.key == pygame.K_s:
                             picker.mcts_enabled = not picker.mcts_enabled
                             # Re-wrap the active policy with/without MCTS
                             # without re-loading the checkpoint from disk.

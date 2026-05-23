@@ -1330,6 +1330,8 @@ class ControlsPanel:
             ("+ / -",   "speed up / down"),
             ("r",       "reset env"),
             ("p / f",   "policy / facility"),
+            ("d",       "(in picker) deterministic"),
+            ("s",       "(in picker) MCTS search"),
             ("g",       "generate random facility"),
             ("q / esc", "quit"),
             ("1 / 2 / 3", "set hovered pallet to empty/small/big"),

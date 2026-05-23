@@ -163,7 +163,7 @@ def draw_picker(
     hint_y = panel.bottom - pad - fonts.small.get_height() * 3 - 8
     for line in [
         "↑/↓ navigate    enter: load + reset    esc: cancel",
-        "d: toggle deterministic    m: toggle MCTS    r: rescan runs/",
+        "d: toggle deterministic    s: toggle MCTS search    r: rescan",
         "p: close picker",
     ]:
         s = fonts.small.render(line, True, CYAN_MID)
