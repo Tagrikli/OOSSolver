@@ -85,6 +85,14 @@ class RetrieveOnlyConfig:
     # Penalty per (take from shelf S → give to shelf S) cycle on the same
     # carrier without an intervening useful move. Opt-in (default 0).
     useless_take_give_penalty: float = 0.0
+    # Hard-disable the WAIT action by zeroing it in the action mask. When on,
+    # the policy literally cannot choose WAIT — forces the agent to take a
+    # real action every decision instant. Useful when WAIT has become a sink
+    # the policy can't unlearn (no terminal feedback because WAIT prevents
+    # voluntary episode end). Caveat: legitimate brief waits (e.g. carrier
+    # mid-move) become unavailable, so use temporarily during hard-arm
+    # training, not as a permanent default.
+    disable_wait: bool = False
 
 
 class RetrieveOnlyEnv(OOSEnv):
@@ -169,6 +177,7 @@ class RetrieveOnlyEnv(OOSEnv):
         )
         info["sim_time"] = facility.state.time
         info["retrieve_target"] = target_id
+        self._apply_action_mask_overrides(obs, info)
         return obs, info
 
     def step(self, action: int):
@@ -209,6 +218,7 @@ class RetrieveOnlyEnv(OOSEnv):
         # ---- step ----
         obs, reward, terminated, truncated, info = super().step(action)
         facility = self._ctx.facility  # type: ignore[union-attr]
+        self._apply_action_mask_overrides(obs, info)
 
         reward = float(reward) + idle_pending_penalty + useless_tg_penalty
 
@@ -232,6 +242,23 @@ class RetrieveOnlyEnv(OOSEnv):
         info["shaping/useless_take_give"] = useless_tg_penalty
 
         return obs, float(reward), terminated, truncated, info
+
+    def _apply_action_mask_overrides(self, obs: dict, info: dict) -> None:
+        """Zero positions in obs['action_mask'] for actions disabled by config.
+
+        Currently handles `disable_wait`. The entry stays in `decoder.entries`
+        at its original index so action decoding still works; the policy just
+        never picks it because the mask forces logit=-inf at that position.
+        """
+        if not self._retrieve_cfg.disable_wait:
+            return
+        entries = info.get("action_entries", [])
+        mask = obs.get("action_mask")
+        if mask is None or not len(entries):
+            return
+        for i, e in enumerate(entries):
+            if e.type == ActionType.WAIT:
+                mask[i] = 0
 
     # ------------------------------------------------------------------
     # Shaping-signal helpers

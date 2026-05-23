@@ -95,6 +95,7 @@ def _retrieve_config(
         require_solvable=args.require_solvable,
         idle_while_pending_penalty=args.idle_while_pending_penalty,
         useless_take_give_penalty=args.useless_take_give_penalty,
+        disable_wait=args.disable_wait,
     )
 
 
@@ -178,6 +179,12 @@ def main() -> None:
                    help="Penalty per (take from shelf S → give to shelf S) "
                         "cycle on the same carrier. Opt-in (default 0); "
                         "discourages no-op shuffles.")
+    p.add_argument("--disable-wait", action="store_true",
+                   help="Mask out the WAIT action so the policy literally "
+                        "can't pick it. Use when the agent has fallen into "
+                        "a WAIT sink it can't unlearn. Off by default — "
+                        "legitimate waits (carrier mid-move) need this "
+                        "action.")
     p.add_argument("--target-deepest", action="store_true",
                    help="Restrict the per-episode target to the deepest "
                         "non-empty pallet of each shelf (random across "
@@ -544,6 +551,7 @@ def main() -> None:
                 require_solvable=args.require_solvable,
                 idle_while_pending_penalty=args.idle_while_pending_penalty,
                 useless_take_give_penalty=args.useless_take_give_penalty,
+                disable_wait=args.disable_wait,
             )
         else:
             cur_fullness = _sample_fullness()
