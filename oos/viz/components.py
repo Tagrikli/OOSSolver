@@ -1121,11 +1121,18 @@ class QueuePanel:
     # Button rects, set per-draw when manual mode is on; (label, rect) tuples.
     # Empty when not in manual mode. Read by the app to hit-test clicks.
     manual_buttons: list = field(default_factory=list)
+    # Fullness slider state — user-controlled fullness value for the
+    # `randomize` button. Rect is reset each draw so the app can hit-test
+    # mousedowns / drags against the actual rendered position.
+    fullness: float = 0.7
+    slider_rect: object = None  # pygame.Rect when manual mode is on, else None
 
     LINE_H = 15
     BUTTON_H = 22
     BUTTON_GAP = 6
-    BUTTON_ROW_PAD = 8  # space above the button row inside the panel
+    BUTTON_ROW_PAD = 8     # space above the button row inside the panel
+    SLIDER_H = 16
+    SLIDER_GAP = 4         # vertical gap between slider and button row
 
     def __post_init__(self) -> None:
         if self.chrome is None:
@@ -1144,6 +1151,16 @@ class QueuePanel:
             if rect.collidepoint(pos):
                 return label
         return None
+
+    def hit_slider(self, pos: tuple[int, int]) -> bool:
+        return self.slider_rect is not None and self.slider_rect.collidepoint(pos)
+
+    def set_fullness_from_x(self, x: int) -> None:
+        """Update self.fullness from a click/drag x-position on the slider."""
+        if self.slider_rect is None:
+            return
+        rel = (x - self.slider_rect.left) / max(1, self.slider_rect.width)
+        self.fullness = max(0.0, min(1.0, float(rel)))
 
     def scroll(self, delta_rows: int) -> None:
         self.chrome.scroll(delta_rows)
@@ -1169,8 +1186,11 @@ class QueuePanel:
         )
         y += 14
         list_top = y
-        # Reserve bottom strip for manual-mode buttons if needed.
-        bottom_reserve = (self.BUTTON_H + self.BUTTON_ROW_PAD) if manual_mode else 0
+        # Reserve bottom strip for manual-mode controls (slider + buttons).
+        bottom_reserve = (
+            self.SLIDER_H + self.SLIDER_GAP + self.BUTTON_H + self.BUTTON_ROW_PAD
+            if manual_mode else 0
+        )
         list_h = inner.bottom - list_top - 2 - bottom_reserve
         list_body = pygame.Rect(x, list_top, inner.w - 4, list_h)
 
@@ -1212,17 +1232,58 @@ class QueuePanel:
         manual_mode: bool,
     ) -> None:
         self.manual_buttons = []
+        self.slider_rect = None
         if not manual_mode:
             return
-        # Four buttons: queue small/big/clear + randomize state.
+
+        # Fullness slider sits above the button row, drives the `randomize`
+        # button's shuffle. Draw the track first, then a knob at the current
+        # value, then a numeric label on the right.
+        btn_row_y = inner.bottom - self.BUTTON_H - 2
+        slider_y = btn_row_y - self.SLIDER_GAP - self.SLIDER_H
+        label_w = 56  # space reserved for "full 0.75" text
+        track_left = inner.left + 2
+        track_w = inner.width - 4 - label_w - 4
+        self.slider_rect = pygame.Rect(
+            track_left, slider_y + (self.SLIDER_H // 2) - 3, track_w, 6,
+        )
+        # Track
+        draw_beveled_rect(
+            surface, self.slider_rect, BASE_GUTTER, bevel=2, alpha=220,
+        )
+        draw_beveled_frame(
+            surface, self.slider_rect, CYAN_MID, bevel=2, width=1,
+        )
+        # Filled portion up to the knob
+        fill_w = int(self.slider_rect.width * self.fullness)
+        if fill_w > 0:
+            fill_rect = pygame.Rect(
+                self.slider_rect.left, self.slider_rect.top,
+                fill_w, self.slider_rect.height,
+            )
+            pygame.draw.rect(surface, MAGENTA_BRIGHT, fill_rect)
+        # Knob
+        knob_x = self.slider_rect.left + fill_w
+        knob_rect = pygame.Rect(
+            knob_x - 4, self.slider_rect.top - 4, 8, self.slider_rect.height + 8,
+        )
+        draw_beveled_rect(surface, knob_rect, BASE_GUTTER, bevel=2, alpha=255)
+        draw_beveled_frame(surface, knob_rect, MAGENTA_BRIGHT, bevel=2, width=1)
+        # Value text on the right
+        _blit_text(
+            surface, f"full {self.fullness:.2f}",
+            (self.slider_rect.right + 6, slider_y + 1),
+            fonts.small, MAGENTA_BRIGHT,
+        )
+
+        # Button row: queue small/big/clear + randomize.
         labels = ("queue small", "queue big", "queue clear", "randomize")
-        row_y = inner.bottom - self.BUTTON_H - 2
         avail = inner.width - 4
         total_gap = self.BUTTON_GAP * (len(labels) - 1)
         btn_w = (avail - total_gap) // len(labels)
         x = inner.left + 2
         for label in labels:
-            rect = pygame.Rect(x, row_y, btn_w, self.BUTTON_H)
+            rect = pygame.Rect(x, btn_row_y, btn_w, self.BUTTON_H)
             if label == "queue clear":
                 border, text_col = YELLOW_BRIGHT, YELLOW_BRIGHT
             elif label == "randomize":

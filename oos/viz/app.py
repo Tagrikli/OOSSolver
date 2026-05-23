@@ -82,6 +82,7 @@ class VizApp:
         ))
 
         running = True
+        dragging_fullness = False  # True while LMB is held on the fullness slider
         while running:
             dt_wall = clock.tick(self.target_fps) / 1000.0
 
@@ -107,6 +108,10 @@ class VizApp:
                             if panel.hit_test(mouse_pos):
                                 panel.scroll(-event.y * mult)
                                 break
+                elif event.type == pygame.MOUSEMOTION and dragging_fullness:
+                    renderer.queue_panel.set_fullness_from_x(event.pos[0])
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    dragging_fullness = False
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     pos = event.pos
                     # Header-click toggles panel collapse — works in both auto
@@ -132,6 +137,10 @@ class VizApp:
                         pass
                     else:
                         pos = event.pos
+                        if renderer.queue_panel.hit_slider(pos):
+                            renderer.queue_panel.set_fullness_from_x(pos[0])
+                            dragging_fullness = True
+                            continue
                         btn = renderer.queue_panel.hit_button(pos)
                         if btn == "queue small":
                             facility.enqueue_store("small")
@@ -159,7 +168,7 @@ class VizApp:
                             from oos.sim.shuffle import shuffle_state
                             shuffle_state(
                                 facility,
-                                fullness=0.7,
+                                fullness=renderer.queue_panel.fullness,
                                 rng=np.random.default_rng(),
                                 require_solvable=True,
                             )
