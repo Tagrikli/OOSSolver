@@ -254,13 +254,22 @@ class VizApp:
                             picker.move(1)
                         elif event.key == pygame.K_d:
                             picker.deterministic = not picker.deterministic
+                        elif event.key == pygame.K_m:
+                            picker.mcts_enabled = not picker.mcts_enabled
+                            # Re-wrap the active policy with/without MCTS
+                            # without re-loading the checkpoint from disk.
+                            self._rewrap_policy_with_mcts(
+                                player, picker, toasts, wall_now(),
+                            )
                         elif event.key == pygame.K_r:
                             picker.rescan()
                         elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                             entry = picker.selected()
                             if entry is not None:
                                 label = self._load_policy(
-                                    entry, player, topo, picker.deterministic, toasts, wall_now()
+                                    entry, player, topo, picker.deterministic, toasts, wall_now(),
+                                    mcts_enabled=picker.mcts_enabled,
+                                    mcts_n_sims=picker.mcts_n_sims,
                                 )
                                 if label is not None:
                                     # Swap the policy in place — keep the env
@@ -644,6 +653,8 @@ class VizApp:
         deterministic: bool,
         toasts: list[Toast],
         wall_now: float,
+        mcts_enabled: bool = False,
+        mcts_n_sims: int = 32,
     ) -> Optional[str]:
         """Swap player.policy to the entry's policy. Returns the display label
         on success, or None if loading failed (a toast is emitted either way)."""
@@ -657,26 +668,71 @@ class VizApp:
         try:
             # Imported lazily so the viz still runs without torch installed when
             # no checkpoint is being loaded.
-            from oos.learn.policy import LearnedPolicy
+            from oos.learn.policy import LearnedPolicy, MCTSPolicy
             policy = LearnedPolicy(
                 checkpoint_path=entry.path,
                 topology=topo,
                 device="cpu",
                 deterministic=deterministic,
             )
-            player.policy = policy
+            if mcts_enabled:
+                player.policy = MCTSPolicy(
+                    learned=policy, env=player.env, n_sims=mcts_n_sims,
+                )
+            else:
+                player.policy = policy
             mode_label = "argmax" if deterministic else "sample"
+            mcts_label = f"+mcts:{mcts_n_sims}" if mcts_enabled else ""
             toasts.append(Toast(
-                text=f"POLICY → {entry.display_name} ({mode_label})",
+                text=f"POLICY → {entry.display_name} ({mode_label}{mcts_label})",
                 color=LIME_BRIGHT, born_wall=wall_now, lifetime=4.0,
             ))
-            return f"{entry.display_name} [iter {policy.iteration}, {mode_label}]"
+            return (
+                f"{entry.display_name} [iter {policy.iteration}, "
+                f"{mode_label}{mcts_label}]"
+            )
         except Exception as e:
             toasts.append(Toast(
                 text=f"LOAD FAILED: {type(e).__name__}: {e}"[:80],
                 color=MAGENTA_BRIGHT, born_wall=wall_now, lifetime=6.0,
             ))
             return None
+
+    def _rewrap_policy_with_mcts(
+        self,
+        player: Player,
+        picker,  # PickerState
+        toasts: list[Toast],
+        wall_now: float,
+    ) -> None:
+        """Toggle MCTS on/off for the *currently loaded* policy without re-
+        reading the checkpoint from disk. Random policy is left untouched."""
+        from oos.learn.policy import LearnedPolicy, MCTSPolicy
+        current = player.policy
+        if isinstance(current, MCTSPolicy):
+            inner = current.learned
+        elif isinstance(current, LearnedPolicy):
+            inner = current
+        else:
+            toasts.append(Toast(
+                text="MCTS: no learned policy loaded",
+                color=MAGENTA_BRIGHT, born_wall=wall_now, lifetime=3.0,
+            ))
+            return
+        if picker.mcts_enabled:
+            player.policy = MCTSPolicy(
+                learned=inner, env=player.env, n_sims=picker.mcts_n_sims,
+            )
+            toasts.append(Toast(
+                text=f"MCTS ON  (n_sims={picker.mcts_n_sims})",
+                color=CYAN_BRIGHT, born_wall=wall_now, lifetime=3.0,
+            ))
+        else:
+            player.policy = inner
+            toasts.append(Toast(
+                text="MCTS OFF  (reactive policy only)",
+                color=YELLOW_BRIGHT, born_wall=wall_now, lifetime=3.0,
+            ))
 
     def _emit_toasts(
         self, player: Player, info: dict, toasts: list[Toast], wall_now: float

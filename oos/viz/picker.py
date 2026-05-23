@@ -37,6 +37,8 @@ class PickerState:
     scroll: int = 0
     runs_dir: str = "runs"
     deterministic: bool = False
+    mcts_enabled: bool = True
+    mcts_n_sims: int = 32
     entries: list[CheckpointEntry] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -100,9 +102,14 @@ def draw_picker(
     surface.blit(title, (x0, y))
     y += title.get_height() + 4
 
+    mcts_str = (
+        f"MCTS:{state.mcts_n_sims}"
+        if state.mcts_enabled else "MCTS:off"
+    )
     sub = fonts.small.render(
         f"runs dir: {state.runs_dir}    │    "
-        f"mode: {'DETERMINISTIC (argmax)' if state.deterministic else 'STOCHASTIC (sample)'}",
+        f"mode: {'DETERMINISTIC (argmax)' if state.deterministic else 'STOCHASTIC (sample)'}"
+        f"    │    {mcts_str}",
         True, TEXT_DIM,
     )
     surface.blit(sub, (x0, y))
@@ -156,7 +163,7 @@ def draw_picker(
     hint_y = panel.bottom - pad - fonts.small.get_height() * 3 - 8
     for line in [
         "↑/↓ navigate    enter: load + reset    esc: cancel",
-        "d: toggle deterministic    r: rescan runs/",
+        "d: toggle deterministic    m: toggle MCTS    r: rescan runs/",
         "p: close picker",
     ]:
         s = fonts.small.render(line, True, CYAN_MID)

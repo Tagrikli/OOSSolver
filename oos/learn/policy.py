@@ -98,3 +98,74 @@ class LearnedPolicy:
             action = int(dist.sample()[0].item())
         self.last_chosen = action
         return action
+
+
+class MCTSPolicy:
+    """Wraps a LearnedPolicy with inference-time MCTS.
+
+    The underlying net is still used as policy prior + value oracle, but the
+    final action is the most-visited child of the search root. Compared to
+    raw LearnedPolicy this is N_SIMS× slower at decision time but can crack
+    scenarios where the reactive policy assigns near-zero probability to a
+    critical move that lookahead would discover.
+
+    Requires a reference to the live env for state snapshotting. Set
+    `policy.env = current_env` after construction or when the env is rebuilt.
+    """
+
+    def __init__(
+        self,
+        learned: "LearnedPolicy",
+        env,
+        n_sims: int = 32,
+        c_puct: float = 1.5,
+        gamma: float = 0.99,
+    ) -> None:
+        self.learned = learned
+        self.env = env
+        self.n_sims = n_sims
+        self.c_puct = c_puct
+        self.gamma = gamma
+        # Mirror LearnedPolicy's viz-side attributes so the dist panel still
+        # sees the root's prior distribution (search visit counts are a
+        # separate question; surfacing the prior is at least continuous).
+        self.last_logits: np.ndarray | None = None
+        self.last_action_mask: np.ndarray | None = None
+        self.last_chosen: int | None = None
+
+    @property
+    def checkpoint_path(self) -> str:
+        return self.learned.checkpoint_path
+
+    @property
+    def iteration(self) -> int:
+        return self.learned.iteration
+
+    def __call__(self, obs: dict, info: dict) -> int:
+        from oos.learn.mcts import mcts_search
+        # Stash the raw net forward for the dist panel before the search
+        # (cheap — one extra pass; would happen inside MCTS anyway but its
+        # outputs aren't surfaced).
+        sample = sample_from_env_step(obs, info, info["action_entries"])
+        n_max = int(np.asarray(obs["action_mask"]).shape[0])
+        batch = self.learned.collator.collate(
+            [sample], n_max=n_max, device=self.learned.device,
+        )
+        with torch.no_grad():
+            out = self.learned.net(batch)
+        self.last_logits = out.logits[0].detach().cpu().numpy()
+        self.last_action_mask = np.asarray(obs["action_mask"]).astype(bool)
+
+        action = mcts_search(
+            env=self.env,
+            net=self.learned.net,
+            collator=self.learned.collator,
+            root_obs=obs,
+            root_info=info,
+            n_sims=self.n_sims,
+            c_puct=self.c_puct,
+            gamma=self.gamma,
+            device=self.learned.device,
+        )
+        self.last_chosen = action
+        return action
