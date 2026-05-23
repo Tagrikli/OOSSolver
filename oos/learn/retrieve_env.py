@@ -97,10 +97,12 @@ class RetrieveOnlyConfig:
     #   B = count of big blockers above the target on the target's shelf
     #   C = empty slots (capacity slack) in big shelves other than the target's
     #
-    # Reward fires when B > C (capacity-constrained) AND A decreased over
-    # the step (agent freed a slot). Amount = weight * (A_before - A_after).
-    # When B <= C the shelf situation is already feasible without this
-    # maneuver, so we don't shape it. 0.0 disables.
+    # Symmetric reward fires when B > C (capacity-constrained):
+    # amount = weight * (A_before - A_after). Positive when A drops
+    # (clearing a slot), negative when A rises (un-clearing). Symmetry
+    # prevents the agent from ping-ponging a small on/off a big shelf to
+    # farm the reward — a full cycle nets to zero. When B <= C the shelf
+    # situation is already feasible without this maneuver. 0.0 disables.
     big_shelf_clearing_weight: float = 0.0
     # Hard-disable the WAIT action by zeroing it in the action mask. When on,
     # the policy literally cannot choose WAIT — forces the agent to take a
@@ -249,12 +251,14 @@ class RetrieveOnlyEnv(OOSEnv):
         if abc_before is not None:
             a_before, b_before, c_before = abc_before
             abc_after = self._compute_big_shelf_abc()
-            # Fire only when (a) we're still in the capacity-constrained regime
-            # B > C as of pre-step, and (b) the action actually freed slots
-            # (A_after < A_before). Use a_before's value relative to a_after; if
-            # the target left the shelf mid-step (abc_after is None), use 0.
+            # Symmetric shaping: reward when A drops (cleared a slot), penalize
+            # when A rises (un-cleared it). Without symmetry the agent could
+            # ping-pong a small item on/off a big shelf and farm the reward
+            # each time it drops. With symmetry, the net reward of a cycle is
+            # zero. Only fires when B > C (regime where the maneuver matters).
+            # If the target left the shelf mid-step (abc_after is None), use 0.
             a_after = abc_after[0] if abc_after is not None else 0
-            if b_before > c_before and a_after < a_before:
+            if b_before > c_before:
                 big_shelf_clearing_reward = (
                     cfg.big_shelf_clearing_weight * (a_before - a_after)
                 )
