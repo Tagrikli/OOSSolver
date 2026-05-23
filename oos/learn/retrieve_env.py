@@ -169,9 +169,15 @@ class RetrieveOnlyEnv(OOSEnv):
         # visibly at (max_depth=0, target_size=small, low fullness) where
         # ~20% of layouts would otherwise produce a None target and get
         # silently counted as "failures" by the success metric.
-        max_target_retries = 50
+        # Re-roll the random shuffle until the target picker finds a
+        # candidate satisfying the depth / size / scope filter. No cap —
+        # tight filters can need many tries, and a phantom "success" from
+        # giving up with target=None is worse than spending a few extra ms.
+        # If a config is genuinely infeasible (e.g. depth=4 on a 4-cap
+        # shelf at low fullness), reset() will loop forever; that's a
+        # diagnostic, not a bug.
         target_id: int | None = None
-        for _ in range(max_target_retries):
+        while target_id is None:
             shuffle_state(
                 facility,
                 fullness=self._retrieve_cfg.fullness,
@@ -179,13 +185,6 @@ class RetrieveOnlyEnv(OOSEnv):
                 require_solvable=self._retrieve_cfg.require_solvable,
             )
             target_id = self._pick_target_pallet(rng)
-            if target_id is not None:
-                break
-        # If we exhausted retries the last shuffle is still in place and
-        # target_id is None — env will trivially "succeed" the episode and
-        # the success metric will tick down. Caller should treat sustained
-        # target=None as evidence that the config (size + max_depth +
-        # fullness) is infeasible and adjust accordingly.
         self._target_pallet_id = target_id
         if target_id is not None:
             facility.queue.add(
