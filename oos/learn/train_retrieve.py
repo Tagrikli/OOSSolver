@@ -96,6 +96,7 @@ def _retrieve_config(
         idle_while_pending_penalty=args.idle_while_pending_penalty,
         useless_take_give_penalty=args.useless_take_give_penalty,
         big_shelf_clearing_weight=args.big_shelf_clearing_weight,
+        big_shelf_clearing_depth_weight=args.big_shelf_clearing_depth_weight,
         disable_wait=args.disable_wait,
     )
 
@@ -187,6 +188,13 @@ def main() -> None:
                         "Amount = w * (A_before - A_after) where A = small+"
                         "empty count in non-target big shelves; fires only "
                         "when B > C (blockers > free slots). 0 disables.")
+    p.add_argument("--big-shelf-clearing-depth-weight", type=float, default=0.0,
+                   help="Companion progress reward gated on B > C. Amount = "
+                        "w * (D_before - D_after) where D = sum of depths-"
+                        "from-top of non-big items in non-target big shelves. "
+                        "Drops as a buried small gets peeled toward the top "
+                        "(even if not yet removed), giving credit for "
+                        "intermediate moves. Symmetric. 0 disables.")
     p.add_argument("--disable-wait", action="store_true",
                    help="Mask out the WAIT action so the policy literally "
                         "can't pick it. Use when the agent has fallen into "
@@ -560,6 +568,7 @@ def main() -> None:
                 idle_while_pending_penalty=args.idle_while_pending_penalty,
                 useless_take_give_penalty=args.useless_take_give_penalty,
                 big_shelf_clearing_weight=args.big_shelf_clearing_weight,
+                big_shelf_clearing_depth_weight=args.big_shelf_clearing_depth_weight,
                 disable_wait=args.disable_wait,
             )
         else:

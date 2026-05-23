@@ -104,6 +104,15 @@ class RetrieveOnlyConfig:
     # farm the reward — a full cycle nets to zero. When B <= C the shelf
     # situation is already feasible without this maneuver. 0.0 disables.
     big_shelf_clearing_weight: float = 0.0
+    # Complementary "depth-progress" reward also gated on B > C.
+    #   D = sum across non-big items (small + empty) sitting in non-target
+    #       big shelves of their depth-from-top in the stack
+    #   reward = weight * (D_before - D_after), symmetric
+    # This rewards *progress toward* a clearing — e.g., peeling a big off
+    # the top of a buried small drops D by 1 even though the small is still
+    # on the shelf (A unchanged). Useful when the count-only signal is too
+    # sparse to credit intermediate moves. 0.0 disables.
+    big_shelf_clearing_depth_weight: float = 0.0
     # Hard-disable the WAIT action by zeroing it in the action mask. When on,
     # the policy literally cannot choose WAIT — forces the agent to take a
     # real action every decision instant. Useful when WAIT has become a sink
@@ -234,13 +243,14 @@ class RetrieveOnlyEnv(OOSEnv):
                     useless_tg_penalty = -cfg.useless_take_give_penalty
                 self._last_take_shelf.pop(querying_carrier, None)
 
-        # Big-shelf-clearing precheck: snapshot (A, B, C) *before* the step so
-        # we can compute A's change after and decide whether to fire shaping.
-        abc_before = (
-            self._compute_big_shelf_abc()
-            if cfg.big_shelf_clearing_weight != 0.0
-            else None
+        # Big-shelf-clearing precheck: snapshot (A, B, C, D) *before* the step
+        # so we can compute deltas after and decide whether to fire shaping.
+        # Computed only if at least one of the two clearing rewards is active.
+        clearing_active = (
+            cfg.big_shelf_clearing_weight != 0.0
+            or cfg.big_shelf_clearing_depth_weight != 0.0
         )
+        abcd_before = self._compute_big_shelf_abcd() if clearing_active else None
 
         # ---- step ----
         obs, reward, terminated, truncated, info = super().step(action)
@@ -248,19 +258,22 @@ class RetrieveOnlyEnv(OOSEnv):
         self._apply_action_mask_overrides(obs, info)
 
         big_shelf_clearing_reward = 0.0
-        if abc_before is not None:
-            a_before, b_before, c_before = abc_before
-            abc_after = self._compute_big_shelf_abc()
-            # Symmetric shaping: reward when A drops (cleared a slot), penalize
-            # when A rises (un-cleared it). Without symmetry the agent could
-            # ping-pong a small item on/off a big shelf and farm the reward
-            # each time it drops. With symmetry, the net reward of a cycle is
-            # zero. Only fires when B > C (regime where the maneuver matters).
-            # If the target left the shelf mid-step (abc_after is None), use 0.
-            a_after = abc_after[0] if abc_after is not None else 0
+        big_shelf_clearing_depth_reward = 0.0
+        if abcd_before is not None:
+            a_before, b_before, c_before, d_before = abcd_before
+            abcd_after = self._compute_big_shelf_abcd()
+            # If the target left the shelf mid-step (abcd_after is None), the
+            # signal no longer applies — drop both deltas to zero contribution.
+            a_after = abcd_after[0] if abcd_after is not None else a_before
+            d_after = abcd_after[3] if abcd_after is not None else d_before
+            # Both signals symmetric and gated on B > C: increases reverse
+            # decreases so a full ping-pong cycle nets to zero reward.
             if b_before > c_before:
                 big_shelf_clearing_reward = (
                     cfg.big_shelf_clearing_weight * (a_before - a_after)
+                )
+                big_shelf_clearing_depth_reward = (
+                    cfg.big_shelf_clearing_depth_weight * (d_before - d_after)
                 )
 
         reward = (
@@ -268,6 +281,7 @@ class RetrieveOnlyEnv(OOSEnv):
             + idle_pending_penalty
             + useless_tg_penalty
             + big_shelf_clearing_reward
+            + big_shelf_clearing_depth_reward
         )
 
         # Early termination: the target retrieve was just served → queue
@@ -289,11 +303,12 @@ class RetrieveOnlyEnv(OOSEnv):
         info["shaping/idle_pending"] = idle_pending_penalty
         info["shaping/useless_take_give"] = useless_tg_penalty
         info["shaping/big_shelf_clearing"] = big_shelf_clearing_reward
+        info["shaping/big_shelf_clearing_depth"] = big_shelf_clearing_depth_reward
 
         return obs, float(reward), terminated, truncated, info
 
-    def _compute_big_shelf_abc(self) -> "tuple[int, int, int] | None":
-        """Compute (A, B, C) for the big-shelf-clearing shaping signal.
+    def _compute_big_shelf_abcd(self) -> "tuple[int, int, int, int] | None":
+        """Compute (A, B, C, D) for the big-shelf-clearing shaping signals.
 
         Returns None if the target isn't on a big shelf (signal doesn't apply).
         """
@@ -330,19 +345,24 @@ class RetrieveOnlyEnv(OOSEnv):
             if p.contents == "big"
         )
 
-        # A and C aggregate over OTHER big shelves.
+        # A, C, D aggregate over OTHER big shelves.
+        # D = sum of depth-from-top for each non-big pallet sitting in them;
+        # depth-from-top = (stack_size - 1) - position_in_list (list[-1] is top).
         a = 0
         c = 0
+        d = 0
         for sid, sh in state.shelves.items():
             if sid == target_shelf_id:
                 continue
             if topo.shelves[sid].size_class != "big":
                 continue
-            for p in sh.stack:
+            stack_size = len(sh.stack)
+            for pos, p in enumerate(sh.stack):
                 if p.contents in ("small", "empty"):
                     a += 1
-            c += topo.shelves[sid].capacity - len(sh.stack)
-        return a, b, c
+                    d += (stack_size - 1) - pos
+            c += topo.shelves[sid].capacity - stack_size
+        return a, b, c, d
 
     def _apply_action_mask_overrides(self, obs: dict, info: dict) -> None:
         """Zero positions in obs['action_mask'] for actions disabled by config.
