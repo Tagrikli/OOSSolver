@@ -309,8 +309,8 @@ def main() -> None:
                    help="Adds `w * (1.0 - recent_mean)` to each well-sampled "
                         "arm's score before the softmax. Biases sampling "
                         "toward low-success arms regardless of slope — useful "
-                        "when ALP alone can't distinguish 'flat at 100%' from "
-                        "'flat at 70%'. 0.0 disables; try 0.1-0.5.")
+                        "when ALP alone can't distinguish 'flat at 100%%' from "
+                        "'flat at 70%%'. 0.0 disables; try 0.1-0.5.")
     p.add_argument("--tscl-log-every", type=int, default=10,
                    help="Iterations between TB dumps of per-arm ALP/n_samples/"
                         "recent_succ. Lower = more detail, more TB traffic.")
