@@ -335,20 +335,16 @@ class Renderer:
         self, surface: pygame.Surface, facility: Facility, anim_now: float
     ) -> None:
         state = facility.state
-        # The unified-action model puts pallets *in* the room (RoomState.load)
-        # rather than on the carrier during customer interaction. Room state:
-        #   - "busy"  : a customer interaction is in progress (mutating room.load)
-        #   - "ready" : room is empty and idle (waiting for a deposit)
-        #   - "idle"  : room holds an unconsumed pallet but no pending task matches
-        del anim_now  # no longer needed; visual readiness is room-load-driven
+        # Customer interactions are now instant: as soon as a carrier deposits
+        # a pallet into a room, the matching task fires and `room.load` either
+        # vanishes (retrieve) or has its contents mutated (store). There's no
+        # "busy" window. Two states:
+        #   - "ready" : room is empty (and possibly serving a pending task)
+        #   - "idle"  : room holds an unconsumed pallet (no matching task yet)
+        del anim_now  # visual readiness is room-load-driven
         for rp in self.layout.rooms:
             rs = state.rooms[rp.room_id]
-            if rs.customer_interaction_until is not None:
-                state_name = "busy"
-            elif rs.load is None:
-                state_name = "ready"
-            else:
-                state_name = "idle"
+            state_name = "ready" if rs.load is None else "idle"
             RoomView(
                 room_id=rp.room_id,
                 cx=rp.x,

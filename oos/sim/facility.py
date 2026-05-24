@@ -68,8 +68,7 @@ class Facility:
         self.task_stream = task_stream
         self.rng = rng if rng is not None else np.random.default_rng(0)
         # Per-pallet retrieve scheduler: called when a customer loads contents
-        # onto a pallet in the room slot (room_mutation_done) with the new
-        # contents value (and the sampler still receives (pallet_id, size_class)) and
+        # onto a pallet in the room slot — sampler receives (pallet_id, size_class) and
         # must return the dwell delay in sim-seconds (or float("inf") to skip
         # the retrieve for that pallet).
         self.dwell_sampler = dwell_sampler
@@ -323,8 +322,6 @@ class Facility:
             self._on_command_done(ev.payload, completions)
         elif kind == "task_arrival":
             self._on_task_arrival(arrivals, dropped, completions)
-        elif kind == "room_mutation_done":
-            self._on_room_mutation_done(ev.payload, completions)
         elif kind == "retrieve_arrival":
             self._on_retrieve_arrival(ev.payload, arrivals, completions)
         else:
@@ -428,39 +425,6 @@ class Facility:
             self.queue.remove(t)
             dropped.append(t)
 
-    def _on_room_mutation_done(
-        self, payload: dict, completions: list[TaskCompletion]
-    ) -> None:
-        """Customer interaction completion. The pallet sitting in `room.load`
-        gets a new contents value: a non-empty size (store: customer filled the
-        empty pallet) or "empty" (retrieve: customer took the item). Pallet id
-        is preserved. The carrier is NOT involved — it may have left long ago.
-        """
-        room_id = payload["room_id"]
-        new_contents = payload["new_contents"]
-        rs = self.state.rooms[room_id]
-        assert rs.load is not None, (
-            "room_mutation_done fired but room.load is None"
-        )
-        pallet_id = rs.load.id
-        rs.load = Pallet(id=pallet_id, contents=new_contents)
-        rs.customer_interaction_until = None
-        # Wake any voluntarily-idle carriers — the world just changed.
-        for cs in self.state.carriers.values():
-            cs.voluntarily_idle = False
-        # If this was a store (pallet just got filled), schedule the eventual
-        # retrieve arrival for this pallet so the produced item gets requested
-        # back later. The dwell sampler is given the new size for distribution
-        # conditioning.
-        if new_contents != "empty" and self.dwell_sampler is not None:
-            delay = self.dwell_sampler(pallet_id, new_contents)
-            if delay != float("inf"):
-                self.scheduler.push(
-                    self.state.time + delay,
-                    "retrieve_arrival",
-                    {"pallet": pallet_id},
-                )
-
     def _on_retrieve_arrival(
         self,
         payload: dict,
@@ -493,18 +457,18 @@ class Facility:
     def _try_auto_serve_room(
         self, room_id: RoomId, completions: list[TaskCompletion],
     ) -> None:
-        """If `room.load` matches a pending task, schedule the customer
-        interaction. Retrieve takes priority over Store (when both could
-        apply, the user-requested pallet wins).
+        """If `room.load` matches a pending task, fire the customer interaction
+        instantly. Retrieve takes priority over Store (when both could apply,
+        the user-requested pallet wins).
 
-        Customer interactions are not policy-chosen actions; they are driven
-        by `room.load` + a pending task that matches. The carrier that did
-        the deposit is already idle and free to leave.
+        The carrier that did the deposit is already idle and free to leave —
+        customer interactions are zero-duration in this simplified model.
+        Later, if we want a real "carrier locked during interaction" state,
+        we'll mask the carrier's actions for the duration; the env state will
+        encode the lock explicitly.
         """
         rs = self.state.rooms[room_id]
         if rs.load is None:
-            return
-        if rs.customer_interaction_until is not None:
             return
         pallet = rs.load
         # A pending Retrieve for THIS pallet (regardless of contents) wins.
@@ -514,13 +478,10 @@ class Facility:
             self.queue.remove(retrieve)
             self.queue.completed_costs.append(cost)
             completions.append(TaskCompletion(task=retrieve, cost=cost))
-            delay = self.durations.customer_unload()
-            rs.customer_interaction_until = self.state.time + delay
-            self.scheduler.push(
-                rs.customer_interaction_until,
-                "room_mutation_done",
-                {"room_id": room_id, "new_contents": "empty"},
-            )
+            # Instant mutation: contents → empty; id preserved.
+            rs.load = Pallet(id=pallet.id, contents="empty")
+            for cs in self.state.carriers.values():
+                cs.voluntarily_idle = False
             return
         # Otherwise — if the pallet is empty — try the oldest pending Store.
         if pallet.is_empty:
@@ -531,13 +492,21 @@ class Facility:
             self.queue.remove(store)
             self.queue.completed_costs.append(cost)
             completions.append(TaskCompletion(task=store, cost=cost))
-            delay = self.durations.customer_load()
-            rs.customer_interaction_until = self.state.time + delay
-            self.scheduler.push(
-                rs.customer_interaction_until,
-                "room_mutation_done",
-                {"room_id": room_id, "new_contents": store.size},
-            )
+            # Instant mutation: contents → store.size; id preserved.
+            rs.load = Pallet(id=pallet.id, contents=store.size)
+            for cs in self.state.carriers.values():
+                cs.voluntarily_idle = False
+            # Schedule the eventual retrieve for this newly-filled pallet so
+            # the produced item gets requested back later (only matters when
+            # auto-arrivals are enabled).
+            if self.dwell_sampler is not None:
+                delay = self.dwell_sampler(pallet.id, store.size)
+                if delay != float("inf"):
+                    self.scheduler.push(
+                        self.state.time + delay,
+                        "retrieve_arrival",
+                        {"pallet": pallet.id},
+                    )
 
     def _scan_all_for_auto_serve_rooms(
         self, completions: list[TaskCompletion],

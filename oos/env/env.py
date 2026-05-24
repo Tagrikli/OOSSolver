@@ -132,8 +132,6 @@ class OOSEnv(gym.Env):
         durations = LinearDurations(
             shelf_op_time=self._experiment_cfg.durations.shelf_op_time,
             handoff_time=self._experiment_cfg.durations.handoff_time,
-            customer_load_time=self._experiment_cfg.durations.customer_load_time,
-            customer_unload_time=self._experiment_cfg.durations.customer_unload_time,
         )
         task_cfg = self._experiment_cfg.task_stream
         stream = PoissonTaskStream(

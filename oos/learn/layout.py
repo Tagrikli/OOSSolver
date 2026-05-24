@@ -90,7 +90,7 @@ def apply_snapshot_to_facility(
         cs.last_take_shelf = None
         cs.last_give_shelf = None
     for rs in facility.state.rooms.values():
-        rs.customer_interaction_until = None
+        rs.load = None
     facility.scheduler = Scheduler()
     if facility.auto_arrivals_enabled:
         facility._schedule_next_arrival()

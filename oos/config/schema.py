@@ -12,8 +12,6 @@ from oos.sim.topology import SizeClass
 class DurationsConfig:
     shelf_op_time: SimTime = 0.5
     handoff_time: SimTime = 1.0
-    customer_load_time: SimTime = 1.0
-    customer_unload_time: SimTime = 1.0
 
 
 @dataclass(frozen=True)

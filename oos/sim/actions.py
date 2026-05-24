@@ -257,17 +257,6 @@ class Relocate(Command):
             raise PreconditionError(
                 f"carrier {self.carrier_id} cannot access {self.dst}"
             )
-        # Room as src: must be non-mid-interaction (otherwise we'd race the customer).
-        if self.src in topo.rooms:
-            if state.rooms[self.src].customer_interaction_until is not None:
-                raise PreconditionError(
-                    f"room {self.src} is mid-customer-interaction"
-                )
-        if self.dst in topo.rooms:
-            if state.rooms[self.dst].customer_interaction_until is not None:
-                raise PreconditionError(
-                    f"room {self.dst} is mid-customer-interaction"
-                )
         # Source has a pallet available (after subtracting pending takes).
         top = _location_top_pallet(self.src, state)
         if top is None:

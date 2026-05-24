@@ -82,10 +82,10 @@ def shelf_feature_count() -> int:
 
 
 ROOM_FEATURE_NAMES = (
-    "ready",
-    "carrier_present",
-    "carrier_busy_at_room",
-    "time_since_last_use_norm",
+    "has_load",     # 1 if any pallet sits in room.load
+    "load_empty",   # 1 if room.load is an empty pallet
+    "load_small",   # 1 if room.load is a small-item pallet
+    "load_big",     # 1 if room.load is a big-item pallet
 )
 
 GLOBAL_FEATURE_NAMES = (
@@ -198,23 +198,17 @@ def build_observation(
             n_pending_retrieves += 1
 
     for i, rid in enumerate(room_ids):
-        r = topo.rooms[rid]
         rs = state.rooms[rid]
-        served_cs = state.carriers[r.served_by]
-        carrier_present = served_cs.position == r.position
-        ready = (
-            carrier_present
-            and served_cs.is_idle
-            and served_cs.load is not None
-            and served_cs.load.is_empty
-        )
-        carrier_busy_at_room = carrier_present and not served_cs.is_idle
-        room_features[i, 0] = 1.0 if ready else 0.0
-        room_features[i, 1] = 1.0 if carrier_present else 0.0
-        room_features[i, 2] = 1.0 if carrier_busy_at_room else 0.0
-        if rs.customer_interaction_until is not None:
-            elapsed = state.time - (rs.customer_interaction_until - 0.0)
-            room_features[i, 3] = min(1.0, max(0.0, elapsed) / cfg.horizon_seconds)
+        # Room as 1-cap virtual shelf: features encode the contents of
+        # `room.load`. All zero if the room is empty.
+        if rs.load is not None:
+            room_features[i, 0] = 1.0
+            if rs.load.contents == "empty":
+                room_features[i, 1] = 1.0
+            elif rs.load.contents == "small":
+                room_features[i, 2] = 1.0
+            elif rs.load.contents == "big":
+                room_features[i, 3] = 1.0
 
     global_features = np.zeros(len(GLOBAL_FEATURE_NAMES), dtype=np.float32)
     global_features[0] = min(1.0, n_pending_stores / 10.0)

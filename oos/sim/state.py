@@ -89,14 +89,13 @@ class RoomState:
 
     A carrier delivers a pallet to a room via Relocate (treating the room as
     the destination); the pallet sits in `load` until the customer interaction
-    fires, then either gets consumed (retrieve), gets its contents mutated
-    in-place (store), or gets picked up by a subsequent Relocate from the
-    room to a real shelf. `customer_interaction_until` is the timestamp at
-    which the current customer interaction will end (None when idle).
+    fires (instantly), which either consumes it (retrieve: load → None) or
+    mutates its contents in place (store: empty → size). After the interaction
+    the carrier is free to walk away; another Relocate can take the pallet
+    out of `load` later.
     """
 
     load: Optional[Pallet] = None
-    customer_interaction_until: Optional[SimTime] = None
 
 
 @dataclass
