@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from oos.sim.actions import Relocate
+from oos.sim.actions import MultiRelocate, Relocate
 from oos.sim.facility import Facility
 from oos.sim.state import Pallet
 from oos.sim.tasks import Retrieve, TaskQueue
@@ -98,29 +98,30 @@ def compute_in_flight_overlay(
 ) -> tuple[dict[str, Pallet], dict[str, int]]:
     """Physically-faithful in-flight overlay for mid-Relocate carriers.
 
-    A Relocate has four conceptual phases between start and complete:
+    Maps to two command types:
+
+    **Relocate** has four conceptual phases:
         1. move to src      — carrier travelling toward source
         2. take_op at src   — picking up (still physically empty until done)
         3. move to dst      — carrying the pallet toward destination
         4. place_op at dst  — placing it down
+    The pallet is *physically* on the carrier from phase 3 onward.
 
-    The pallet is *physically* on the carrier only from phase 3 onward.
-    Before then the carrier is still travelling/picking up and the source
-    still holds it. This overlay reflects that: it returns the per-carrier
-    in-transit pallet (and per-source top-pop count) only for carriers
-    whose elapsed Relocate time has passed `move_to_src + take_op` — i.e.,
-    they've actually completed the pickup phase.
+    **MultiRelocate** has more phases:
+        1. A: travel to src; B: travel to B's handoff pose (in parallel)
+        2. A: take_op at src
+        3. A: travel src → A's handoff pose (A loaded);
+           B continues if still travelling
+        4. sync wait at handoff poses (A loaded, B at pose empty)
+        5. handoff_op (transfer)
+        6. B: travel handoff pose → dst (B loaded)
+        7. B: give_op at dst (B loaded)
+    During 3-5 the pallet is on A; during 6-7 it's on B.
 
-    The sim itself is atomic at `Relocate.complete()`, so without this
-    overlay `cs.load` would read None and `src.stack[-1]` would still show
-    the pallet for the whole Relocate. The overlay closes that gap by
-    showing what would be true if the take physically happened the moment
-    the take_op finished.
-
-    Multiple concurrent Relocates from the same source are handled by
-    handing out top pallets in submission order — first carrier past the
-    take phase gets `stack[-1]`, second gets `stack[-2]`, etc. Rooms only
-    ever have one in-flight Relocate from them (1-cap).
+    The sim itself is atomic at `complete()`, so without this overlay
+    cs.load reads None throughout and src.stack[-1] (or room.load) still
+    shows the pallet. The overlay closes that gap, exposing the
+    physically-correct intermediate state.
     """
     state = facility.state
     topo = facility.topology
@@ -128,44 +129,100 @@ def compute_in_flight_overlay(
     now = state.time
     carrier_loads: dict[str, Pallet] = {}
     src_pops: dict[str, int] = {}
-    for cid, cs in state.carriers.items():
-        cmd = cs.current_command
-        if not isinstance(cmd, Relocate):
-            continue
-        # Phase gate: only fire the overlay once the take_op has completed.
-        carrier = topo.carriers[cid]
-        start_pos = (
-            cs.command_start_position
-            if cs.command_start_position is not None
-            else cs.position
-        )
-        if cmd.src in topo.shelves:
-            src_pos = topo.shelves[cmd.src].position_for[cid]
-            take_op = durs.shelf_op("take", topo.shelves[cmd.src])
-        elif cmd.src in topo.rooms:
-            src_pos = topo.rooms[cmd.src].position
-            take_op = 0.0
-        else:
-            continue
-        move1 = durs.move(carrier, start_pos, src_pos)
-        elapsed = now - (cs.command_started_at or 0.0)
-        if elapsed < move1 + take_op:
-            # Phases 1-2: still travelling to src or picking up. The pallet
-            # is physically still on src and the carrier is still empty.
-            continue
-        src = cmd.src
+
+    def _peek_src_pallet(src: str) -> "Pallet | None":
         n = src_pops.get(src, 0)
-        pallet: Pallet | None = None
         if src in state.shelves:
             stk = state.shelves[src].stack
             if len(stk) > n:
-                pallet = stk[-(n + 1)]
+                return stk[-(n + 1)]
         elif src in state.rooms:
             if n == 0:
-                pallet = state.rooms[src].load
-        if pallet is not None:
-            carrier_loads[cid] = pallet
-            src_pops[src] = n + 1
+                return state.rooms[src].load
+        return None
+
+    # Iterate unique pending commands — MultiRelocate sets the same Command
+    # on both A's and B's current_command, so we must dedupe by id().
+    seen_cmds: set[int] = set()
+    for cid, cs in state.carriers.items():
+        cmd = cs.current_command
+        if cmd is None or id(cmd) in seen_cmds:
+            continue
+        seen_cmds.add(id(cmd))
+
+        if isinstance(cmd, Relocate):
+            carrier = topo.carriers[cid]
+            start_pos = (
+                cs.command_start_position
+                if cs.command_start_position is not None
+                else cs.position
+            )
+            if cmd.src in topo.shelves:
+                src_pos = topo.shelves[cmd.src].position_for[cid]
+                take_op = durs.shelf_op("take", topo.shelves[cmd.src])
+            elif cmd.src in topo.rooms:
+                src_pos = topo.rooms[cmd.src].position
+                take_op = 0.0
+            else:
+                continue
+            move1 = durs.move(carrier, start_pos, src_pos)
+            elapsed = now - (cs.command_started_at or 0.0)
+            if elapsed < move1 + take_op:
+                continue
+            pallet = _peek_src_pallet(cmd.src)
+            if pallet is not None:
+                carrier_loads[cid] = pallet
+                src_pops[cmd.src] = src_pops.get(cmd.src, 0) + 1
+
+        elif isinstance(cmd, MultiRelocate):
+            a_cs = state.carriers[cmd.carrier_id]
+            b_cs = state.carriers[cmd.partner_id]
+            a_car = topo.carriers[cmd.carrier_id]
+            b_car = topo.carriers[cmd.partner_id]
+            pair = (cmd.carrier_id, cmd.partner_id)
+            if pair not in topo.handoff_positions:
+                continue
+            a_pose, b_pose = topo.handoff_positions[pair]
+            a_start = (
+                a_cs.command_start_position
+                if a_cs.command_start_position is not None
+                else a_cs.position
+            )
+            b_start = (
+                b_cs.command_start_position
+                if b_cs.command_start_position is not None
+                else b_cs.position
+            )
+            if cmd.src in topo.shelves:
+                src_pos = topo.shelves[cmd.src].position_for[cmd.carrier_id]
+                take_op = durs.shelf_op("take", topo.shelves[cmd.src])
+            elif cmd.src in topo.rooms:
+                src_pos = topo.rooms[cmd.src].position
+                take_op = 0.0
+            else:
+                continue
+            a_pickup_done = (
+                durs.move(a_car, a_start, src_pos) + take_op
+            )
+            a_at_handoff = a_pickup_done + durs.move(a_car, src_pos, a_pose)
+            b_at_handoff = durs.move(b_car, b_start, b_pose)
+            sync_done = max(a_at_handoff, b_at_handoff)
+            handoff_done = sync_done + durs.handoff()
+            elapsed = now - (a_cs.command_started_at or 0.0)
+            if elapsed < a_pickup_done:
+                # Phase 1-2: A still picking up. Pallet still on src.
+                continue
+            pallet = _peek_src_pallet(cmd.src)
+            if pallet is None:
+                continue
+            src_pops[cmd.src] = src_pops.get(cmd.src, 0) + 1
+            if elapsed < handoff_done:
+                # Phases 3-5: A is carrying the pallet.
+                carrier_loads[cmd.carrier_id] = pallet
+            else:
+                # Phases 6-7: B has the pallet.
+                carrier_loads[cmd.partner_id] = pallet
+
     return carrier_loads, src_pops
 
 
@@ -289,6 +346,7 @@ def build_observation(
     edges_transfer: list[tuple[int, int]] = []
     edges_committed: list[tuple[int, int]] = []
     edges_in_flight_src: list[tuple[int, int]] = []
+    edges_in_flight_partner: list[tuple[int, int]] = []  # carrier <-> partner during MultiRelocate
 
     # We use a single node-index space: [carriers | shelves | rooms].
     c_off = 0
@@ -311,28 +369,37 @@ def build_observation(
         edges_handoff.append((c_off + carrier_idx[a], c_off + carrier_idx[b]))
         edges_handoff.append((c_off + carrier_idx[b], c_off + carrier_idx[a]))
 
+    # In-flight edges. Iterate unique pending commands so MultiRelocate
+    # (which is set on both A and B's current_command) is processed once.
+    _seen_cmds: set[int] = set()
     for cid, cs in state.carriers.items():
         cmd = cs.current_command
-        if cmd is None:
+        if cmd is None or id(cmd) in _seen_cmds:
             continue
-        # Committed edge: carrier → destination of the in-flight command.
-        # For a Relocate this is the dst; for MoveToPartner the partner; etc.
+        _seen_cmds.add(id(cmd))
+        # Committed edge: initiating carrier → command's destination.
         tgt = _target_node(cmd, c_off, s_off, r_off, carrier_idx, shelf_idx, room_idx)
-        if tgt is not None:
-            edges_committed.append((c_off + carrier_idx[cid], tgt))
-        # In-flight src edge: a Relocate's other anchor. Only Relocate has a
-        # meaningful source location; for every other command we leave this
-        # edge type empty for that carrier. Together with the committed edge
-        # this gives the network the complete (carrier, src, dst) triplet via
-        # pointer attention along two parallel edges.
-        if isinstance(cmd, Relocate):
+        if tgt is not None and isinstance(cmd, (Relocate, MultiRelocate)):
+            initiator = cmd.carrier_id if isinstance(cmd, MultiRelocate) else cid
+            edges_committed.append((c_off + carrier_idx[initiator], tgt))
+        # In-flight src edge: initiating carrier → command's source.
+        if isinstance(cmd, (Relocate, MultiRelocate)):
             src_node = _location_node(
                 cmd.src, s_off, r_off, shelf_idx, room_idx,
             )
             if src_node is not None:
+                initiator = cmd.carrier_id if isinstance(cmd, MultiRelocate) else cid
                 edges_in_flight_src.append(
-                    (c_off + carrier_idx[cid], src_node)
+                    (c_off + carrier_idx[initiator], src_node)
                 )
+        # In-flight partner edge: A ↔ B during a MultiRelocate, both directions
+        # (bidirectional like handoff). Gives the network a structural signal
+        # that these two carriers are committed together.
+        if isinstance(cmd, MultiRelocate):
+            a_node = c_off + carrier_idx[cmd.carrier_id]
+            b_node = c_off + carrier_idx[cmd.partner_id]
+            edges_in_flight_partner.append((a_node, b_node))
+            edges_in_flight_partner.append((b_node, a_node))
 
     return {
         "carrier_features": carrier_features,
@@ -344,6 +411,7 @@ def build_observation(
         "edges_transfer": _edges_to_array(edges_transfer),
         "edges_committed": _edges_to_array(edges_committed),
         "edges_in_flight_src": _edges_to_array(edges_in_flight_src),
+        "edges_in_flight_partner": _edges_to_array(edges_in_flight_partner),
         "querying_carrier": int(carrier_idx[querying_carrier]),
     }
 
@@ -366,24 +434,21 @@ def _target_node(
 ) -> int | None:
     """Map an in-flight command to a node index for the 'committed' edge.
 
-    For Relocate the committed edge points at the destination (the carrier is
-    on its way there); src is implied by the carrier's pose. Move/Wait have
-    no associated node.
+    For both Relocate and MultiRelocate the committed edge points at the
+    destination (where the pallet ends up). Move/Wait have no associated
+    node. Carrier identifier args are accepted for signature symmetry but
+    only consulted when the command targets a carrier (none currently).
     """
+    del c_off, carrier_idx  # reserved for future carrier-targeted commands
     from oos.sim.actions import (
-        Handoff,
         Move,
-        MoveToPartner,
+        MultiRelocate,
         Relocate,
         Wait,
     )
 
-    if isinstance(cmd, Relocate):
+    if isinstance(cmd, (Relocate, MultiRelocate)):
         return _location_node(cmd.dst, s_off, r_off, shelf_idx, room_idx)
-    if isinstance(cmd, Handoff):
-        return c_off + carrier_idx[cmd.receiver_id]
-    if isinstance(cmd, MoveToPartner):
-        return c_off + carrier_idx[cmd.partner_id]
     if isinstance(cmd, (Move, Wait)):
         return None
     return None

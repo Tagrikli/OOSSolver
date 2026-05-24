@@ -9,8 +9,7 @@ import numpy as np
 
 from oos.sim.actions import (
     Command,
-    Handoff,
-    MoveToPartner,
+    MultiRelocate,
     Relocate,
     Wait,
 )
@@ -144,12 +143,15 @@ class Facility:
         giver_cs.busy_until = busy_until
         giver_cs.command_started_at = self.state.time
         giver_cs.command_start_position = giver_cs.position
-        if isinstance(cmd, Handoff):
-            rs = self.state.carriers[cmd.receiver_id]
-            rs.current_command = cmd
-            rs.busy_until = busy_until
-            rs.command_started_at = self.state.time
-            rs.command_start_position = rs.position
+        if isinstance(cmd, MultiRelocate):
+            # Atomic two-carrier command — lock the partner too, with the
+            # SAME current_command instance so `_pending_commands` can
+            # deduplicate by id().
+            ps = self.state.carriers[cmd.partner_id]
+            ps.current_command = cmd
+            ps.busy_until = busy_until
+            ps.command_started_at = self.state.time
+            ps.command_start_position = ps.position
         self.scheduler.push(busy_until, "command_done", cmd.carrier)
 
     def idle_carriers(self) -> list[CarrierId]:
@@ -177,7 +179,6 @@ class Facility:
         self.queue.add(Store(arrived_at=self.state.time, size=size))
         self._wake_waiting_carriers()
         self._scan_all_for_auto_serve_rooms(self._pending_completions)
-        self._scan_all_for_auto_handoff()
 
     def clear_queue(self) -> None:
         """Drop every pending task. In-flight customer interactions continue."""
@@ -201,7 +202,6 @@ class Facility:
         self.queue.add(Retrieve(arrived_at=self.state.time, pallet=pallet_id))
         self._wake_waiting_carriers()
         self._scan_all_for_auto_serve_rooms(self._pending_completions)
-        self._scan_all_for_auto_handoff()
         return True
 
     def _wake_waiting_carriers(self) -> None:
@@ -342,50 +342,40 @@ class Facility:
         cmd = cs.current_command
         assert cmd is not None
         cmd.complete(self.state, self.topology)
-        # Clear giver state (and receiver, if Handoff).
+        # Clear initiator state (and partner, if multi-carrier).
         cs.current_command = None
         cs.busy_until = None
         cs.command_started_at = None
         cs.command_start_position = None
-        if isinstance(cmd, Handoff):
-            rs = self.state.carriers[cmd.receiver_id]
-            rs.current_command = None
-            rs.busy_until = None
-            rs.command_started_at = None
-            rs.command_start_position = None
+        if isinstance(cmd, MultiRelocate):
+            ps = self.state.carriers[cmd.partner_id]
+            ps.current_command = None
+            ps.busy_until = None
+            ps.command_started_at = None
+            ps.command_start_position = None
 
-        # Auto-serve trigger: customer interactions now fire on `room.load`
-        # changes, not on `cs.load` changes. The only command that mutates
-        # room.load is Relocate-to-room, so that's the trigger.
-        if isinstance(cmd, Relocate) and cmd.dst in self.topology.rooms:
+        # Auto-serve trigger: customer interactions fire on `room.load`
+        # changes. Both Relocate (single-carrier) and MultiRelocate (two-
+        # carrier) can deposit into a room when their dst is a room.
+        if isinstance(cmd, (Relocate, MultiRelocate)) and cmd.dst in self.topology.rooms:
             self._try_auto_serve_room(cmd.dst, completions)
 
-        # "Must cleanup" constraint maintenance:
-        #   - Cleared when a Relocate FROM a room (the previous cleanup
-        #     anchor) completes. The carrier just took the cargo out, the
-        #     room is now free, the constraint is satisfied.
-        #   - Set when a Relocate TO a room ends with the room STILL holding
-        #     cargo after the auto-serve attempt — meaning either the
-        #     dropped pallet didn't match any pending task (junk placement)
-        #     or the customer just filled an empty pallet for a Store and
-        #     it now needs to be stowed somewhere. Either way the carrier's
-        #     next legal action is forced to be "take it back out."
+        # "Must cleanup" constraint maintenance — same logic for both
+        # command types: whichever carrier ended up at the room (Relocate's
+        # carrier, or MultiRelocate's partner) gets the cleanup obligation.
         if isinstance(cmd, Relocate):
             if cs.must_relocate_from == cmd.src:
                 cs.must_relocate_from = None
             if cmd.dst in self.topology.rooms:
                 if self.state.rooms[cmd.dst].load is not None:
                     cs.must_relocate_from = cmd.dst
-        if isinstance(cmd, Handoff):
-            # Both ends just finished the handoff at the handoff pose. We
-            # deliberately do NOT re-fire auto-handoff here — both would still
-            # be in position with opposite load states (the very condition
-            # that would fire another reverse handoff) and we'd ping-pong.
-            # One of them needs to relocate or move away before another
-            # handoff can be considered.
-            pass
-        else:
-            self._try_auto_handoff(carrier_id)
+        elif isinstance(cmd, MultiRelocate):
+            ps = self.state.carriers[cmd.partner_id]
+            # Partner is the one that ended up at dst — apply the cleanup
+            # check to them.
+            if cmd.dst in self.topology.rooms:
+                if self.state.rooms[cmd.dst].load is not None:
+                    ps.must_relocate_from = cmd.dst
 
     def _on_task_arrival(
         self,
@@ -412,7 +402,6 @@ class Facility:
         # Any idle carrier already parked at a room they serve with a usable
         # load state should pick this customer up immediately.
         self._scan_all_for_auto_serve_rooms(completions)
-        self._scan_all_for_auto_handoff()
 
     def _can_accept_big_item(self) -> bool:
         """True iff at least one big-class shelf has a slot that is not
@@ -469,7 +458,6 @@ class Facility:
         # An idle carrier may already be holding this pallet and parked at a
         # room — let them serve immediately.
         self._scan_all_for_auto_serve_rooms(completions)
-        self._scan_all_for_auto_handoff()
 
     # ------------------------------------------------------------------
     # Auto-serve dispatch (room-load-driven)
@@ -550,51 +538,6 @@ class Facility:
             if isinstance(t, Store):
                 return t
         return None
-
-    def _try_auto_handoff(self, carrier_id: CarrierId) -> None:
-        """If `carrier_id` is idle at a handoff pose with a partner also idle
-        at the matching pose and compatible loads, auto-fire the Handoff.
-
-        Handoff is not an action the policy chooses any more — the policy only
-        positions carriers via MOVE_TO_PARTNER. The moment both ends are in
-        position with one carrier loaded and the other empty, this fires.
-        """
-        from oos.sim.actions import Handoff as _HandoffCmd
-
-        cs = self.state.carriers[carrier_id]
-        if cs.current_command is not None:
-            return
-        for partner_id in self.topology.handoff_partners[carrier_id]:
-            pair = (carrier_id, partner_id)
-            if pair not in self.topology.handoff_positions:
-                continue
-            my_pose, partner_pose = self.topology.handoff_positions[pair]
-            if cs.position != my_pose:
-                continue
-            ps = self.state.carriers[partner_id]
-            if ps.current_command is not None:
-                continue
-            if ps.position != partner_pose:
-                continue
-            # Handoff semantics: exactly one carrier holds the pallet,
-            # the other holds nothing (load is None). The Handoff command
-            # transfers the pallet from giver → receiver.
-            if cs.load is not None and ps.load is None:
-                giver, receiver = carrier_id, partner_id
-            elif cs.load is None and ps.load is not None:
-                giver, receiver = partner_id, carrier_id
-            else:
-                continue
-            cmd = _HandoffCmd(giver_id=giver, receiver_id=receiver)
-            try:
-                self.submit(cmd)
-            except Exception:
-                continue
-            return  # one handoff at a time
-
-    def _scan_all_for_auto_handoff(self) -> None:
-        for carrier_id in self.topology.carriers:
-            self._try_auto_handoff(carrier_id)
 
 
 def _pallet_exists(facility: "Facility", pallet_id: PalletId) -> bool:

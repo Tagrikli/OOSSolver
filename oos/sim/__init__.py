@@ -2,10 +2,9 @@
 
 from oos.sim.actions import (
     Command,
-    Handoff,
     LocationId,
     Move,
-    MoveToPartner,
+    MultiRelocate,
     Relocate,
     Wait,
 )
@@ -44,12 +43,11 @@ __all__ = [
     "Event",
     "Facility",
     "FacilityState",
-    "Handoff",
     "HandoffEdge",
     "LinearDurations",
     "LocationId",
     "Move",
-    "MoveToPartner",
+    "MultiRelocate",
     "Pallet",
     "Position",
     "Relocate",

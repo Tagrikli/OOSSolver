@@ -122,22 +122,33 @@ def _push_pallet(loc: LocationId, pallet: Pallet, state: FacilityState) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _pending_src_count(state: FacilityState, loc: LocationId) -> int:
-    """Number of in-flight Relocate commands that will pop from `loc`."""
-    n = 0
+def _pending_commands(state: FacilityState):
+    """Iterate every in-flight Command exactly once, regardless of how many
+    carriers reference it. MultiRelocate sets the same Command on both A and
+    B's current_command; without deduplication we'd double-count it."""
+    seen: set[int] = set()
     for cs in state.carriers.values():
         cmd = cs.current_command
-        if isinstance(cmd, Relocate) and cmd.src == loc:
+        if cmd is None or id(cmd) in seen:
+            continue
+        seen.add(id(cmd))
+        yield cmd
+
+
+def _pending_src_count(state: FacilityState, loc: LocationId) -> int:
+    """Number of in-flight Relocate/MultiRelocate commands that will pop from `loc`."""
+    n = 0
+    for cmd in _pending_commands(state):
+        if isinstance(cmd, (Relocate, MultiRelocate)) and cmd.src == loc:
             n += 1
     return n
 
 
 def _pending_dst_count(state: FacilityState, loc: LocationId) -> int:
-    """Number of in-flight Relocate commands that will place at `loc`."""
+    """Number of in-flight Relocate/MultiRelocate commands that will place at `loc`."""
     n = 0
-    for cs in state.carriers.values():
-        cmd = cs.current_command
-        if isinstance(cmd, Relocate) and cmd.dst == loc:
+    for cmd in _pending_commands(state):
+        if isinstance(cmd, (Relocate, MultiRelocate)) and cmd.dst == loc:
             n += 1
     return n
 
@@ -314,122 +325,162 @@ class Relocate(Command):
 
 
 # ---------------------------------------------------------------------------
-# Handoff — synchronous pallet transfer between two co-located carriers
+# MultiRelocate — atomic two-carrier relocate via synchronized handoff
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class Handoff(Command):
-    """Instantaneous-ish pallet transfer between two co-located carriers.
+class MultiRelocate(Command):
+    """Atomic two-carrier relocate via a synchronized handoff.
 
-    Both carriers must be at matching handoff poses with compatible load states
-    (giver loaded, receiver empty). Facility constructs and fires this; the
-    policy only positions carriers via MOVE_TO_PARTNER.
+    Carrier A picks up from `src`, travels to its handoff pose with partner B;
+    B travels in parallel to its handoff pose with A; when both arrive, the
+    pallet transfers (instant); B then delivers to `dst`. Both carriers are
+    locked busy for the entire sequence. From the policy's perspective this
+    is a single atomic action — there is no half-committed state where a
+    deadlock could form.
+
+    Wall-clock duration:
+        max(A's pickup+travel, B's travel-to-pose) + handoff_op
+                                  + B's travel-to-dst + give_op
     """
 
-    giver_id: CarrierId
-    receiver_id: CarrierId
-
-    @property
-    def carrier(self) -> CarrierId:
-        return self.giver_id
-
-    def _matching_positions(self, topo: Topology) -> tuple[Position, Position] | None:
-        pair = (self.giver_id, self.receiver_id)
-        if pair in topo.handoff_positions:
-            return topo.handoff_positions[pair]
-        return None
-
-    def check_preconditions(self, state: FacilityState, topo: Topology) -> None:
-        if self.giver_id == self.receiver_id:
-            raise PreconditionError("giver and receiver must differ")
-        if self.giver_id not in topo.carriers or self.receiver_id not in topo.carriers:
-            raise PreconditionError("unknown carrier in handoff")
-        if self.receiver_id not in topo.handoff_partners[self.giver_id]:
-            raise PreconditionError(
-                f"no handoff edge between {self.giver_id} and {self.receiver_id}"
-            )
-        positions = self._matching_positions(topo)
-        if positions is None:
-            raise PreconditionError("no matching handoff positions")
-        giver_pos, receiver_pos = positions
-        gs = state.carriers[self.giver_id]
-        rs = state.carriers[self.receiver_id]
-        if gs.position != giver_pos:
-            raise PreconditionError("giver not at handoff position")
-        if rs.position != receiver_pos:
-            raise PreconditionError("receiver not at handoff position")
-        if gs.load is None:
-            raise PreconditionError("giver has no pallet")
-        if rs.load is not None:
-            raise PreconditionError("receiver is already loaded")
-        if not gs.is_idle:
-            raise PreconditionError("giver is not idle")
-        if not rs.is_idle:
-            raise PreconditionError("receiver is not idle")
-
-    def start(
-        self, state: FacilityState, topo: Topology, durations, now: SimTime
-    ) -> SimTime:
-        return now + durations.handoff()
-
-    def complete(self, state: FacilityState, topo: Topology) -> None:
-        gs = state.carriers[self.giver_id]
-        rs = state.carriers[self.receiver_id]
-        assert gs.load is not None and rs.load is None
-        rs.load = gs.load
-        gs.load = None
-
-
-# ---------------------------------------------------------------------------
-# MoveToPartner — positions for an upcoming auto-handoff
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class MoveToPartner(Command):
-    carrier_id: CarrierId
-    partner_id: CarrierId
+    carrier_id: CarrierId     # A — picker
+    partner_id: CarrierId     # B — deliverer
+    src: LocationId           # source A reaches
+    dst: LocationId           # destination B reaches
 
     @property
     def carrier(self) -> CarrierId:
         return self.carrier_id
 
-    def _target_position(self, topo: Topology) -> Position | None:
+    def _handoff_positions(self, topo: Topology) -> tuple[Position, Position] | None:
         pair = (self.carrier_id, self.partner_id)
         if pair in topo.handoff_positions:
-            return topo.handoff_positions[pair][0]
+            return topo.handoff_positions[pair]
         return None
 
     def check_preconditions(self, state: FacilityState, topo: Topology) -> None:
+        if self.carrier_id == self.partner_id:
+            raise PreconditionError("multi-relocate requires two distinct carriers")
+        if (self.carrier_id not in topo.carriers
+                or self.partner_id not in topo.carriers):
+            raise PreconditionError("unknown carrier in multi-relocate")
         if self.partner_id not in topo.handoff_partners[self.carrier_id]:
             raise PreconditionError(
-                f"no handoff/transfer edge between {self.carrier_id} and {self.partner_id}"
+                f"no handoff edge between {self.carrier_id} and {self.partner_id}"
             )
-        target = self._target_position(topo)
-        if target is None:
-            raise PreconditionError("no target position for partner move")
-        cs = state.carriers[self.carrier_id]
-        if not cs.is_idle:
+        positions = self._handoff_positions(topo)
+        if positions is None:
+            raise PreconditionError("no handoff positions for this pair")
+        if self.src == self.dst:
+            raise PreconditionError("multi-relocate src and dst must differ")
+        # Endpoint existence.
+        if self.src not in topo.shelves and self.src not in topo.rooms:
+            raise PreconditionError(f"unknown source {self.src!r}")
+        if self.dst not in topo.shelves and self.dst not in topo.rooms:
+            raise PreconditionError(f"unknown destination {self.dst!r}")
+        # Both carriers idle and empty.
+        a_cs = state.carriers[self.carrier_id]
+        b_cs = state.carriers[self.partner_id]
+        if not a_cs.is_idle:
             raise PreconditionError(f"carrier {self.carrier_id} is not idle")
-        if cs.position == target:
+        if not b_cs.is_idle:
+            raise PreconditionError(f"partner {self.partner_id} is not idle")
+        if a_cs.load is not None:
+            raise PreconditionError(f"carrier {self.carrier_id} is loaded")
+        if b_cs.load is not None:
+            raise PreconditionError(f"partner {self.partner_id} is loaded")
+        # A reaches src; B reaches dst.
+        if not _carrier_reaches(self.src, self.carrier_id, topo):
             raise PreconditionError(
-                f"carrier {self.carrier_id} already at partner position {target}"
+                f"carrier {self.carrier_id} cannot access source {self.src}"
+            )
+        if not _carrier_reaches(self.dst, self.partner_id, topo):
+            raise PreconditionError(
+                f"partner {self.partner_id} cannot access destination {self.dst}"
+            )
+        # Source has a pallet, after subtracting other pending pickups.
+        top = _location_top_pallet(self.src, state)
+        if top is None:
+            raise PreconditionError(f"source {self.src} is empty")
+        if self.src in state.shelves:
+            ss = state.shelves[self.src]
+            if ss.depth - _pending_src_count(state, self.src) <= 0:
+                raise PreconditionError(f"source {self.src} is empty (effective)")
+        elif _pending_src_count(state, self.src) > 0:
+            raise PreconditionError(f"source {self.src} is empty (effective)")
+        # Destination has capacity for the pallet.
+        pdst = _pending_dst_count(state, self.dst)
+        if not _location_has_capacity_for(self.dst, top, state, topo, pdst):
+            raise PreconditionError(
+                f"destination {self.dst} cannot accept pallet"
             )
 
     def start(
         self, state: FacilityState, topo: Topology, durations, now: SimTime
     ) -> SimTime:
-        cs = state.carriers[self.carrier_id]
-        c = topo.carriers[self.carrier_id]
-        target = self._target_position(topo)
-        assert target is not None
-        return now + durations.move(c, cs.position, target)
+        a_cs = state.carriers[self.carrier_id]
+        b_cs = state.carriers[self.partner_id]
+        a_car = topo.carriers[self.carrier_id]
+        b_car = topo.carriers[self.partner_id]
+        positions = self._handoff_positions(topo)
+        assert positions is not None
+        a_pose, b_pose = positions
+        src_pos = _location_position(self.src, self.carrier_id, topo)
+        dst_pos = _location_position(self.dst, self.partner_id, topo)
+
+        take_op = (
+            durations.shelf_op("take", topo.shelves[self.src])
+            if self.src in topo.shelves else 0.0
+        )
+        give_op = (
+            durations.shelf_op("give", topo.shelves[self.dst])
+            if self.dst in topo.shelves else 0.0
+        )
+
+        a_pre_handoff = (
+            durations.move(a_car, a_cs.position, src_pos)
+            + take_op
+            + durations.move(a_car, src_pos, a_pose)
+        )
+        b_pre_handoff = durations.move(b_car, b_cs.position, b_pose)
+        sync_time = max(a_pre_handoff, b_pre_handoff)
+
+        b_post_handoff = (
+            durations.move(b_car, b_pose, dst_pos)
+            + give_op
+        )
+
+        total = sync_time + durations.handoff() + b_post_handoff
+        return now + total
 
     def complete(self, state: FacilityState, topo: Topology) -> None:
-        target = self._target_position(topo)
-        assert target is not None
-        state.carriers[self.carrier_id].position = target
+        a_cs = state.carriers[self.carrier_id]
+        b_cs = state.carriers[self.partner_id]
+        positions = self._handoff_positions(topo)
+        assert positions is not None
+        a_pose, _b_pose = positions
+        dst_pos = _location_position(self.dst, self.partner_id, topo)
+
+        # Atomic pallet transfer src → dst (handoff is internal to this command).
+        pallet = _pop_top_pallet(self.src, state)
+        _push_pallet(self.dst, pallet, state)
+
+        # Final positions: A ends at its handoff pose, B ends at dst.
+        a_cs.position = a_pose
+        b_cs.position = dst_pos
+        a_cs.load = None
+        b_cs.load = None
+
+        # Undo masks: A "took" from src; B "gave" to dst.
+        a_cs.last_take_shelf = self.src if self.src in topo.shelves else None
+        a_cs.last_give_shelf = None
+        b_cs.last_take_shelf = None
+        b_cs.last_give_shelf = self.dst if self.dst in topo.shelves else None
+        # The cleanup-mask "must_relocate_from" applies if B delivered to a
+        # room and the room is still holding cargo — facility's _on_command_done
+        # checks this after auto-serve runs.
 
 
 # ---------------------------------------------------------------------------

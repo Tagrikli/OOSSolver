@@ -13,8 +13,7 @@ from typing import Optional
 import pygame
 
 from oos.sim.actions import (
-    Handoff,
-    MoveToPartner,
+    MultiRelocate,
     Relocate,
     Wait,
 )
@@ -1803,10 +1802,8 @@ def short_action_label(cmd) -> str:
         return "idle"
     if isinstance(cmd, Relocate):
         return f"reloc {cmd.src}→{cmd.dst}"
-    if isinstance(cmd, Handoff):
-        return f"handoff↔{cmd.receiver_id}"
-    if isinstance(cmd, MoveToPartner):
-        return f"meet {cmd.partner_id}"
+    if isinstance(cmd, MultiRelocate):
+        return f"multi {cmd.src}→[{cmd.partner_id}]→{cmd.dst}"
     if isinstance(cmd, Wait):
         return "wait"
     return type(cmd).__name__.lower()

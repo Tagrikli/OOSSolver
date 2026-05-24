@@ -215,6 +215,14 @@ class OOSEnv(gym.Env):
             facility.submit(cmd)
         except Exception as e:
             raise IllegalActionError(str(e)) from e
+        # The submission may have locked other carriers as a side effect —
+        # MultiRelocate locks its partner busy. Strip any newly-busy carriers
+        # from pending_idle before continuing to query them.
+        ctx.pending_idle = [
+            c for c in ctx.pending_idle
+            if facility.state.carriers[c].is_idle
+            and not facility.state.carriers[c].voluntarily_idle
+        ]
         if ctx.pending_idle:
             ctx.querying_carrier = ctx.pending_idle.pop(0)
             entries = enumerate_actions(
@@ -381,6 +389,7 @@ class OOSEnv(gym.Env):
             "edges_transfer": obs["edges_transfer"],
             "edges_committed": obs["edges_committed"],
             "edges_in_flight_src": obs["edges_in_flight_src"],
+            "edges_in_flight_partner": obs["edges_in_flight_partner"],
             "dt": dt,
             "completions": completions,
             "arrivals": arrivals,

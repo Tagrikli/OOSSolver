@@ -1,13 +1,17 @@
 """Action enumeration, legality masking, and index decoding for a carrier.
 
-Unified-action model: the policy chooses among
-  - `RELOCATE(carrier, src, dst)` — move a pallet from src to dst. Both
-    endpoints can be a real shelf or a room (rooms = 1-cap virtual shelves
-    via `RoomState.load`).
-  - `MOVE_TO_PARTNER(carrier, partner)` — position for an upcoming auto-handoff.
+Unified two-action model — the policy chooses from exactly:
+
+  - `RELOCATE(carrier, src, dst)` — single-carrier pallet move. Both src
+    and dst are LocationIds (real shelf or 1-cap virtual room).
+  - `MULTI_RELOCATE(carrier, partner, src, dst)` — atomic two-carrier
+    pallet move via synchronized handoff. The querying carrier picks up
+    from src and meets `partner` at their shared handoff pose; partner
+    then delivers to dst. Both carriers lock busy for the full sequence;
+    there is no half-committed state, so no deadlock is possible.
   - `WAIT(carrier)` — event-driven voluntary idle.
 
-Auto-fired (not policy-chosen): Handoff, customer interactions on rooms.
+Auto-fired (not policy-chosen): customer interactions on rooms.
 """
 
 from __future__ import annotations
@@ -19,18 +23,18 @@ from typing import Optional
 from oos.sim.actions import (
     Command,
     LocationId,
-    MoveToPartner,
+    MultiRelocate,
     Relocate,
     Wait,
 )
-from oos.sim.state import FacilityState, Pallet
-from oos.sim.tasks import Retrieve, Store, TaskQueue
+from oos.sim.state import FacilityState
+from oos.sim.tasks import TaskQueue
 from oos.sim.topology import CarrierId, Topology
 
 
 class ActionType(IntEnum):
     RELOCATE = 0
-    MOVE_TO_PARTNER = 1
+    MULTI_RELOCATE = 1
     WAIT = 2
 
 
@@ -39,23 +43,31 @@ class ActionEntry:
     """One legal action for the querying carrier.
 
     Field semantics by type:
-      - RELOCATE: src = LocationId (shelf or room), dst = LocationId (other)
-      - MOVE_TO_PARTNER: target = partner carrier id; src/dst unused
+      - RELOCATE: src + dst are LocationIds; partner unused
+      - MULTI_RELOCATE: src + dst are LocationIds; partner is the carrier id
+        of the receiving partner (which is locked busy alongside the querying
+        carrier for the full sequence)
       - WAIT: all fields None
     """
 
     type: ActionType
-    target: Optional[str] = None   # partner carrier id (MOVE_TO_PARTNER)
-    src: Optional[str] = None      # source location id (RELOCATE)
-    dst: Optional[str] = None      # destination location id (RELOCATE)
+    src: Optional[str] = None          # source location id
+    dst: Optional[str] = None          # destination location id
+    partner: Optional[str] = None      # partner carrier id (MULTI_RELOCATE)
 
     def to_command(self, carrier: CarrierId) -> Command:
         if self.type == ActionType.RELOCATE:
             assert self.src is not None and self.dst is not None
             return Relocate(carrier_id=carrier, src=self.src, dst=self.dst)
-        if self.type == ActionType.MOVE_TO_PARTNER:
-            assert self.target is not None
-            return MoveToPartner(carrier_id=carrier, partner_id=self.target)
+        if self.type == ActionType.MULTI_RELOCATE:
+            assert (
+                self.partner is not None and self.src is not None
+                and self.dst is not None
+            )
+            return MultiRelocate(
+                carrier_id=carrier, partner_id=self.partner,
+                src=self.src, dst=self.dst,
+            )
         if self.type == ActionType.WAIT:
             return Wait(carrier_id=carrier)
         raise ValueError(f"unknown action type {self.type}")
@@ -69,16 +81,16 @@ def enumerate_actions(
 ) -> list[ActionEntry]:
     """List every legal action for the given (idle) carrier.
 
-    For RELOCATE we iterate every (src, dst) pair the carrier can reach where
-    src is non-empty and dst can accept the topmost pallet of src. Both src
-    and dst can be shelves or rooms. The same precondition checks used by the
-    Relocate command itself are reused (via `_ok`) so the masker can never
-    surface an action the engine would then reject.
+    For RELOCATE we iterate every (src, dst) pair the carrier itself can
+    reach. For MULTI_RELOCATE we additionally iterate every (partner, src,
+    dst) triple where the carrier reaches src, partner reaches dst, and
+    partner is currently idle+empty (so the command can actually lock both).
 
-    Two action classes remain auto-fired and NOT surfaced:
-    - Customer interactions (mutate room.load when a matching task is pending).
-    - HANDOFF (auto-fires when two carriers idle at handoff poses with
-      compatible loads). The policy only chooses MOVE_TO_PARTNER to position.
+    The same precondition checks used by the underlying Commands are reused
+    (via `_ok`) so the masker can never surface an action the engine would
+    then reject.
+
+    Customer interactions on rooms remain auto-fired (not policy-chosen).
     """
     del queue  # reserved for future task-aware masking; not needed now
     entries: list[ActionEntry] = []
@@ -86,9 +98,8 @@ def enumerate_actions(
 
     # "Must cleanup" constraint: if the carrier just dropped cargo into a
     # room that didn't get consumed (junk placement, or store fill awaiting
-    # stow), it is now forced to take that cargo back out. The constraint
-    # auto-clears if the room's load vanished for any reason (another carrier
-    # cleared it, etc.) — we re-check here so a stale field doesn't trap us.
+    # stow), it is now forced to take that cargo back out. Auto-clears the
+    # field if the room's load vanished for any other reason.
     forced_src: LocationId | None = None
     if cs.must_relocate_from is not None:
         room_id = cs.must_relocate_from
@@ -98,23 +109,17 @@ def enumerate_actions(
             cs.must_relocate_from = None
 
     # RELOCATE: every (src, dst) pair across reachable locations.
-    # Reachable = shelves in topo.accessible_shelves[carrier] ∪ rooms in
-    # topo.accessible_rooms[carrier]. Rooms behave as 1-cap virtual shelves.
     if cs.load is None:
         reachable: list[LocationId] = list(topo.accessible_shelves[carrier])
         reachable.extend(topo.accessible_rooms[carrier])
         for src in reachable:
-            # Hard constraint: under cleanup, src must be the room we owe a
-            # take from. All other sources are masked.
             if forced_src is not None and src != forced_src:
                 continue
-            # Skip src if it's the location we just dropped at (immediate undo).
             if src == cs.last_give_shelf:
                 continue
             for dst in reachable:
                 if dst == src:
                     continue
-                # Skip dst if it's the location we just took from (immediate undo).
                 if dst == cs.last_take_shelf:
                     continue
                 cmd = Relocate(carrier_id=carrier, src=src, dst=dst)
@@ -123,19 +128,38 @@ def enumerate_actions(
                         type=ActionType.RELOCATE, src=src, dst=dst,
                     ))
 
-    # MOVE_TO_PARTNER: position for a future (auto-fired) handoff. Masked
-    # entirely while the carrier owes a cleanup — no wandering off while a
-    # room is stuck with cargo this carrier dropped.
-    if forced_src is None:
-        for other in topo.handoff_partners[carrier]:
-            cmd = MoveToPartner(carrier_id=carrier, partner_id=other)
-            if _ok(cmd, state, topo):
-                entries.append(ActionEntry(
-                    type=ActionType.MOVE_TO_PARTNER, target=other,
-                ))
+    # MULTI_RELOCATE: querying carrier picks up from src, partner delivers
+    # to dst. Only enumerable when the partner is currently idle, empty,
+    # and we're not under the cleanup constraint.
+    if cs.load is None and forced_src is None:
+        my_reachable = list(topo.accessible_shelves[carrier])
+        my_reachable.extend(topo.accessible_rooms[carrier])
+        for partner in topo.handoff_partners[carrier]:
+            ps = state.carriers[partner]
+            if not ps.is_idle or ps.load is not None:
+                continue
+            partner_reachable: list[LocationId] = list(
+                topo.accessible_shelves[partner]
+            )
+            partner_reachable.extend(topo.accessible_rooms[partner])
+            for src in my_reachable:
+                if src == cs.last_give_shelf:
+                    continue
+                for dst in partner_reachable:
+                    if dst == src:
+                        continue
+                    cmd = MultiRelocate(
+                        carrier_id=carrier, partner_id=partner,
+                        src=src, dst=dst,
+                    )
+                    if _ok(cmd, state, topo):
+                        entries.append(ActionEntry(
+                            type=ActionType.MULTI_RELOCATE,
+                            partner=partner, src=src, dst=dst,
+                        ))
 
-    # WAIT: always legal. Event-driven idle — the carrier sits out this
-    # decision instant and gets re-queried after any scheduler event.
+    # WAIT: always legal. Carrier sits out this decision instant and gets
+    # re-queried after any scheduler event fires.
     entries.append(ActionEntry(type=ActionType.WAIT))
     return entries
 
@@ -174,16 +198,28 @@ class ActionDecoder:
 def max_actions_per_carrier(topo: Topology) -> int:
     """Conservative upper bound on legal actions a carrier could ever have.
 
-    For RELOCATE the bound is |reachable|^2 (ordered pairs of distinct
-    endpoints), where `reachable` includes both shelves and rooms.
+    Breakdown per querying carrier C:
+      - RELOCATE: |reachable_C|^2 ordered (src, dst) pairs
+      - MULTI_RELOCATE: for each handoff partner P, |reachable_C| × |reachable_P|
+      - WAIT: 1
     """
     max_n = 0
     for cid in topo.carriers:
-        n_reach = len(topo.accessible_shelves[cid]) + len(topo.accessible_rooms[cid])
+        my_reach = (
+            len(topo.accessible_shelves[cid])
+            + len(topo.accessible_rooms[cid])
+        )
+        multi_relocate = 0
+        for partner in topo.handoff_partners[cid]:
+            p_reach = (
+                len(topo.accessible_shelves[partner])
+                + len(topo.accessible_rooms[partner])
+            )
+            multi_relocate += my_reach * p_reach
         n = (
-            n_reach * max(0, n_reach - 1)  # relocate (src, dst) ordered pairs
-            + len(topo.handoff_partners[cid])  # move_to_partner
-            + 1  # wait
+            my_reach * max(0, my_reach - 1)  # single-carrier relocate
+            + multi_relocate                  # multi-carrier via handoff
+            + 1                               # wait
         )
         max_n = max(max_n, n)
     return max_n

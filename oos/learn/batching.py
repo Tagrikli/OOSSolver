@@ -30,14 +30,16 @@ EDGE_TYPES: tuple[str, ...] = (
     "handoff",           # carrier <-> carrier (bidirectional already in obs)
     "transfer",          # carrier -> transfer-shelf
     "transfer_rev",      # transfer-shelf -> carrier
-    "committed",         # carrier -> currently-committed target (Relocate dst, partner, ...)
+    "committed",         # carrier -> currently-committed target (Relocate/MultiRelocate dst)
     "committed_rev",     # target -> carrier
-    # Source half of the (carrier, src, dst) triplet for an in-flight Relocate.
-    # Pairs with `committed` so pointer attention along both edges sees the
-    # full structural relationship "this carrier is moving the pallet from
-    # in_flight_src to committed."
-    "in_flight_src",     # carrier -> Relocate src (shelf or room)
+    # Source half of the (carrier, src, dst) triplet for in-flight
+    # Relocate/MultiRelocate. Together with `committed`, gives pointer
+    # attention direct access to both ends of the in-flight commitment.
+    "in_flight_src",     # carrier -> Relocate/MultiRelocate src
     "in_flight_src_rev", # src -> carrier
+    # Partner edge during in-flight MultiRelocate: A <-> B. Bidirectional
+    # in the obs already (we emit both directions), so no _rev mirror.
+    "in_flight_partner", # carrier <-> partner carrier
 )
 
 
@@ -57,6 +59,7 @@ class Sample:
     edges_transfer: np.ndarray
     edges_committed: np.ndarray
     edges_in_flight_src: np.ndarray
+    edges_in_flight_partner: np.ndarray
 
     # Action layout.
     action_mask: np.ndarray         # [N_max] int8
@@ -82,8 +85,9 @@ class Batch:
     querying: torch.Tensor       # [B] long, local carrier idx in [0, Nc)
     action_mask: torch.Tensor    # [B, N_max] bool
     type_per_slot: torch.Tensor  # [B, N_max] long (ActionType.value); 0 where invalid
-    target_per_slot: torch.Tensor  # [B, N_max] long. For RELOCATE = dst node; for MOVE_TO_PARTNER = partner node; 0 for WAIT or invalid.
-    source_per_slot: torch.Tensor  # [B, N_max] long. RELOCATE-only — src node idx; 0 for non-RELOCATE/invalid.
+    target_per_slot: torch.Tensor  # [B, N_max] long. dst node for both RELOCATE and MULTI_RELOCATE; 0 for WAIT or invalid.
+    source_per_slot: torch.Tensor  # [B, N_max] long. src node for both RELOCATE and MULTI_RELOCATE; 0 otherwise.
+    partner_per_slot: torch.Tensor # [B, N_max] long. MULTI_RELOCATE-only — partner carrier node idx; 0 otherwise.
 
     # Constants (handy for the network).
     n_carriers: int
@@ -135,23 +139,19 @@ class GraphCollator:
         raise ValueError(f"unknown location {loc!r}")
 
     def _target_node_idx(self, entry: ActionEntry) -> int:
-        """Concat-space node idx for an entry's primary target (the one the
-        pointer-attention scorer uses as the 'destination'-ish slot).
-        Returns 0 for WAIT."""
+        """Concat-space node idx for an entry's destination — the dst
+        location for RELOCATE and MULTI_RELOCATE. Returns 0 for WAIT."""
         if entry.type == ActionType.WAIT:
             return 0
-        if entry.type == ActionType.RELOCATE:
+        if entry.type in (ActionType.RELOCATE, ActionType.MULTI_RELOCATE):
             assert entry.dst is not None
             return self._location_node_idx(entry.dst)
-        if entry.type == ActionType.MOVE_TO_PARTNER:
-            assert entry.target is not None
-            return self._carrier_node[entry.target]
         raise ValueError(f"unknown action type {entry.type}")
 
     def _source_node_idx(self, entry: ActionEntry) -> int:
-        """Concat-space node idx for the entry's source location. Only
-        meaningful for RELOCATE; 0 otherwise."""
-        if entry.type == ActionType.RELOCATE:
+        """Concat-space node idx for the entry's source location. Meaningful
+        for both RELOCATE and MULTI_RELOCATE; 0 otherwise."""
+        if entry.type in (ActionType.RELOCATE, ActionType.MULTI_RELOCATE):
             assert entry.src is not None
             return self._location_node_idx(entry.src)
         return 0
@@ -201,6 +201,9 @@ class GraphCollator:
             push("transfer", s.edges_transfer, "transfer_rev")
             push("committed", s.edges_committed, "committed_rev")
             push("in_flight_src", s.edges_in_flight_src, "in_flight_src_rev")
+            # in_flight_partner is already bidirectional in the env obs (both
+            # A→B and B→A are emitted); don't duplicate via also_rev.
+            push("in_flight_partner", s.edges_in_flight_partner, None)
 
         edges: dict[str, torch.Tensor] = {}
         for t in EDGE_TYPES:
@@ -221,11 +224,15 @@ class GraphCollator:
         type_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
         target_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
         source_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
+        partner_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
         for b, s in enumerate(samples):
             for i, entry in enumerate(s.action_entries):
                 type_per_slot[b, i] = int(entry.type)
                 target_per_slot[b, i] = self._target_node_idx(entry)
                 source_per_slot[b, i] = self._source_node_idx(entry)
+                if entry.type == ActionType.MULTI_RELOCATE:
+                    assert entry.partner is not None
+                    partner_per_slot[b, i] = self._carrier_node[entry.partner]
 
         return Batch(
             carrier_x=carrier_x,
@@ -238,6 +245,7 @@ class GraphCollator:
             type_per_slot=type_per_slot,
             target_per_slot=target_per_slot,
             source_per_slot=source_per_slot,
+            partner_per_slot=partner_per_slot,
             n_carriers=self.n_c,
             n_shelves=self.n_s,
             n_rooms=self.n_r,
@@ -260,6 +268,7 @@ def sample_from_env_step(
         edges_transfer=info["edges_transfer"],
         edges_committed=info["edges_committed"],
         edges_in_flight_src=info["edges_in_flight_src"],
+        edges_in_flight_partner=info["edges_in_flight_partner"],
         action_mask=np.asarray(obs["action_mask"]),
         action_entries=list(action_entries),
         querying_carrier=int(obs["querying_carrier"]),

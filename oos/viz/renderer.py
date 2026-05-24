@@ -8,8 +8,7 @@ from dataclasses import dataclass, field
 import pygame
 
 from oos.sim.actions import (
-    Handoff,
-    MoveToPartner,
+    MultiRelocate,
     Relocate,
 )
 from oos.sim.facility import Facility
@@ -396,16 +395,24 @@ class Renderer:
         for cid, cs in facility.state.carriers.items():
             strip = self.layout.strips[cid]
             cmd = cs.current_command
-            # Position interpolation stays phased (move→src, take-op,
-            # move→dst, place-op) so the carrier visually follows its physical
-            # trajectory. The load shown matches the observation overlay:
-            # in-transit pallet throughout a Relocate, sim cs.load otherwise.
+            # Position interpolation is phase-aware for the multi-step
+            # commands (Relocate and MultiRelocate) so the carrier visually
+            # follows its actual physical trajectory through each sub-phase.
+            # The load shown matches the observation overlay, so what the
+            # human sees mirrors what the agent sees in features.
             if (
                 isinstance(cmd, Relocate)
                 and cs.command_started_at is not None
             ):
                 pos_now, _ = _relocate_visual_state(
                     facility, cid, rs.anim_now,
+                )
+            elif (
+                isinstance(cmd, MultiRelocate)
+                and cs.command_started_at is not None
+            ):
+                pos_now = _multi_relocate_visual_position(
+                    facility, cid, cmd, rs.anim_now,
                 )
             else:
                 pos_now = _interpolated_position(facility, cid, rs.anim_now)
@@ -560,22 +567,111 @@ def _relocate_visual_state(facility: Facility, carrier_id: str, anim_now: float)
     return dst_pos, None
 
 
+def _multi_relocate_visual_position(
+    facility: Facility, carrier_id: str, cmd, anim_now: float,
+) -> float:
+    """Phase-aware physical position for a carrier mid-MultiRelocate.
+
+    For the initiator A:
+        Phase 1: travel from A_start to src
+        Phase 2: take_op at src (stationary)
+        Phase 3: travel from src to A's handoff pose
+        Phase 4+: stationary at A's handoff pose (post-handoff A is "done"
+                  with its motion even though it remains locked until B finishes)
+
+    For the partner B:
+        Phase 1: travel from B_start to B's handoff pose
+        Phase 2: stationary at B's handoff pose (waiting for handoff)
+        Phase 3: post-handoff travel from B's handoff pose to dst
+        Phase 4: stationary at dst (give_op)
+    """
+    state = facility.state
+    topo = facility.topology
+    durs = facility.durations
+    a_cs = state.carriers[cmd.carrier_id]
+    b_cs = state.carriers[cmd.partner_id]
+    a_car = topo.carriers[cmd.carrier_id]
+    b_car = topo.carriers[cmd.partner_id]
+    pair = (cmd.carrier_id, cmd.partner_id)
+    a_pose, b_pose = topo.handoff_positions[pair]
+    a_start = (
+        a_cs.command_start_position
+        if a_cs.command_start_position is not None
+        else a_cs.position
+    )
+    b_start = (
+        b_cs.command_start_position
+        if b_cs.command_start_position is not None
+        else b_cs.position
+    )
+    src_pos = _location_visual_pos(cmd.src, cmd.carrier_id, topo)
+    dst_pos = _location_visual_pos(cmd.dst, cmd.partner_id, topo)
+    if src_pos is None or dst_pos is None:
+        return float(state.carriers[carrier_id].position)
+    take_op = (
+        durs.shelf_op("take", topo.shelves[cmd.src])
+        if cmd.src in topo.shelves else 0.0
+    )
+    a_to_src = durs.move(a_car, a_start, src_pos)
+    a_to_handoff = durs.move(a_car, src_pos, a_pose)
+    a_at_handoff_t = a_to_src + take_op + a_to_handoff
+    b_to_handoff = durs.move(b_car, b_start, b_pose)
+    sync_done_t = max(a_at_handoff_t, b_to_handoff)
+    handoff_done_t = sync_done_t + durs.handoff()
+    b_to_dst = durs.move(b_car, b_pose, dst_pos)
+
+    elapsed = max(0.0, anim_now - (a_cs.command_started_at or 0.0))
+
+    if carrier_id == cmd.carrier_id:
+        # A's trajectory.
+        if elapsed < a_to_src:
+            frac = elapsed / max(a_to_src, 1e-9)
+            return a_start + frac * (src_pos - a_start)
+        e = elapsed - a_to_src
+        if e < take_op:
+            return float(src_pos)
+        e -= take_op
+        if e < a_to_handoff:
+            frac = e / max(a_to_handoff, 1e-9)
+            return src_pos + frac * (a_pose - src_pos)
+        return float(a_pose)
+
+    if carrier_id == cmd.partner_id:
+        # B's trajectory.
+        if elapsed < b_to_handoff:
+            frac = elapsed / max(b_to_handoff, 1e-9)
+            return b_start + frac * (b_pose - b_start)
+        # B holds at handoff pose until both arrived + handoff_op done.
+        if elapsed < handoff_done_t:
+            return float(b_pose)
+        e = elapsed - handoff_done_t
+        if e < b_to_dst:
+            frac = e / max(b_to_dst, 1e-9)
+            return b_pose + frac * (dst_pos - b_pose)
+        return float(dst_pos)
+
+    return float(state.carriers[carrier_id].position)
+
+
 def _command_end_position(facility: Facility, cmd, carrier_id: str):
+    """Visual endpoint where the carrier ends up when `cmd` completes.
+
+    For Relocate this is dst. For MultiRelocate it depends on which carrier
+    is being queried: A (initiator) ends at the handoff pose; B (partner)
+    ends at dst. The full phase-aware visual position for both is computed
+    by `_multi_relocate_visual_state` — this function is a coarser fallback
+    used only by the unphased `_interpolated_position` path.
+    """
     topo = facility.topology
     if isinstance(cmd, Relocate):
-        # Visual end is the destination — the source is just a waypoint.
-        # (Relocate's full sub-phase visualization lives in
-        # `_relocate_visual_state`; this is only used as a fallback by
-        # `_interpolated_position` for non-Relocate code paths.)
         return _location_visual_pos(cmd.dst, carrier_id, topo)
-    if isinstance(cmd, MoveToPartner):
-        pair = (carrier_id, cmd.partner_id)
-        if pair in topo.handoff_positions:
-            return topo.handoff_positions[pair][0]
-        for s in topo.shelves.values():
-            if s.is_transfer and carrier_id in s.access and cmd.partner_id in s.access:
-                return s.position_for[carrier_id]
-        return None
-    if isinstance(cmd, Handoff):
+    if isinstance(cmd, MultiRelocate):
+        pair = (cmd.carrier_id, cmd.partner_id)
+        if carrier_id == cmd.carrier_id:
+            if pair in topo.handoff_positions:
+                return topo.handoff_positions[pair][0]
+            return None
+        if carrier_id == cmd.partner_id:
+            return _location_visual_pos(cmd.dst, carrier_id, topo)
         return None
     return None
