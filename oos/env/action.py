@@ -23,8 +23,8 @@ from oos.sim.actions import (
     Relocate,
     Wait,
 )
-from oos.sim.state import FacilityState
-from oos.sim.tasks import TaskQueue
+from oos.sim.state import FacilityState, Pallet
+from oos.sim.tasks import Retrieve, Store, TaskQueue
 from oos.sim.topology import CarrierId, Topology
 
 
@@ -84,6 +84,19 @@ def enumerate_actions(
     entries: list[ActionEntry] = []
     cs = state.carriers[carrier]
 
+    # "Must cleanup" constraint: if the carrier just dropped cargo into a
+    # room that didn't get consumed (junk placement, or store fill awaiting
+    # stow), it is now forced to take that cargo back out. The constraint
+    # auto-clears if the room's load vanished for any reason (another carrier
+    # cleared it, etc.) — we re-check here so a stale field doesn't trap us.
+    forced_src: LocationId | None = None
+    if cs.must_relocate_from is not None:
+        room_id = cs.must_relocate_from
+        if room_id in state.rooms and state.rooms[room_id].load is not None:
+            forced_src = room_id
+        else:
+            cs.must_relocate_from = None
+
     # RELOCATE: every (src, dst) pair across reachable locations.
     # Reachable = shelves in topo.accessible_shelves[carrier] ∪ rooms in
     # topo.accessible_rooms[carrier]. Rooms behave as 1-cap virtual shelves.
@@ -91,6 +104,10 @@ def enumerate_actions(
         reachable: list[LocationId] = list(topo.accessible_shelves[carrier])
         reachable.extend(topo.accessible_rooms[carrier])
         for src in reachable:
+            # Hard constraint: under cleanup, src must be the room we owe a
+            # take from. All other sources are masked.
+            if forced_src is not None and src != forced_src:
+                continue
             # Skip src if it's the location we just dropped at (immediate undo).
             if src == cs.last_give_shelf:
                 continue
@@ -106,13 +123,16 @@ def enumerate_actions(
                         type=ActionType.RELOCATE, src=src, dst=dst,
                     ))
 
-    # MOVE_TO_PARTNER: position for a future (auto-fired) handoff.
-    for other in topo.handoff_partners[carrier]:
-        cmd = MoveToPartner(carrier_id=carrier, partner_id=other)
-        if _ok(cmd, state, topo):
-            entries.append(ActionEntry(
-                type=ActionType.MOVE_TO_PARTNER, target=other,
-            ))
+    # MOVE_TO_PARTNER: position for a future (auto-fired) handoff. Masked
+    # entirely while the carrier owes a cleanup — no wandering off while a
+    # room is stuck with cargo this carrier dropped.
+    if forced_src is None:
+        for other in topo.handoff_partners[carrier]:
+            cmd = MoveToPartner(carrier_id=carrier, partner_id=other)
+            if _ok(cmd, state, topo):
+                entries.append(ActionEntry(
+                    type=ActionType.MOVE_TO_PARTNER, target=other,
+                ))
 
     # WAIT: always legal. Event-driven idle — the carrier sits out this
     # decision instant and gets re-queried after any scheduler event.

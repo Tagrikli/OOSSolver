@@ -1,9 +1,9 @@
-"""Tests for LayoutSnapshot capture/apply/mutate.
+"""Tests for LayoutSnapshot capture/apply and HardnessSignature extraction.
 
 Covers the invariants ACCEL's buffer relies on: snapshot round-trips
-through a facility, mutations preserve per-shelf pallet counts + target
-identity + size-class compatibility, the solvability check agrees with the
-shuffle-module canonical version.
+through a facility, the solvability check agrees with the shuffle-module
+canonical version, and the hardness signature correctly distinguishes
+small-shelf vs big-shelf targets and counts blockers / other-shelf state.
 """
 
 from __future__ import annotations
@@ -12,14 +12,10 @@ import numpy as np
 
 from oos.facilities import get_facility
 from oos.learn.layout import (
+    HardnessSignature,
     LayoutSnapshot,
     apply_snapshot_to_facility,
-    mutate_empty_one,
-    mutate_fill_one,
-    mutate_once,
-    mutate_repick_target,
-    mutate_shuffle_shelf,
-    mutate_swap_contents,
+    hardness_signature,
     snapshot_from_facility,
     snapshot_is_solvable,
 )
@@ -52,14 +48,6 @@ def _make_snapshot(seed: int = 0, fullness: float = 0.7) -> tuple[LayoutSnapshot
     return snapshot_from_facility(fac, target), fac
 
 
-def _per_shelf_counts(snap: LayoutSnapshot) -> dict[str, int]:
-    return {sid: len(stk) for sid, stk in snap.shelves}
-
-
-def _all_pallet_ids(snap: LayoutSnapshot) -> set[int]:
-    return {pid for _, stk in snap.shelves for pid, _ in stk}
-
-
 def test_snapshot_roundtrip():
     snap, fac = _make_snapshot()
     fac2 = _build_facility()
@@ -69,7 +57,6 @@ def test_snapshot_roundtrip():
 
 
 def test_snapshot_is_solvable_agrees_with_shuffle():
-    # A solvable-required shuffle should pass our snapshot solvability check.
     fac = _build_facility()
     shuffle_state(fac, fullness=0.7, rng=np.random.default_rng(0),
                   require_solvable=True)
@@ -80,85 +67,76 @@ def test_snapshot_is_solvable_agrees_with_shuffle():
     assert snapshot_is_solvable(snap, fac.topology)
 
 
-def test_swap_contents_preserves_invariants():
-    snap, fac = _make_snapshot()
-    rng = np.random.default_rng(0)
-    out = mutate_swap_contents(snap, rng, fac.topology)
-    assert out is not None
-    assert _per_shelf_counts(out) == _per_shelf_counts(snap)
-    assert _all_pallet_ids(out) == _all_pallet_ids(snap)
-    assert out.target_pallet_id == snap.target_pallet_id
+def test_hardness_signature_small_target():
+    """For a small-shelf target only target_depth matters; the big-shelf
+    fields stay at their defaults (0)."""
+    fac = _build_facility()
+    shuffle_state(fac, fullness=0.7, rng=np.random.default_rng(0))
+    # Find a non-empty pallet on a small shelf and use it as target.
+    target = None
+    for sid, ss in fac.state.shelves.items():
+        if fac.topology.shelves[sid].size_class != "small":
+            continue
+        for p in ss.stack:
+            if not p.is_empty:
+                target = p.id
+                break
+        if target is not None:
+            break
+    assert target is not None
+    snap = snapshot_from_facility(fac, target)
+    sig = hardness_signature(snap, fac.topology)
+    assert sig.target_size == "small"
+    assert sig.target_depth >= 0
+    # Big-shelf-only fields stay at defaults for a small-shelf target.
+    assert sig.big_blockers == 0
+    assert sig.free_other_big_slots == 0
+    assert sig.nonbig_count_other_big == 0
 
 
-def test_shuffle_shelf_preserves_invariants():
-    snap, fac = _make_snapshot()
-    rng = np.random.default_rng(0)
-    out = mutate_shuffle_shelf(snap, rng, fac.topology)
-    assert out is not None
-    assert _per_shelf_counts(out) == _per_shelf_counts(snap)
-    assert _all_pallet_ids(out) == _all_pallet_ids(snap)
-    assert out.target_pallet_id == snap.target_pallet_id
-
-
-def test_fill_one_increases_filled_count():
-    snap, fac = _make_snapshot(fullness=0.4)  # leaves headroom for filling
-    rng = np.random.default_rng(0)
-    out = mutate_fill_one(snap, rng, fac.topology)
-    assert out is not None
-    before = sum(1 for _, stk in snap.shelves for _, c in stk if c != "empty")
-    after = sum(1 for _, stk in out.shelves for _, c in stk if c != "empty")
-    assert after == before + 1
-
-
-def test_empty_one_decreases_filled_count():
-    snap, fac = _make_snapshot(fullness=0.7)
-    rng = np.random.default_rng(0)
-    out = mutate_empty_one(snap, rng, fac.topology)
-    assert out is not None
-    before = sum(1 for _, stk in snap.shelves for _, c in stk if c != "empty")
-    after = sum(1 for _, stk in out.shelves for _, c in stk if c != "empty")
-    assert after == before - 1
-
-
-def test_repick_target_changes_target_only():
-    snap, fac = _make_snapshot()
-    rng = np.random.default_rng(0)
-    out = mutate_repick_target(snap, rng, fac.topology)
-    assert out is not None
-    assert out.shelves == snap.shelves            # layout unchanged
-    assert out.target_pallet_id != snap.target_pallet_id
-
-
-def test_mutations_never_target_the_target_pallet():
-    """Target pallet's contents must never be modified by fill/empty/swap."""
-    snap, fac = _make_snapshot()
-    target_id = snap.target_pallet_id
-    rng = np.random.default_rng(0)
-    for op in (mutate_swap_contents, mutate_fill_one, mutate_empty_one):
-        for _ in range(20):
-            out = op(snap, rng, fac.topology)
-            if out is None:
+def test_hardness_signature_big_target_counts_blockers():
+    """For a big-shelf target the signature counts big blockers above target
+    and surveys other-big-shelf occupancy."""
+    fac = _build_facility()
+    shuffle_state(fac, fullness=0.95, rng=np.random.default_rng(0))
+    # Find a non-empty pallet on a big shelf at non-zero depth so the
+    # blocker count is meaningfully testable.
+    target = None
+    expected_depth = 0
+    for sid, ss in fac.state.shelves.items():
+        if fac.topology.shelves[sid].size_class != "big":
+            continue
+        n = len(ss.stack)
+        for i, p in enumerate(ss.stack):
+            if p.is_empty:
                 continue
-            # Find target contents in both before and after.
-            def _target_contents(s):
-                for _, stk in s.shelves:
-                    for pid, cnt in stk:
-                        if pid == target_id:
-                            return cnt
-                return None
-            assert _target_contents(out) == _target_contents(snap)
+            depth = n - 1 - i
+            if depth >= 1:
+                target = p.id
+                expected_depth = depth
+                break
+        if target is not None:
+            break
+    assert target is not None
+    snap = snapshot_from_facility(fac, target)
+    sig = hardness_signature(snap, fac.topology)
+    assert sig.target_size == "big"
+    assert sig.target_depth == expected_depth
+    # Big-shelf fields populated; values depend on random seed but are
+    # non-negative and bounded by topology.
+    assert 0 <= sig.big_blockers <= sig.target_depth
+    assert sig.free_other_big_slots >= 0
+    assert sig.nonbig_count_other_big >= 0
 
 
-def test_mutate_once_drops_unsolvable_mutants():
-    """When require_solvable=True, no unsolvable mutant is ever returned."""
-    snap, fac = _make_snapshot(fullness=0.95)
-    rng = np.random.default_rng(0)
-    for _ in range(20):
-        out = mutate_once(
-            snap, rng, fac.topology,
-            ops_enabled=("swap_contents", "shuffle_shelf", "fill_one",
-                         "empty_one", "repick_target"),
-            require_solvable=True,
-        )
-        if out is not None:
-            assert snapshot_is_solvable(out, fac.topology)
+def test_hardness_signature_equality_for_isomorphic_layouts():
+    """Two snapshots that are identical (same snap → same snap) trivially
+    share a signature. Different layouts may or may not — this just confirms
+    the equality semantics work."""
+    snap, fac = _make_snapshot(seed=0)
+    sig1 = hardness_signature(snap, fac.topology)
+    sig2 = hardness_signature(snap, fac.topology)
+    assert sig1 == sig2
+    # Sanity: it's frozen and hashable.
+    assert hash(sig1) == hash(sig2)
+    _ = {sig1, sig2}  # set construction

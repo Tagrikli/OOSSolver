@@ -18,18 +18,26 @@ Loop contract:
   - After the iter, `record(snapshot, buffer_index, success_rate)` either
     EMA-updates a replayed entry's regret or admits a fresh snapshot if
     its observed regret clears the floor.
-  - Every `mutate_every` iters, `maybe_mutate(it, rng, topology)` evolves
-    the top-K hardest entries by chaining `edit_steps` single-edit ops.
+  - Every `mutate_every` iters, `maybe_mutate(it, rng, mutator)` asks the
+    trainer-supplied `mutator(parent_snap, rng)` to produce a same-
+    hardness-class variant of each top-K parent. The trainer's mutator
+    is typically "regenerate a random layout that matches the parent's
+    HardnessSignature" (see train_retrieve._make_mutator).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 import numpy as np
 
-from oos.learn.layout import LayoutSnapshot, mutate_once
+from oos.learn.layout import LayoutSnapshot
+
+# Mutator API: given a parent snapshot and rng, produce a same-hardness
+# variant. Returns None if no valid variant could be generated within the
+# implementation's attempt budget.
+Mutator = Callable[[LayoutSnapshot, np.random.Generator], Optional[LayoutSnapshot]]
 
 
 @dataclass
@@ -52,16 +60,7 @@ class ACCELConfig:
     # Mutation
     mutate_every: int = 10               # iters between mutation passes
     mutation_parents: int = 4            # top-K hardest entries used as parents
-    edit_steps: int = 3                  # ops chained per parent (lineage length)
-    require_solvable: bool = True        # drop mutants that fail solvability
-    # Names of enabled mutation operators (must exist in layout.MUTATION_OPS).
-    mutation_ops: tuple[str, ...] = (
-        "swap_contents",
-        "shuffle_shelf",
-        "fill_one",
-        "empty_one",
-        "repick_target",
-    )
+    edit_steps: int = 2                  # attempts per parent to find a same-hardness variant
     # Early-stop metric
     metric_top_k: int = 5                # avg success across top-K hardest entries
     metric_min_visits: int = 2           # entries with fewer visits aren't trusted
@@ -158,13 +157,19 @@ class ACCELTeacher:
     # Mutation
     # ------------------------------------------------------------------
     def maybe_mutate(
-        self, it: int, rng: np.random.Generator, topology,
+        self, it: int, rng: np.random.Generator, mutator: Mutator,
     ) -> int:
-        """Every `mutate_every` iters, take the top-K hardest entries and
-        chain `edit_steps` single-edit mutations off each. Each link's regret
-        is initialized at the parent's — if it later gets sampled and proves
-        easy, `record()` will drop its regret and evict it. Returns count of
-        mutants admitted."""
+        """Every `mutate_every` iters, take the top-K hardest parents and
+        ask the trainer-supplied mutator for up to `edit_steps` same-
+        hardness variants of each. Each accepted variant is admitted at the
+        parent's regret as an optimistic initial estimate; if it later turns
+        out to be easy (regret drops below the floor on re-eval) it gets
+        evicted naturally.
+
+        The mutator is opaque to ACCEL — typically "regenerate a random
+        layout whose HardnessSignature matches the parent's." See
+        train_retrieve._make_mutator. Returns the count of variants admitted.
+        """
         if self.cfg.mutate_every <= 0 or not self.buffer:
             return 0
         if it % self.cfg.mutate_every != 0:
@@ -174,16 +179,10 @@ class ACCELTeacher:
         )[: self.cfg.mutation_parents]
         added = 0
         for parent in ranked:
-            snap = parent.snapshot
             for _ in range(self.cfg.edit_steps):
-                mutant = mutate_once(
-                    snap, rng, topology,
-                    ops_enabled=self.cfg.mutation_ops,
-                    require_solvable=self.cfg.require_solvable,
-                )
+                mutant = mutator(parent.snapshot, rng)
                 if mutant is None:
-                    break  # lineage stalled — move to next parent
-                snap = mutant
+                    break  # generator gave up — move to next parent
                 self._admit(BufferEntry(
                     snapshot=mutant, regret=parent.regret, n_visits=0,
                 ))

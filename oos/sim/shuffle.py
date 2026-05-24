@@ -132,6 +132,7 @@ def _place_pallets(
         cs.voluntarily_idle = False
         cs.last_take_shelf = None
         cs.last_give_shelf = None
+        cs.must_relocate_from = None
     for rs in facility.state.rooms.values():
         rs.load = None
     facility.scheduler = Scheduler()

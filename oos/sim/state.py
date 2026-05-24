@@ -65,6 +65,14 @@ class CarrierState:
     # multi-step sequences. Cleared on shuffle/reset.
     last_take_shelf: Optional[str] = None
     last_give_shelf: Optional[str] = None
+    # When the carrier finishes a Relocate-to-room and the room still holds
+    # cargo (didn't get consumed by the auto-serve), this is set to that
+    # room id. While set, enumerate_actions only emits Relocate entries with
+    # src=must_relocate_from for this carrier — forcing immediate cleanup
+    # and preventing the room from being used as temporary storage. Cleared
+    # when a Relocate-from-that-room completes, or when the room's load
+    # vanishes for any other reason. Wiped on shuffle/reset.
+    must_relocate_from: Optional[str] = None
 
     @property
     def is_idle(self) -> bool:

@@ -1587,19 +1587,21 @@ class DistributionPanel:
             fonts.tiny, CYAN_MID,
         )
 
-        # Chart geometry — one bar per ALL slots (legal + illegal). Illegal
-        # slots draw as faint gray placeholders so the user can see the
-        # entire action space, not just the legal subset.
+        # Chart geometry — one bar per LEGAL slot only. Illegal slots are not
+        # rendered (no value in a wall of gray placeholders), so the legal
+        # distribution gets the chart's full horizontal range.
         chart_top = inner.top + 18
         chart_h = inner.bottom - chart_top - 4
         chart_left = inner.left + 4
         chart_w = inner.w - 8
-        if chart_h <= 4 or n_total == 0:
+        if chart_h <= 4 or n_legal == 0:
             return
+
+        legal_indices = list(np.flatnonzero(mask))  # original slot ids, in order
 
         # Per-bar width including 1px gap. Bars get at least 1px.
         gap = 1
-        cell_w = max(2, (chart_w + gap) // n_total)
+        cell_w = max(2, (chart_w + gap) // n_legal)
         bar_w = max(1, cell_w - gap)
 
         # Baseline.
@@ -1609,43 +1611,31 @@ class DistributionPanel:
             (chart_left + chart_w, chart_top + chart_h), 1,
         )
 
-        # Peak prob over LEGAL bars only — illegal slots are ignored when
-        # computing the normalization so the legal distribution still uses
-        # the chart's full vertical range.
         peak = float(probs[mask].max()) if mask.any() else 1.0
 
-        # Pass 1: paint all bars.
-        hovered_idx: Optional[int] = None
-        for i in range(n_total):
-            x = chart_left + i * cell_w
+        # Pass 1: paint the legal bars.
+        hovered_slot: Optional[int] = None  # original slot id of the hovered bar
+        for rank, slot_i in enumerate(legal_indices):
+            x = chart_left + rank * cell_w
             if x + bar_w > chart_left + chart_w:
                 break
-            if mask[i]:
-                h = int(chart_h * (probs[i] / peak)) if peak > 0 else 0
-                color = MAGENTA_BRIGHT if i == chosen else LIME_BRIGHT
-                bar_rect = pygame.Rect(x, chart_top + chart_h - h, bar_w, h)
-                pygame.draw.rect(surface, color, bar_rect)
-            else:
-                # Illegal: short faint-gray placeholder so the slot is visible
-                # but visually subordinate. Height = ~10% of chart for a
-                # consistent footprint regardless of count.
-                h = max(2, chart_h // 10)
-                bar_rect = pygame.Rect(x, chart_top + chart_h - h, bar_w, h)
-                pygame.draw.rect(surface, BASE_GUTTER, bar_rect)
+            h = int(chart_h * (probs[slot_i] / peak)) if peak > 0 else 0
+            color = MAGENTA_BRIGHT if slot_i == chosen else LIME_BRIGHT
+            bar_rect = pygame.Rect(x, chart_top + chart_h - h, bar_w, h)
+            pygame.draw.rect(surface, color, bar_rect)
 
             # Hover detection (over the full vertical slot, not just the bar).
             if mouse_pos is not None:
                 slot_rect = pygame.Rect(x, chart_top, bar_w, chart_h)
                 if slot_rect.collidepoint(mouse_pos):
-                    hovered_idx = i
+                    hovered_slot = int(slot_i)
 
-        # Pass 2: tooltip for the hovered slot, drawn on top of everything.
-        if hovered_idx is not None and mouse_pos is not None:
+        # Pass 2: tooltip for the hovered legal bar.
+        if hovered_slot is not None and mouse_pos is not None:
             self._draw_tooltip(
                 surface, fonts,
-                slot_idx=hovered_idx,
-                is_legal=bool(mask[hovered_idx]),
-                prob=float(probs[hovered_idx]) if mask[hovered_idx] else 0.0,
+                slot_idx=hovered_slot,
+                prob=float(probs[hovered_slot]),
                 action_entries=action_entries or [],
                 anchor=mouse_pos,
                 clip_rect=inner,
@@ -1656,24 +1646,34 @@ class DistributionPanel:
         surface: pygame.Surface,
         fonts: Fonts,
         slot_idx: int,
-        is_legal: bool,
         prob: float,
         action_entries: list,
         anchor: tuple[int, int],
         clip_rect: pygame.Rect,
     ) -> None:
-        """Beveled tooltip near the cursor describing the hovered bar."""
-        if is_legal and 0 <= slot_idx < len(action_entries):
+        """Beveled tooltip near the cursor describing the hovered legal bar.
+
+        Action label format by type:
+          RELOCATE         → "RELOCATE   src → dst"   (e.g. "B2 → S4")
+          MOVE_TO_PARTNER  → "MOVE_TO_PARTNER   partner"
+          WAIT             → "WAIT"
+        """
+        accent = MAGENTA_BRIGHT
+        if 0 <= slot_idx < len(action_entries):
             entry = action_entries[slot_idx]
             type_name = entry.type.name if hasattr(entry, "type") else "?"
-            target = entry.target if hasattr(entry, "target") else None
-            label = type_name if target is None else f"{type_name}  {target}"
-            sub = f"slot {slot_idx}   p={prob:.3f}"
-            accent = MAGENTA_BRIGHT
+            src = getattr(entry, "src", None)
+            dst = getattr(entry, "dst", None)
+            target = getattr(entry, "target", None)
+            if src is not None and dst is not None:
+                label = f"{type_name}   {src} → {dst}"
+            elif target is not None:
+                label = f"{type_name}   {target}"
+            else:
+                label = type_name
         else:
-            label = "(illegal / padding)"
-            sub = f"slot {slot_idx}"
-            accent = BASE_MUTED
+            label = "?"
+        sub = f"slot {slot_idx}   p={prob:.3f}"
 
         pad = 6
         label_surf = fonts.small.render(label, True, SOFT_WHITE)

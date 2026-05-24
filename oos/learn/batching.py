@@ -30,8 +30,14 @@ EDGE_TYPES: tuple[str, ...] = (
     "handoff",           # carrier <-> carrier (bidirectional already in obs)
     "transfer",          # carrier -> transfer-shelf
     "transfer_rev",      # transfer-shelf -> carrier
-    "committed",         # carrier -> currently-committed target
+    "committed",         # carrier -> currently-committed target (Relocate dst, partner, ...)
     "committed_rev",     # target -> carrier
+    # Source half of the (carrier, src, dst) triplet for an in-flight Relocate.
+    # Pairs with `committed` so pointer attention along both edges sees the
+    # full structural relationship "this carrier is moving the pallet from
+    # in_flight_src to committed."
+    "in_flight_src",     # carrier -> Relocate src (shelf or room)
+    "in_flight_src_rev", # src -> carrier
 )
 
 
@@ -50,6 +56,7 @@ class Sample:
     edges_handoff: np.ndarray
     edges_transfer: np.ndarray
     edges_committed: np.ndarray
+    edges_in_flight_src: np.ndarray
 
     # Action layout.
     action_mask: np.ndarray         # [N_max] int8
@@ -193,6 +200,7 @@ class GraphCollator:
             push("handoff", s.edges_handoff, None)
             push("transfer", s.edges_transfer, "transfer_rev")
             push("committed", s.edges_committed, "committed_rev")
+            push("in_flight_src", s.edges_in_flight_src, "in_flight_src_rev")
 
         edges: dict[str, torch.Tensor] = {}
         for t in EDGE_TYPES:
@@ -251,6 +259,7 @@ def sample_from_env_step(
         edges_handoff=info["edges_handoff"],
         edges_transfer=info["edges_transfer"],
         edges_committed=info["edges_committed"],
+        edges_in_flight_src=info["edges_in_flight_src"],
         action_mask=np.asarray(obs["action_mask"]),
         action_entries=list(action_entries),
         querying_carrier=int(obs["querying_carrier"]),

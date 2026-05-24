@@ -186,11 +186,15 @@ class Facility:
     def toggle_retrieve_for_pallet(self, pallet_id: PalletId) -> bool:
         """If a pending Retrieve for this pallet exists, remove it; else add one.
         Returns True if a Retrieve is now pending for this pallet, False otherwise.
-        Wakes WAIT-ing carriers on add so they react at the next env advance.
+
+        Wakes WAIT-ing carriers in either direction — the optimal next action
+        can change whether the Retrieve was just added (now there's work) or
+        just removed (the carrier may have been heading to fetch this pallet).
         """
         for t in self.queue.pending:
             if isinstance(t, Retrieve) and t.pallet == pallet_id:
                 self.queue.remove(t)
+                self._wake_waiting_carriers()
                 return False
         if not _pallet_exists(self, pallet_id):
             return False
@@ -355,6 +359,23 @@ class Facility:
         # room.load is Relocate-to-room, so that's the trigger.
         if isinstance(cmd, Relocate) and cmd.dst in self.topology.rooms:
             self._try_auto_serve_room(cmd.dst, completions)
+
+        # "Must cleanup" constraint maintenance:
+        #   - Cleared when a Relocate FROM a room (the previous cleanup
+        #     anchor) completes. The carrier just took the cargo out, the
+        #     room is now free, the constraint is satisfied.
+        #   - Set when a Relocate TO a room ends with the room STILL holding
+        #     cargo after the auto-serve attempt — meaning either the
+        #     dropped pallet didn't match any pending task (junk placement)
+        #     or the customer just filled an empty pallet for a Store and
+        #     it now needs to be stowed somewhere. Either way the carrier's
+        #     next legal action is forced to be "take it back out."
+        if isinstance(cmd, Relocate):
+            if cs.must_relocate_from == cmd.src:
+                cs.must_relocate_from = None
+            if cmd.dst in self.topology.rooms:
+                if self.state.rooms[cmd.dst].load is not None:
+                    cs.must_relocate_from = cmd.dst
         if isinstance(cmd, Handoff):
             # Both ends just finished the handoff at the handoff pose. We
             # deliberately do NOT re-fire auto-handoff here — both would still

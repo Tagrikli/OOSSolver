@@ -193,9 +193,21 @@ class VizApp:
                         else:
                             # Pallet hit-test: toggle a Retrieve for any pallet
                             # whose slot the user clicked (any contents, incl. empty).
+                            # After the toggle, refresh the player's cached
+                            # obs/info so the next policy call sees the new
+                            # queue + the woken (no-longer-voluntarily-idle)
+                            # carriers — otherwise the next step decides
+                            # against pre-click state and the user's click
+                            # has no visible effect until the iteration after.
                             for rect, pallet_id in renderer.pallet_hit_areas:
                                 if rect.collidepoint(pos):
                                     now_pending = facility.toggle_retrieve_for_pallet(pallet_id)
+                                    player.env.refresh_decision_context()  # type: ignore[attr-defined]
+                                    player.obs, player.info = (
+                                        player.env._observation_for_current(  # type: ignore[attr-defined]
+                                            facility, dt=0.0, completions=[], arrivals=[],
+                                        )
+                                    )
                                     toasts.append(Toast(
                                         text=(f"+ RETRIEVE pallet={pallet_id}" if now_pending
                                               else f"– RETRIEVE pallet={pallet_id}"),

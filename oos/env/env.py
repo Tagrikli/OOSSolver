@@ -380,6 +380,7 @@ class OOSEnv(gym.Env):
             "edges_handoff": obs["edges_handoff"],
             "edges_transfer": obs["edges_transfer"],
             "edges_committed": obs["edges_committed"],
+            "edges_in_flight_src": obs["edges_in_flight_src"],
             "dt": dt,
             "completions": completions,
             "arrivals": arrivals,

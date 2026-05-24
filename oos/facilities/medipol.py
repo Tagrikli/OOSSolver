@@ -19,8 +19,7 @@ carrier has a handoff with every long carrier (16 handoffs total).
 Shelf counts
 ------------
   16 big   cap-2  (4 per room-side carrier)
-  17 small cap-3  (2 on c5, 5 on c6/c7/c8)
-  33 small cap-4  (6 on c5, 9 on c6/c7/c8)
+  50 small cap-3  (8 on c5, 14 on c6/c7/c8)
 
 Track layout — same convention on every carrier (positions=30) so the
 vertical viz lines up:
@@ -70,10 +69,8 @@ _ROOM_POS = 0
 _BIG_SHELF_SLOTS = (1, 2, 3, 4)
 _HANDOFF_COL_BASE = 14  # first handoff column; 14..29 are the 16 handoff cols
 
-# Long-carrier shelf counts. Small shelves fill positions 0..N-1; first
-# N_cap3 of them are cap-3, the rest cap-4.
+# Long-carrier shelf counts. All small shelves are cap-3 (max depth 3).
 _LONG_N_SHELVES = {"carrier_5": 8,  "carrier_6": 14, "carrier_7": 14, "carrier_8": 14}
-_LONG_N_CAP3    = {"carrier_5": 2,  "carrier_6": 5,  "carrier_7": 5,  "carrier_8": 5}
 
 
 def _handoff_col(rs_idx: int, lg_idx: int) -> int:
@@ -109,14 +106,11 @@ def make_facility() -> tuple[Topology, SeedingConfig]:
         for i, slot in enumerate(_BIG_SHELF_SLOTS, start=1):
             c.shelf(f"big_{cname}_{i}", at=slot, capacity=2, size="big")
 
-    # Small shelves on long carriers (contiguous at start of track).
+    # Small shelves on long carriers (contiguous at start of track). All cap-3.
     for cname in _LONG_NAMES:
         c = long_carriers[cname]
-        n_shelves = _LONG_N_SHELVES[cname]
-        n_cap3 = _LONG_N_CAP3[cname]
-        for i in range(n_shelves):
-            cap = 3 if i < n_cap3 else 4
-            c.shelf(f"small_{cname}_{i+1}", at=i, capacity=cap, size="small")
+        for i in range(_LONG_N_SHELVES[cname]):
+            c.shelf(f"small_{cname}_{i+1}", at=i, capacity=3, size="small")
 
     # Bipartite handoffs, vertically aligned via the Latin-square column map.
     for rs_idx, rs in enumerate(_ROOM_SIDE_NAMES):

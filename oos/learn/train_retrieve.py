@@ -30,6 +30,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -53,7 +54,12 @@ from oos.learn.network import NetworkConfig, PolicyValueNet
 from oos.learn.normalize import RewardNormalizer
 from oos.learn.ppo import PPOConfig, ppo_update
 from oos.learn.accel import ACCELConfig, ACCELTeacher
-from oos.learn.layout import LayoutSnapshot, snapshot_from_facility
+from oos.learn.layout import (
+    HardnessSignature,
+    LayoutSnapshot,
+    hardness_signature,
+    snapshot_from_facility,
+)
 
 
 def _fg(hex_color: str) -> str:
@@ -250,6 +256,46 @@ def _target_summary(
     return None
 
 
+def _make_mutator(
+    snapshot_env: RetrieveOnlyEnv,
+    topology,
+    args: argparse.Namespace,
+) -> "Callable[[LayoutSnapshot, np.random.Generator], LayoutSnapshot | None]":
+    """Build the ACCEL mutator: given a parent snapshot, regenerate a fresh
+    random layout whose HardnessSignature matches the parent's exactly.
+
+    Replaces the canonical single-knob random-perturbation operators —
+    those don't reliably produce same-hardness neighbors in this domain
+    because the hard region of state space is structurally narrow and
+    random walks fall off it. Signature-matched regeneration guarantees
+    every accepted mutant is in the parent's difficulty equivalence
+    class (same target_size + target_depth, and for big-shelf targets
+    also same big_blockers + free_other_big_slots + nonbig_count_other_big).
+    """
+    max_tries = max(1, int(args.accel_mutator_tries))
+
+    def mutator(
+        parent_snap: LayoutSnapshot, rng: np.random.Generator,
+    ) -> LayoutSnapshot | None:
+        target_sig = hardness_signature(parent_snap, topology)
+        # Use the existing fresh-snapshot path; reject candidates whose
+        # signature doesn't match. The snapshot env's `require_solvable`
+        # is already enforced inside its shuffle; we don't double-check.
+        for _ in range(max_tries):
+            fullness = float(rng.uniform(args.fullness_min, args.fullness_max))
+            seed = int(rng.integers(0, 2**31 - 1))
+            cand = _generate_fresh_snapshot(
+                snapshot_env, fullness=fullness, args=args, seed=seed,
+            )
+            if cand is None:
+                continue
+            if hardness_signature(cand, topology) == target_sig:
+                return cand
+        return None
+
+    return mutator
+
+
 def _generate_fresh_snapshot(
     snapshot_env: RetrieveOnlyEnv,
     fullness: float,
@@ -265,6 +311,11 @@ def _generate_fresh_snapshot(
     snapshot_env._retrieve_cfg = dataclasses.replace(
         _retrieve_config(args, fullness),
         layout_override=None,  # explicit: this env path runs the shuffle
+        # Pin the target's minimum depth during fresh sampling so we
+        # consistently surface deep-dig scenarios. With min_depth=4 and
+        # fullness=0.95 in dibaji, ~63% of shuffles already have a d=4
+        # pallet; reset() re-rolls until one does. None = no constraint.
+        min_depth=args.accel_fresh_min_depth or None,
     )
     snapshot_env.reset(seed=seed)
     target_id = snapshot_env._target_pallet_id
@@ -428,17 +479,26 @@ def main() -> None:
                    help="Chain length of single-edit mutations per parent. "
                         "Each link applies one randomly-picked operator and "
                         "is admitted as its own buffer entry.")
-    p.add_argument("--accel-mutation-ops", type=str,
-                   default="swap_contents,shuffle_shelf,fill_one,empty_one,repick_target",
-                   help="Comma-separated mutation operators to enable. See "
-                        "oos.learn.layout.MUTATION_OPS for the registry.")
-    p.add_argument("--accel-require-solvable", dest="accel_require_solvable",
-                   action="store_true", default=True,
-                   help="Drop mutated snapshots that fail the conservative "
-                        "solvability check. On by default — matches the "
-                        "shuffle path's require_solvable semantics.")
-    p.add_argument("--no-accel-require-solvable",
-                   dest="accel_require_solvable", action="store_false")
+    p.add_argument("--accel-fresh-min-depth", type=int, default=0,
+                   help="Pin the target's minimum depth-from-top in fresh "
+                        "(explore) snapshots. 0 = no constraint (picker is "
+                        "uniform over all non-empty pallets). N ≥ 1 = the "
+                        "env's target picker re-rolls the shuffle until it "
+                        "finds a layout containing a non-empty pallet at "
+                        "depth ≥ N. Use to surface deep-dig scenarios that "
+                        "random shuffles produce rarely (e.g., d=4 lives "
+                        "in ~4-5%% of dibaji pallets — N=4 forces every "
+                        "explore sample to have one). Warning: a high pin "
+                        "with no compensating shallow training will let "
+                        "the policy forget shallow retrievals; rely on "
+                        "ACCEL's hard→easy transfer or run mixed.")
+    p.add_argument("--accel-mutator-tries", type=int, default=10000,
+                   help="Per-mutation budget of random regenerations the "
+                        "mutator may try before giving up on producing a "
+                        "same-hardness-class variant of a parent. Large by "
+                        "default (10k) because some signatures are rare in "
+                        "random shuffles; the mutator returns None if no "
+                        "match is found within budget and that lineage stalls.")
     p.add_argument("--accel-metric-top-k", type=int, default=5,
                    help="Best-checkpoint metric averages success across this "
                         "many highest-regret entries.")
@@ -544,9 +604,6 @@ def main() -> None:
     # iterative single-edit mutation of high-regret entries.
     accel_teacher: ACCELTeacher | None = None
     if args.accel:
-        mutation_ops = tuple(
-            s.strip() for s in args.accel_mutation_ops.split(",") if s.strip()
-        )
         accel_cfg = ACCELConfig(
             buffer_capacity=args.accel_buffer_capacity,
             min_regret_to_admit=args.accel_min_regret,
@@ -556,8 +613,6 @@ def main() -> None:
             mutate_every=args.accel_mutate_every,
             mutation_parents=args.accel_mutation_parents,
             edit_steps=args.accel_edit_steps,
-            require_solvable=args.accel_require_solvable,
-            mutation_ops=mutation_ops,
             metric_top_k=args.accel_metric_top_k,
             metric_min_visits=args.accel_metric_min_visits,
         )
@@ -569,7 +624,11 @@ def main() -> None:
             f"{C_DIM}mutate_every{_C.RESET} {_v(accel_cfg.mutate_every)}  "
             f"{C_DIM}edit_steps{_C.RESET} {_v(accel_cfg.edit_steps)}",
         )
-        _kv("ops", f" {C_DIM}·{_C.RESET} ".join(_v(op) for op in mutation_ops))
+        _kv(
+            "mutator",
+            f"{_v('signature-matched regeneration')}  "
+            f"{C_DIM}tries{_C.RESET} {_v(args.accel_mutator_tries)}",
+        )
 
     fullness_rng = np.random.default_rng(args.seed)
 
@@ -593,8 +652,12 @@ def main() -> None:
     # layout. Same facility/topology; only its reset() is called (never
     # stepped), so it's cheap.
     snapshot_env: RetrieveOnlyEnv | None = None
+    accel_mutator: Callable[
+        [LayoutSnapshot, np.random.Generator], LayoutSnapshot | None,
+    ] | None = None
     if args.accel:
         snapshot_env = _build_env(args, initial_fullness)
+        accel_mutator = _make_mutator(snapshot_env, topo, args)
 
     # Network.
     net_cfg = NetworkConfig(
@@ -894,7 +957,10 @@ def main() -> None:
         if accel_teacher is not None and cur_snapshot is not None:
             if ep_returns_all:
                 accel_teacher.record(cur_snapshot, cur_buffer_idx, success_rate)
-            n_mutated = accel_teacher.maybe_mutate(it, fullness_rng, topo)
+            n_mutated = (
+                accel_teacher.maybe_mutate(it, fullness_rng, accel_mutator)
+                if accel_mutator is not None else 0
+            )
             if tb_log_this_iter:
                 writer.add_scalar(
                     "accel/picked_fullness", cur_fullness, total_env_steps,

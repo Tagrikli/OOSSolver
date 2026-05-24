@@ -1,22 +1,24 @@
-"""Layout snapshots and mutation operators for instance-level ACCEL.
+"""Layout snapshots and hardness-class signatures for instance-level ACCEL.
 
 A `LayoutSnapshot` is a frozen, hashable record of every pallet's id,
 contents, and position on every shelf — plus the per-episode retrieve
-target. It can be captured from a post-shuffle Facility, mutated by single
-single-edit operators, and re-applied to a Facility to deterministically
-reproduce an exact layout. ACCEL's buffer stores these snapshots directly,
-which is what lets replay be byte-identical and what lets mutation produce
-true layout neighbors instead of "another draw from a perturbed parameter
-region."
+target. It can be captured from a post-shuffle Facility and re-applied
+to one for deterministic replay. ACCEL's buffer stores these snapshots
+directly so replays are byte-identical.
+
+A `HardnessSignature` is the structural fingerprint of the retrieval
+problem a snapshot poses. Two snapshots with the same signature require
+the same kind of dig + clearing reasoning, so the mutator can treat them
+as members of the same difficulty class — the canonical "single-knob
+random perturbation" mutation is replaced by "regenerate a fresh random
+layout that matches the parent's signature."
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
-
-import numpy as np
+from typing import TYPE_CHECKING, Literal
 
 from oos.sim.scheduler import Scheduler
 from oos.sim.shuffle import _layout_is_solvable
@@ -89,6 +91,7 @@ def apply_snapshot_to_facility(
         cs.voluntarily_idle = False
         cs.last_take_shelf = None
         cs.last_give_shelf = None
+        cs.must_relocate_from = None
     for rs in facility.state.rooms.values():
         rs.load = None
     facility.scheduler = Scheduler()
@@ -125,191 +128,103 @@ def snapshot_is_solvable(
 
 
 # ---------------------------------------------------------------------------
-# Mutation operators (snapshot → snapshot | None)
+# Hardness signature — equivalence class of retrieval problems
 # ---------------------------------------------------------------------------
-# Every operator preserves these invariants:
-#   - per-shelf pallet count is unchanged (matches shelf capacity)
-#   - target_pallet_id remains a real, non-empty pallet in the layout
-#   - all contents satisfy size-class compatibility for their host shelf
-# An operator returns None if it couldn't find a valid edit within its
-# attempt budget; the caller can pick a different operator or skip the iter.
 
 
-def _content_fits_shelf(contents: str, size_class: str) -> bool:
-    """big content → big shelves only; small/empty fit anywhere."""
-    if contents == "big":
-        return size_class == "big"
-    return True
+@dataclass(frozen=True)
+class HardnessSignature:
+    """Structural fingerprint of a retrieve scenario.
 
+    Two snapshots with the same signature pose the same kind of dig +
+    clearing problem — an agent that can solve one can solve the other.
 
-def _rebuild_snapshot(
-    shelves: dict[str, list[tuple[int, str]]],
-    order: list[str],
-    target_pallet_id: int,
-) -> LayoutSnapshot:
-    return LayoutSnapshot(
-        shelves=tuple((sid, tuple(shelves[sid])) for sid in order),
-        target_pallet_id=target_pallet_id,
-    )
+    Fields:
+      target_size            : "small" or "big" — the size class of the
+                               target's host shelf. For "small" only
+                               `target_depth` matters (smalls and empties
+                               always have somewhere to go).
+      target_depth           : how many pallets sit between the target and
+                               the top of its shelf (i.e., how many blockers
+                               the dig has to move out of the way).
+      big_blockers           : of those `target_depth` blockers, how many
+                               are big-content (need a big-shelf slot to
+                               relocate to). Big-shelf-target only.
+      free_other_big_slots   : free big-shelf real estate across all
+                               non-target big shelves. Big-shelf-target only.
+      nonbig_count_other_big : small/empty pallets currently occupying
+                               non-target big shelves — these are clearable
+                               (movable to small shelves) when the agent
+                               needs more big-shelf receiving room.
+                               Big-shelf-target only.
 
-
-def _to_mutable(snap: LayoutSnapshot):
-    shelves = {sid: list(stk) for sid, stk in snap.shelves}
-    order = [sid for sid, _ in snap.shelves]
-    return shelves, order
-
-
-def mutate_swap_contents(
-    snap: LayoutSnapshot, rng: np.random.Generator, topology: "Topology",
-    *, max_attempts: int = 10,
-) -> LayoutSnapshot | None:
-    """Swap the contents of two pallets on different shelves. Target pallet
-    is excluded. Swap is accepted only if both new content/shelf pairs are
-    size-compatible."""
-    shelves, order = _to_mutable(snap)
-    if len(order) < 2:
-        return None
-    target_id = snap.target_pallet_id
-    for _ in range(max_attempts):
-        i, j = rng.choice(len(order), size=2, replace=False)
-        sa, sb = order[int(i)], order[int(j)]
-        stack_a, stack_b = shelves[sa], shelves[sb]
-        if not stack_a or not stack_b:
-            continue
-        ia = int(rng.integers(0, len(stack_a)))
-        ib = int(rng.integers(0, len(stack_b)))
-        pid_a, cnt_a = stack_a[ia]
-        pid_b, cnt_b = stack_b[ib]
-        if pid_a == target_id or pid_b == target_id:
-            continue
-        if not _content_fits_shelf(cnt_b, topology.shelves[sa].size_class):
-            continue
-        if not _content_fits_shelf(cnt_a, topology.shelves[sb].size_class):
-            continue
-        stack_a[ia] = (pid_a, cnt_b)
-        stack_b[ib] = (pid_b, cnt_a)
-        return _rebuild_snapshot(shelves, order, target_id)
-    return None
-
-
-def mutate_shuffle_shelf(
-    snap: LayoutSnapshot, rng: np.random.Generator, topology: "Topology",
-) -> LayoutSnapshot | None:
-    """Permute one shelf's stack. Target pallet's depth changes; its
-    identity and shelf don't. Useful for exploring "same items, different
-    burial depth" neighbors of a hard layout."""
-    shelves, order = _to_mutable(snap)
-    # Only shelves with at least 2 items are worth shuffling.
-    candidates = [sid for sid in order if len(shelves[sid]) >= 2]
-    if not candidates:
-        return None
-    sid = str(rng.choice(candidates))
-    stack = shelves[sid]
-    indices = list(range(len(stack)))
-    rng.shuffle(indices)
-    shelves[sid] = [stack[i] for i in indices]
-    return _rebuild_snapshot(shelves, order, snap.target_pallet_id)
-
-
-def mutate_fill_one(
-    snap: LayoutSnapshot, rng: np.random.Generator, topology: "Topology",
-) -> LayoutSnapshot | None:
-    """Pick a non-target empty pallet and fill it with a size-valid content.
-    Increases effective fullness by 1 pallet. On a big shelf, fair coin flip
-    between big and small (mirrors shuffle_state's filling rule)."""
-    shelves, order = _to_mutable(snap)
-    target_id = snap.target_pallet_id
-    candidates: list[tuple[str, int]] = []
-    for sid in order:
-        for i, (pid, cnt) in enumerate(shelves[sid]):
-            if cnt == "empty" and pid != target_id:
-                candidates.append((sid, i))
-    if not candidates:
-        return None
-    sid, i = candidates[int(rng.integers(0, len(candidates)))]
-    size_class = topology.shelves[sid].size_class
-    if size_class == "small":
-        new_cnt = "small"
-    else:
-        new_cnt = "big" if rng.random() < 0.5 else "small"
-    pid, _ = shelves[sid][i]
-    shelves[sid][i] = (pid, new_cnt)
-    return _rebuild_snapshot(shelves, order, target_id)
-
-
-def mutate_empty_one(
-    snap: LayoutSnapshot, rng: np.random.Generator, topology: "Topology",
-) -> LayoutSnapshot | None:
-    """Pick a non-target non-empty pallet and clear its contents. Decreases
-    effective fullness by 1 pallet."""
-    shelves, order = _to_mutable(snap)
-    target_id = snap.target_pallet_id
-    candidates: list[tuple[str, int]] = []
-    for sid in order:
-        for i, (pid, cnt) in enumerate(shelves[sid]):
-            if cnt != "empty" and pid != target_id:
-                candidates.append((sid, i))
-    if not candidates:
-        return None
-    sid, i = candidates[int(rng.integers(0, len(candidates)))]
-    pid, _ = shelves[sid][i]
-    shelves[sid][i] = (pid, "empty")
-    return _rebuild_snapshot(shelves, order, target_id)
-
-
-def mutate_repick_target(
-    snap: LayoutSnapshot, rng: np.random.Generator, topology: "Topology",
-) -> LayoutSnapshot | None:
-    """Choose a different non-empty pallet as the retrieve target. The
-    layout itself is unchanged — only `target_pallet_id` moves. Discovers
-    "same arrangement, different target" hardness siblings."""
-    target_id = snap.target_pallet_id
-    candidates = [
-        pid
-        for _, stk in snap.shelves
-        for pid, cnt in stk
-        if cnt != "empty" and pid != target_id
-    ]
-    if not candidates:
-        return None
-    new_target = int(rng.choice(candidates))
-    return LayoutSnapshot(shelves=snap.shelves, target_pallet_id=new_target)
-
-
-# Registry — order matches the default --accel-mutation-ops CLI string.
-MUTATION_OPS = {
-    "swap_contents": mutate_swap_contents,
-    "shuffle_shelf": mutate_shuffle_shelf,
-    "fill_one": mutate_fill_one,
-    "empty_one": mutate_empty_one,
-    "repick_target": mutate_repick_target,
-}
-
-
-def mutate_once(
-    snap: LayoutSnapshot, rng: np.random.Generator, topology: "Topology",
-    ops_enabled: tuple[str, ...],
-    *, require_solvable: bool = True, max_op_tries: int = 4,
-) -> LayoutSnapshot | None:
-    """Apply one randomly-chosen enabled operator. If the operator returns
-    None (couldn't find a valid edit) or produces an unsolvable layout, try
-    another op up to `max_op_tries` times. Returns None if all tries failed.
-
-    `require_solvable=True` runs the conservative solvability check after
-    each candidate — keeps mutated layouts inside the policy's training
-    distribution (the env's reset() loops on unsolvable shuffles anyway).
+    `big_blockers > free_other_big_slots` is the boundary between an "easy
+    dig of depth N" and "requires clearing dance" — at the same depth the
+    latter is dramatically harder because the agent has to evacuate non-big
+    items from other big shelves first to make receiving room.
     """
-    if not ops_enabled:
-        return None
-    for _ in range(max_op_tries):
-        op_name = str(rng.choice(ops_enabled))
-        op = MUTATION_OPS.get(op_name)
-        if op is None:
+
+    target_size: Literal["small", "big"]
+    target_depth: int
+    big_blockers: int = 0
+    free_other_big_slots: int = 0
+    nonbig_count_other_big: int = 0
+
+
+def hardness_signature(
+    snapshot: LayoutSnapshot, topology: "Topology",
+) -> HardnessSignature:
+    """Compute the hardness equivalence class of a snapshot. Pure function
+    of (snapshot, topology) — no I/O, microsecond-scale."""
+    target_id = snapshot.target_pallet_id
+
+    # Locate the target's host shelf + its index in the stack.
+    target_shelf_id: str | None = None
+    target_index: int = -1
+    target_stack: tuple[tuple[int, str], ...] | None = None
+    for sid, stk in snapshot.shelves:
+        for i, (pid, _cnt) in enumerate(stk):
+            if pid == target_id:
+                target_shelf_id = sid
+                target_index = i
+                target_stack = stk
+                break
+        if target_shelf_id is not None:
+            break
+    if target_shelf_id is None or target_stack is None:
+        # Snapshot is malformed (no such target). Fall back to a degenerate
+        # signature so callers don't crash; this should be unreachable in
+        # the normal pipeline because the env's target picker guarantees
+        # target_id refers to a real non-empty pallet.
+        return HardnessSignature(target_size="small", target_depth=0)
+
+    target_depth = len(target_stack) - 1 - target_index
+    if topology.shelves[target_shelf_id].size_class == "small":
+        return HardnessSignature(
+            target_size="small", target_depth=target_depth,
+        )
+
+    # Big-shelf target: count big blockers + survey other big shelves.
+    blockers = target_stack[target_index + 1:]
+    big_blockers = sum(1 for _pid, cnt in blockers if cnt == "big")
+
+    free_other = 0
+    nonbig_other = 0
+    for sid, stk in snapshot.shelves:
+        if sid == target_shelf_id:
             continue
-        candidate = op(snap, rng, topology)
-        if candidate is None:
+        if topology.shelves[sid].size_class != "big":
             continue
-        if require_solvable and not snapshot_is_solvable(candidate, topology):
-            continue
-        return candidate
-    return None
+        cap = topology.shelves[sid].capacity
+        free_other += cap - len(stk)
+        for _pid, cnt in stk:
+            if cnt != "big":
+                nonbig_other += 1
+
+    return HardnessSignature(
+        target_size="big",
+        target_depth=target_depth,
+        big_blockers=big_blockers,
+        free_other_big_slots=free_other,
+        nonbig_count_other_big=nonbig_other,
+    )

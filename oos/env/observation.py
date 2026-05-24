@@ -7,8 +7,10 @@ from typing import Any
 
 import numpy as np
 
+from oos.sim.actions import Relocate
 from oos.sim.facility import Facility
-from oos.sim.tasks import Retrieve, Store, TaskQueue
+from oos.sim.state import Pallet
+from oos.sim.tasks import Retrieve, TaskQueue
 from oos.sim.topology import CarrierId
 
 
@@ -88,14 +90,83 @@ ROOM_FEATURE_NAMES = (
     "load_big",     # 1 if room.load is a big-item pallet
 )
 
-GLOBAL_FEATURE_NAMES = (
-    "n_pending_stores_norm",
-    "n_pending_stores_small_norm",
-    "n_pending_stores_big_norm",
-    "n_pending_retrieves_norm",
-    "oldest_pending_age_norm",
-    "time_norm",
-)
+GLOBAL_FEATURE_NAMES: tuple[str, ...] = ()
+
+
+def compute_in_flight_overlay(
+    facility: Facility,
+) -> tuple[dict[str, Pallet], dict[str, int]]:
+    """Physically-faithful in-flight overlay for mid-Relocate carriers.
+
+    A Relocate has four conceptual phases between start and complete:
+        1. move to src      — carrier travelling toward source
+        2. take_op at src   — picking up (still physically empty until done)
+        3. move to dst      — carrying the pallet toward destination
+        4. place_op at dst  — placing it down
+
+    The pallet is *physically* on the carrier only from phase 3 onward.
+    Before then the carrier is still travelling/picking up and the source
+    still holds it. This overlay reflects that: it returns the per-carrier
+    in-transit pallet (and per-source top-pop count) only for carriers
+    whose elapsed Relocate time has passed `move_to_src + take_op` — i.e.,
+    they've actually completed the pickup phase.
+
+    The sim itself is atomic at `Relocate.complete()`, so without this
+    overlay `cs.load` would read None and `src.stack[-1]` would still show
+    the pallet for the whole Relocate. The overlay closes that gap by
+    showing what would be true if the take physically happened the moment
+    the take_op finished.
+
+    Multiple concurrent Relocates from the same source are handled by
+    handing out top pallets in submission order — first carrier past the
+    take phase gets `stack[-1]`, second gets `stack[-2]`, etc. Rooms only
+    ever have one in-flight Relocate from them (1-cap).
+    """
+    state = facility.state
+    topo = facility.topology
+    durs = facility.durations
+    now = state.time
+    carrier_loads: dict[str, Pallet] = {}
+    src_pops: dict[str, int] = {}
+    for cid, cs in state.carriers.items():
+        cmd = cs.current_command
+        if not isinstance(cmd, Relocate):
+            continue
+        # Phase gate: only fire the overlay once the take_op has completed.
+        carrier = topo.carriers[cid]
+        start_pos = (
+            cs.command_start_position
+            if cs.command_start_position is not None
+            else cs.position
+        )
+        if cmd.src in topo.shelves:
+            src_pos = topo.shelves[cmd.src].position_for[cid]
+            take_op = durs.shelf_op("take", topo.shelves[cmd.src])
+        elif cmd.src in topo.rooms:
+            src_pos = topo.rooms[cmd.src].position
+            take_op = 0.0
+        else:
+            continue
+        move1 = durs.move(carrier, start_pos, src_pos)
+        elapsed = now - (cs.command_started_at or 0.0)
+        if elapsed < move1 + take_op:
+            # Phases 1-2: still travelling to src or picking up. The pallet
+            # is physically still on src and the carrier is still empty.
+            continue
+        src = cmd.src
+        n = src_pops.get(src, 0)
+        pallet: Pallet | None = None
+        if src in state.shelves:
+            stk = state.shelves[src].stack
+            if len(stk) > n:
+                pallet = stk[-(n + 1)]
+        elif src in state.rooms:
+            if n == 0:
+                pallet = state.rooms[src].load
+        if pallet is not None:
+            carrier_loads[cid] = pallet
+            src_pops[src] = n + 1
+    return carrier_loads, src_pops
 
 
 def build_observation(
@@ -119,16 +190,23 @@ def build_observation(
     # both the carrier-load and per-slot shelf feature builders.
     requested_pallets = {t.pallet for t in queue.pending if isinstance(t, Retrieve)}
 
+    # In-flight overlay: project Relocate commitments onto carrier loads
+    # and source pops so the observation reflects what the agent should plan
+    # around, not the raw atomic-sim state. See compute_in_flight_overlay.
+    in_flight_loads, src_pops = compute_in_flight_overlay(facility)
+
     carrier_features = np.zeros((len(carrier_ids), len(CARRIER_FEATURE_NAMES)), dtype=np.float32)
     for i, cid in enumerate(carrier_ids):
         c = topo.carriers[cid]
         cs = state.carriers[cid]
+        # Effective load: in-transit pallet if mid-Relocate, else cs.load.
+        eff_load = in_flight_loads.get(cid, cs.load)
         carrier_features[i, 0] = cs.position / max(c.positions - 1, 1)
-        if cs.load is None:
+        if eff_load is None:
             carrier_features[i, 1] = 1.0
-        elif cs.load.is_empty:
+        elif eff_load.is_empty:
             carrier_features[i, 2] = 1.0
-        elif cs.load.contents == "small":
+        elif eff_load.contents == "small":
             carrier_features[i, 3] = 1.0
         else:
             carrier_features[i, 4] = 1.0
@@ -137,11 +215,11 @@ def build_observation(
             eta = max(0.0, cs.busy_until - state.time)
             carrier_features[i, 6] = min(1.0, eta / cfg.horizon_seconds)
         carrier_features[i, 7] = 1.0 if cid == querying_carrier else 0.0
-        # load_is_requested — 1 iff load id matches a pending Retrieve.
+        # load_is_requested — 1 iff effective load id matches a pending Retrieve.
         if (
-            cs.load is not None
-            and not cs.load.is_empty
-            and cs.load.id in requested_pallets
+            eff_load is not None
+            and not eff_load.is_empty
+            and eff_load.id in requested_pallets
         ):
             carrier_features[i, 8] = 1.0
 
@@ -152,19 +230,24 @@ def build_observation(
     for i, sid in enumerate(shelf_ids):
         s = topo.shelves[sid]
         ss = state.shelves[sid]
+        # Hide the top N pallets if N in-flight Relocates have logically
+        # popped them. eff_depth and eff_stack are what the agent should see.
+        n_pops = src_pops.get(sid, 0)
+        eff_depth = max(0, ss.depth - n_pops)
+        eff_stack = ss.stack[:-n_pops] if n_pops > 0 else ss.stack
         shelf_features[i, 0] = 1.0 if s.size_class == "small" else 0.0
         shelf_features[i, 1] = 1.0 if s.size_class == "big" else 0.0
         shelf_features[i, 2] = s.capacity / SHELF_MAX_CAPACITY
-        shelf_features[i, 3] = ss.depth / SHELF_MAX_CAPACITY
-        shelf_features[i, 4] = ss.depth / max(s.capacity, 1)
+        shelf_features[i, 3] = eff_depth / SHELF_MAX_CAPACITY
+        shelf_features[i, 4] = eff_depth / max(s.capacity, 1)
         shelf_features[i, 5] = 1.0 if s.is_transfer else 0.0
         n_requested_in_stack = 0
-        # Per-slot occupancy. Slot index 0 = LIFO top (= stack[-1]).
+        # Per-slot occupancy. Slot index 0 = LIFO top (= eff_stack[-1]).
         # Slots beyond this shelf's capacity stay all-zero (no signal).
         for slot_i in range(min(SHELF_MAX_CAPACITY, s.capacity)):
             off = base_dim + slot_i * per_slot_dim
-            if slot_i < ss.depth:
-                p = ss.stack[-(slot_i + 1)]
+            if slot_i < eff_depth:
+                p = eff_stack[-(slot_i + 1)]
                 if p.is_empty:
                     shelf_features[i, off + 1] = 1.0      # slot_pallet_empty
                 elif p.contents == "small":
@@ -179,50 +262,33 @@ def build_observation(
         shelf_features[i, 6] = n_requested_in_stack / SHELF_MAX_CAPACITY
 
     room_features = np.zeros((len(room_ids), len(ROOM_FEATURE_NAMES)), dtype=np.float32)
-    n_pending_stores = 0
-    n_pending_stores_small = 0
-    n_pending_stores_big = 0
-    n_pending_retrieves = 0
-    oldest_pending_age = 0.0
-    for t in queue.pending:
-        age = state.time - t.arrived_at
-        if age > oldest_pending_age:
-            oldest_pending_age = age
-        if isinstance(t, Store):
-            n_pending_stores += 1
-            if t.size == "small":
-                n_pending_stores_small += 1
-            else:
-                n_pending_stores_big += 1
-        elif isinstance(t, Retrieve):
-            n_pending_retrieves += 1
-
     for i, rid in enumerate(room_ids):
         rs = state.rooms[rid]
         # Room as 1-cap virtual shelf: features encode the contents of
-        # `room.load`. All zero if the room is empty.
-        if rs.load is not None:
+        # `room.load`. Apply the overlay — if a Relocate from this room is
+        # in flight, the pallet is logically already on the carrier.
+        eff_load = None if src_pops.get(rid, 0) > 0 else rs.load
+        if eff_load is not None:
             room_features[i, 0] = 1.0
-            if rs.load.contents == "empty":
+            if eff_load.contents == "empty":
                 room_features[i, 1] = 1.0
-            elif rs.load.contents == "small":
+            elif eff_load.contents == "small":
                 room_features[i, 2] = 1.0
-            elif rs.load.contents == "big":
+            elif eff_load.contents == "big":
                 room_features[i, 3] = 1.0
 
+    # Global features deliberately empty for retrieve-only training — there's
+    # no Store stream so the old aggregates (n_pending_stores / oldest age /
+    # sim time) carry no usable signal. When we re-enable a Store stream we
+    # can re-introduce just the features that actually vary.
     global_features = np.zeros(len(GLOBAL_FEATURE_NAMES), dtype=np.float32)
-    global_features[0] = min(1.0, n_pending_stores / 10.0)
-    global_features[1] = min(1.0, n_pending_stores_small / 10.0)
-    global_features[2] = min(1.0, n_pending_stores_big / 10.0)
-    global_features[3] = min(1.0, n_pending_retrieves / 10.0)
-    global_features[4] = min(1.0, oldest_pending_age / max(cfg.horizon_seconds, 1.0))
-    global_features[5] = min(1.0, state.time / max(cfg.horizon_seconds * 60.0, 1.0))
 
     # ----- edges -----
     edges_accesses: list[tuple[int, int]] = []  # carrier_node_idx -> shelf/room (offset)
     edges_handoff: list[tuple[int, int]] = []
     edges_transfer: list[tuple[int, int]] = []
     edges_committed: list[tuple[int, int]] = []
+    edges_in_flight_src: list[tuple[int, int]] = []
 
     # We use a single node-index space: [carriers | shelves | rooms].
     c_off = 0
@@ -249,10 +315,24 @@ def build_observation(
         cmd = cs.current_command
         if cmd is None:
             continue
-        # Try to map current_command to a target node.
+        # Committed edge: carrier → destination of the in-flight command.
+        # For a Relocate this is the dst; for MoveToPartner the partner; etc.
         tgt = _target_node(cmd, c_off, s_off, r_off, carrier_idx, shelf_idx, room_idx)
         if tgt is not None:
             edges_committed.append((c_off + carrier_idx[cid], tgt))
+        # In-flight src edge: a Relocate's other anchor. Only Relocate has a
+        # meaningful source location; for every other command we leave this
+        # edge type empty for that carrier. Together with the committed edge
+        # this gives the network the complete (carrier, src, dst) triplet via
+        # pointer attention along two parallel edges.
+        if isinstance(cmd, Relocate):
+            src_node = _location_node(
+                cmd.src, s_off, r_off, shelf_idx, room_idx,
+            )
+            if src_node is not None:
+                edges_in_flight_src.append(
+                    (c_off + carrier_idx[cid], src_node)
+                )
 
     return {
         "carrier_features": carrier_features,
@@ -263,6 +343,7 @@ def build_observation(
         "edges_handoff": _edges_to_array(edges_handoff),
         "edges_transfer": _edges_to_array(edges_transfer),
         "edges_committed": _edges_to_array(edges_committed),
+        "edges_in_flight_src": _edges_to_array(edges_in_flight_src),
         "querying_carrier": int(carrier_idx[querying_carrier]),
     }
 

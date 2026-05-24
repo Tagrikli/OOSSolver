@@ -241,16 +241,30 @@ class Renderer:
         self._draw_handoff_hints(surface)
         self._draw_transfer_hints(surface)
 
-        # Shelves
-        self._draw_shelves(surface, facility.state, requested_pallets, rs.wall_now)
+        # In-flight overlay: same commitment-state projection the observation
+        # builder uses. Phase-aware: the pallet only flips from src to
+        # carrier once the carrier has physically completed the take_op.
+        # Keeps the human's view of state byte-identical to the agent's view.
+        from oos.env.observation import compute_in_flight_overlay
+        in_flight_loads, pickups_in_flight = compute_in_flight_overlay(facility)
 
-        # Rooms (use interpolated carrier position so the room dims the instant
-        # the carrier starts moving away, instead of waiting for the move command
-        # to complete).
-        self._draw_rooms(surface, facility, rs.anim_now)
+        # Shelves
+        self._draw_shelves(
+            surface, facility.state, requested_pallets, rs.wall_now,
+            pickups_in_flight=pickups_in_flight,
+        )
+
+        # Rooms
+        self._draw_rooms(
+            surface, facility, rs.anim_now,
+            pickups_in_flight=pickups_in_flight,
+        )
 
         # Carriers (top)
-        self._draw_carriers(surface, facility, rs, requested_pallets)
+        self._draw_carriers(
+            surface, facility, rs, requested_pallets,
+            in_flight_loads=in_flight_loads,
+        )
 
         # Canvas corner brackets
         draw_corner_brackets(
@@ -311,12 +325,19 @@ class Renderer:
         state: FacilityState,
         requested_pallets: frozenset,
         wall_now: float,
+        pickups_in_flight: dict[str, int] | None = None,
     ) -> None:
         self.pallet_hit_areas = []
         self.shelf_hit_areas = []
+        pickups = pickups_in_flight or {}
         for sp in self.layout.shelves:
             s = self.topology.shelves[sp.shelf_id]
             ss = state.shelves[sp.shelf_id]
+            # Hide the topmost N pallets if N carriers are visually mid-Relocate
+            # having picked up from this shelf; the sim still has them on the
+            # stack until atomic complete(), but visually they're in transit.
+            n_hidden = pickups.get(sp.shelf_id, 0)
+            visual_stack = ss.stack[:-n_hidden] if n_hidden > 0 else ss.stack
             shelf_rect = ShelfView(
                 shelf_id=sp.shelf_id,
                 cx=sp.x,
@@ -324,7 +345,7 @@ class Renderer:
                 capacity=s.capacity,
                 size_class=s.size_class,
                 is_transfer=s.is_transfer,
-                stack=ss.stack,
+                stack=visual_stack,
                 partner=sp.partner,
                 pulsing_items=requested_pallets,
                 wall_now=wall_now,
@@ -332,7 +353,11 @@ class Renderer:
             self.shelf_hit_areas.append((shelf_rect, sp.shelf_id))
 
     def _draw_rooms(
-        self, surface: pygame.Surface, facility: Facility, anim_now: float
+        self,
+        surface: pygame.Surface,
+        facility: Facility,
+        anim_now: float,
+        pickups_in_flight: dict[str, int] | None = None,
     ) -> None:
         state = facility.state
         # Customer interactions are now instant: as soon as a carrier deposits
@@ -341,16 +366,21 @@ class Renderer:
         # "busy" window. Two states:
         #   - "ready" : room is empty (and possibly serving a pending task)
         #   - "idle"  : room holds an unconsumed pallet (no matching task yet)
+        # When a carrier is mid-Relocate FROM a room, the room's load is
+        # logically already on the carrier even though the sim still holds it
+        # in room.load until atomic complete(); hide it visually.
         del anim_now  # visual readiness is room-load-driven
+        pickups = pickups_in_flight or {}
         for rp in self.layout.rooms:
             rs = state.rooms[rp.room_id]
-            state_name = "ready" if rs.load is None else "idle"
+            visual_load = rs.load if pickups.get(rp.room_id, 0) == 0 else None
+            state_name = "ready" if visual_load is None else "idle"
             RoomView(
                 room_id=rp.room_id,
                 cx=rp.x,
                 cy=self.layout.strips[rp.carrier_id].track_y,
                 state=state_name,
-                load=rs.load,
+                load=visual_load,
             ).draw(surface, self.fonts)
 
     def _draw_carriers(
@@ -359,21 +389,36 @@ class Renderer:
         facility: Facility,
         rs: RenderState,
         requested_pallets: frozenset,
+        in_flight_loads: dict | None = None,
     ) -> None:
         pulse_phase = (rs.wall_now * 0.8) % 1.0
+        loads = in_flight_loads or {}
         for cid, cs in facility.state.carriers.items():
             strip = self.layout.strips[cid]
-            pos_now = _interpolated_position(facility, cid, rs.anim_now)
+            cmd = cs.current_command
+            # Position interpolation stays phased (move→src, take-op,
+            # move→dst, place-op) so the carrier visually follows its physical
+            # trajectory. The load shown matches the observation overlay:
+            # in-transit pallet throughout a Relocate, sim cs.load otherwise.
+            if (
+                isinstance(cmd, Relocate)
+                and cs.command_started_at is not None
+            ):
+                pos_now, _ = _relocate_visual_state(
+                    facility, cid, rs.anim_now,
+                )
+            else:
+                pos_now = _interpolated_position(facility, cid, rs.anim_now)
+            visual_load = loads.get(cid, cs.load)
             x = strip.pos_to_x(pos_now)
             y = strip.track_y
-            cmd = cs.current_command
             state_name = "busy" if cmd is not None else "idle"
             label = short_action_label(cmd)
             CarrierIconView(
                 carrier_id=cid,
                 x=x,
                 y=y,
-                load=cs.load,
+                load=visual_load,
                 state=state_name,
                 action_label=label,
                 is_querying=(cid == rs.querying),
@@ -439,15 +484,90 @@ def _interpolated_position(facility: Facility, carrier_id: str, anim_now: float)
     return start_pos + frac * (end_pos - start_pos)
 
 
+def _location_visual_pos(loc: str, carrier_id: str, topo) -> int | None:
+    """Carrier-track x-position (discrete slot index) of a Relocate endpoint
+    — a real shelf or a room. Matches the sim's discrete `Position` type so
+    duration calculations get the integer arguments they expect; the visual
+    smoothing that interpolates between two such positions happens at the
+    call site and is the only place that produces fractional values."""
+    if loc in topo.shelves:
+        return topo.shelves[loc].position_for[carrier_id]
+    if loc in topo.rooms:
+        return topo.rooms[loc].position
+    return None
+
+
+def _relocate_visual_state(facility: Facility, carrier_id: str, anim_now: float):
+    """Synthesize the physical visual position of a carrier mid-Relocate.
+
+    The sim treats Relocate as one atomic command — at `start()` the carrier
+    just becomes busy; at `complete()` the pallet teleports src→dst. The viz
+    interpolates the carrier through four physical sub-phases for an
+    accurate motion trajectory:
+
+      Phase 1: travel to src       — position interpolates start→src
+      Phase 2: shelf-op take       — position holds at src
+      Phase 3: travel to dst       — position interpolates src→dst
+      Phase 4: shelf-op place      — position holds at dst
+
+    The carrier's *visual load* is decided separately by the observation's
+    in-flight overlay (see compute_in_flight_overlay) so what the human sees
+    matches what the agent sees: the pallet is on the carrier from t=0 of
+    the Relocate, the source loses it at t=0 too. This function therefore
+    returns position only; the second tuple slot is reserved/ignored.
+    """
+    cs = facility.state.carriers[carrier_id]
+    cmd = cs.current_command
+    assert isinstance(cmd, Relocate)
+    topo = facility.topology
+    durs = facility.durations
+    carrier = topo.carriers[carrier_id]
+
+    start_pos = (
+        cs.command_start_position
+        if cs.command_start_position is not None
+        else cs.position
+    )
+    src_pos = _location_visual_pos(cmd.src, carrier_id, topo)
+    dst_pos = _location_visual_pos(cmd.dst, carrier_id, topo)
+    if src_pos is None or dst_pos is None:
+        return float(cs.position), None
+
+    move1 = durs.move(carrier, start_pos, src_pos)
+    take_op = (
+        durs.shelf_op("take", topo.shelves[cmd.src])
+        if cmd.src in topo.shelves else 0.0
+    )
+    move2 = durs.move(carrier, src_pos, dst_pos)
+    # place_op is consumed visually within phase 4; no separate computation needed.
+
+    elapsed = max(0.0, anim_now - (cs.command_started_at or 0.0))
+
+    # Phase 1: travel to src.
+    if elapsed < move1:
+        frac = elapsed / max(move1, 1e-9)
+        return start_pos + frac * (src_pos - start_pos), None
+    elapsed -= move1
+    # Phase 2: holding at src during take-op.
+    if elapsed < take_op:
+        return src_pos, None
+    elapsed -= take_op
+    # Phase 3: travel to dst.
+    if elapsed < move2:
+        frac = elapsed / max(move2, 1e-9)
+        return src_pos + frac * (dst_pos - src_pos), None
+    # Phase 4: holding at dst during place-op.
+    return dst_pos, None
+
+
 def _command_end_position(facility: Facility, cmd, carrier_id: str):
     topo = facility.topology
     if isinstance(cmd, Relocate):
         # Visual end is the destination — the source is just a waypoint.
-        if cmd.dst in topo.shelves:
-            return topo.shelves[cmd.dst].position_for[carrier_id]
-        if cmd.dst in topo.rooms:
-            return topo.rooms[cmd.dst].position
-        return None
+        # (Relocate's full sub-phase visualization lives in
+        # `_relocate_visual_state`; this is only used as a fallback by
+        # `_interpolated_position` for non-Relocate code paths.)
+        return _location_visual_pos(cmd.dst, carrier_id, topo)
     if isinstance(cmd, MoveToPartner):
         pair = (carrier_id, cmd.partner_id)
         if pair in topo.handoff_positions:

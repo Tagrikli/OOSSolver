@@ -25,11 +25,14 @@ from oos.sim.topology import Topology
 def make_facility() -> tuple[Topology, SeedingConfig]:
     fac = Facility("big_retr")
 
-    C1 = fac.carrier("C1", positions=6)
+    C1 = fac.carrier("C1", positions=8)
     C1.room("R1", at=0)
-    C1.shelf("B1", at=2, capacity=5, size="big")
-    C1.shelf("S1", at=3, capacity=5, size="small")
-    C1.shelf("B2", at=4, capacity=5, size="big")
+    C1.shelf("B1", at=2, capacity=3, size="big")
+    C1.shelf("S1", at=3, capacity=3, size="small")
+    C1.shelf("B2", at=4, capacity=3, size="big")
+    C1.shelf("B3", at=5, capacity=3, size="big")
+    C1.shelf("S3", at=6, capacity=3, size="small")
+    C1.shelf("B4", at=7, capacity=3, size="big")
 
     fac.seed_pool()
     return fac.build()
