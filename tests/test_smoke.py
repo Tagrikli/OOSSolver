@@ -78,6 +78,12 @@ def test_pallet_count_conserved():
         for cs in fac.state.carriers.values():
             if cs.load is not None:
                 n += 1
+        # Unified-action model: rooms are 1-capacity virtual shelves; a pallet
+        # may sit in `room.load` between a Relocate-into-room and the next
+        # Relocate-out-of-room.
+        for rs in fac.state.rooms.values():
+            if rs.load is not None:
+                n += 1
         return n
 
     initial = count_pallets()

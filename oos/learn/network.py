@@ -19,11 +19,12 @@ import torch.nn.functional as F
 from oos.env.action import ActionType
 from oos.learn.batching import EDGE_TYPES, Batch
 
-# Targeted action types (in EnumIntValue order, but value not relied on).
+# Action types that take node-typed targets. RELOCATE is special — it takes
+# BOTH a source and a destination node, scored together. MOVE_TO_PARTNER takes
+# a single partner-carrier target. Both are handled in the action head with
+# distinct MLPs that have different input shapes.
 TARGETED_ACTION_TYPES: tuple[ActionType, ...] = (
-    ActionType.TAKE,
-    ActionType.GIVE,
-    ActionType.MOVE_TO_ROOM,
+    ActionType.RELOCATE,
     ActionType.MOVE_TO_PARTNER,
 )
 
@@ -195,16 +196,21 @@ class PolicyValueNet(nn.Module):
             nn.Linear(cfg.head_hidden, 1),
         )
 
-        # Targeted action heads: one MLP per action type, input is
-        # [h_querying ; h_target ; global_features].
+        # Targeted action heads. Input dim differs by type:
+        #   - RELOCATE        : [h_query ; h_src ; h_dst ; global] = 3h + Fg
+        #   - MOVE_TO_PARTNER : [h_query ; h_partner ; global]     = 2h + Fg
         self.action_heads = nn.ModuleDict(
             {
-                t.name: nn.Sequential(
+                ActionType.RELOCATE.name: nn.Sequential(
+                    nn.Linear(3 * h + global_feat_dim, cfg.head_hidden),
+                    nn.GELU(),
+                    nn.Linear(cfg.head_hidden, 1),
+                ),
+                ActionType.MOVE_TO_PARTNER.name: nn.Sequential(
                     nn.Linear(2 * h + global_feat_dim, cfg.head_hidden),
                     nn.GELU(),
                     nn.Linear(cfg.head_hidden, 1),
-                )
-                for t in TARGETED_ACTION_TYPES
+                ),
             }
         )
         # WAIT head: no target (voluntary-idle action).
@@ -245,17 +251,30 @@ class PolicyValueNet(nn.Module):
 
         valid_mask = batch.action_mask                   # [B, N_max] bool
 
-        # Targeted heads.
-        for at in TARGETED_ACTION_TYPES:
-            sel = valid_mask & (batch.type_per_slot == int(at))
-            if not sel.any():
-                continue
+        # RELOCATE head — input is [h_query ; h_src ; h_dst ; global].
+        sel = valid_mask & (batch.type_per_slot == int(ActionType.RELOCATE))
+        if sel.any():
             bidx, sidx = sel.nonzero(as_tuple=True)
-            tgt_node = batch.target_per_slot[bidx, sidx]  # [K]
-            h_t = x_per[bidx, tgt_node]                   # [K, h]
-            h_c = h_query[bidx]                           # [K, h]
-            g = batch.global_x[bidx]                      # [K, Fg]
-            scores = self.action_heads[at.name](
+            src_node = batch.source_per_slot[bidx, sidx]
+            dst_node = batch.target_per_slot[bidx, sidx]
+            h_src = x_per[bidx, src_node]
+            h_dst = x_per[bidx, dst_node]
+            h_c = h_query[bidx]
+            g = batch.global_x[bidx]
+            scores = self.action_heads[ActionType.RELOCATE.name](
+                torch.cat([h_c, h_src, h_dst, g], dim=-1)
+            ).squeeze(-1)
+            logits[bidx, sidx] = scores
+
+        # MOVE_TO_PARTNER head — input is [h_query ; h_partner ; global].
+        sel = valid_mask & (batch.type_per_slot == int(ActionType.MOVE_TO_PARTNER))
+        if sel.any():
+            bidx, sidx = sel.nonzero(as_tuple=True)
+            tgt_node = batch.target_per_slot[bidx, sidx]
+            h_t = x_per[bidx, tgt_node]
+            h_c = h_query[bidx]
+            g = batch.global_x[bidx]
+            scores = self.action_heads[ActionType.MOVE_TO_PARTNER.name](
                 torch.cat([h_c, h_t, g], dim=-1)
             ).squeeze(-1)
             logits[bidx, sidx] = scores

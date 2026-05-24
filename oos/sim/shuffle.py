@@ -133,6 +133,7 @@ def _place_pallets(
         cs.last_take_shelf = None
         cs.last_give_shelf = None
     for rs in facility.state.rooms.values():
+        rs.load = None
         rs.customer_interaction_until = None
     facility.scheduler = Scheduler()
     if facility.auto_arrivals_enabled:

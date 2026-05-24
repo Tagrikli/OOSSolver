@@ -85,12 +85,17 @@ class ShelfState:
 
 @dataclass
 class RoomState:
-    """A room has no inventory of its own — pallets stay on the serving
-    carrier through the entire customer interaction. The only mutable state
-    here is the timestamp at which the current interaction will end (or
-    None when idle).
+    """A room is a 1-capacity virtual shelf in the unified-action model.
+
+    A carrier delivers a pallet to a room via Relocate (treating the room as
+    the destination); the pallet sits in `load` until the customer interaction
+    fires, then either gets consumed (retrieve), gets its contents mutated
+    in-place (store), or gets picked up by a subsequent Relocate from the
+    room to a real shelf. `customer_interaction_until` is the timestamp at
+    which the current customer interaction will end (None when idle).
     """
 
+    load: Optional[Pallet] = None
     customer_interaction_until: Optional[SimTime] = None
 
 

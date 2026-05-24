@@ -289,21 +289,38 @@ def _target_node(
     shelf_idx: dict,
     room_idx: dict,
 ) -> int | None:
+    """Map an in-flight command to a node index for the 'committed' edge.
+
+    For Relocate the committed edge points at the destination (the carrier is
+    on its way there); src is implied by the carrier's pose. Move/Wait have
+    no associated node.
+    """
     from oos.sim.actions import (
-        Give,
         Handoff,
         Move,
-        MoveToRoom,
-        Take,
+        MoveToPartner,
+        Relocate,
         Wait,
     )
 
-    if isinstance(cmd, (Give, Take)):
-        return s_off + shelf_idx[cmd.shelf_id]
+    if isinstance(cmd, Relocate):
+        return _location_node(cmd.dst, s_off, r_off, shelf_idx, room_idx)
     if isinstance(cmd, Handoff):
         return c_off + carrier_idx[cmd.receiver_id]
-    if isinstance(cmd, MoveToRoom):
-        return r_off + room_idx[cmd.room_id]
+    if isinstance(cmd, MoveToPartner):
+        return c_off + carrier_idx[cmd.partner_id]
     if isinstance(cmd, (Move, Wait)):
         return None
+    return None
+
+
+def _location_node(
+    loc: str, s_off: int, r_off: int,
+    shelf_idx: dict, room_idx: dict,
+) -> int | None:
+    """Node index for a Relocate endpoint (shelf or room). None if unknown."""
+    if loc in shelf_idx:
+        return s_off + shelf_idx[loc]
+    if loc in room_idx:
+        return r_off + room_idx[loc]
     return None

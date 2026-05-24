@@ -8,11 +8,9 @@ from dataclasses import dataclass, field
 import pygame
 
 from oos.sim.actions import (
-    Give,
     Handoff,
     MoveToPartner,
-    MoveToRoom,
-    Take,
+    Relocate,
 )
 from oos.sim.facility import Facility
 from oos.sim.state import FacilityState
@@ -336,36 +334,19 @@ class Renderer:
     def _draw_rooms(
         self, surface: pygame.Surface, facility: Facility, anim_now: float
     ) -> None:
-        from oos.sim.facility import _CustomerInteractionSentinel
-
         state = facility.state
-        # Tolerance for "the carrier is visually at the room" — a fraction of
-        # a slot. Anything beyond this means the carrier has visually moved
-        # off the room marker, so the room should appear dim even though the
-        # underlying move command hasn't completed in sim time yet.
-        EPS = 0.1
+        # The unified-action model puts pallets *in* the room (RoomState.load)
+        # rather than on the carrier during customer interaction. Room state:
+        #   - "busy"  : a customer interaction is in progress (mutating room.load)
+        #   - "ready" : room is empty and idle (waiting for a deposit)
+        #   - "idle"  : room holds an unconsumed pallet but no pending task matches
+        del anim_now  # no longer needed; visual readiness is room-load-driven
         for rp in self.layout.rooms:
-            r = self.topology.rooms[rp.room_id]
-            cs = state.carriers[r.served_by]
-            visual_pos = _interpolated_position(facility, r.served_by, anim_now)
-            visual_at_room = abs(visual_pos - r.position) < EPS
-            ready = (
-                visual_at_room
-                and cs.is_idle
-                and cs.load is not None
-                and cs.load.is_empty
-            )
-            # Yellow ("busy") specifically means a customer is interacting
-            # with the carrier at this room — not just "carrier is at the
-            # room while some command is still completing."
-            busy_at_room = (
-                visual_at_room
-                and isinstance(cs.current_command, _CustomerInteractionSentinel)
-            )
-            if ready:
-                state_name = "ready"
-            elif busy_at_room:
+            rs = state.rooms[rp.room_id]
+            if rs.customer_interaction_until is not None:
                 state_name = "busy"
+            elif rs.load is None:
+                state_name = "ready"
             else:
                 state_name = "idle"
             RoomView(
@@ -373,6 +354,7 @@ class Renderer:
                 cx=rp.x,
                 cy=self.layout.strips[rp.carrier_id].track_y,
                 state=state_name,
+                load=rs.load,
             ).draw(surface, self.fonts)
 
     def _draw_carriers(
@@ -382,8 +364,6 @@ class Renderer:
         rs: RenderState,
         requested_pallets: frozenset,
     ) -> None:
-        from oos.sim.facility import _CustomerInteractionSentinel as _CIS
-
         pulse_phase = (rs.wall_now * 0.8) % 1.0
         for cid, cs in facility.state.carriers.items():
             strip = self.layout.strips[cid]
@@ -391,9 +371,7 @@ class Renderer:
             x = strip.pos_to_x(pos_now)
             y = strip.track_y
             cmd = cs.current_command
-            state_name = "idle"
-            if cmd is not None:
-                state_name = "customer" if isinstance(cmd, _CIS) else "busy"
+            state_name = "busy" if cmd is not None else "idle"
             label = short_action_label(cmd)
             CarrierIconView(
                 carrier_id=cid,
@@ -441,10 +419,10 @@ def _interpolated_position(facility: Facility, carrier_id: str, anim_now: float)
     """Carrier x-position along its track at `anim_now`.
 
     Only the MOVE portion of a command's duration is used for interpolation;
-    any trailing shelf-op or customer-interaction time leaves the carrier
-    stationary at the target. Without this, a Take/Give appears 3× slower
-    than the equivalent MoveToPartner because the shelf_op_time stretches
-    the visual move beyond the actual travel duration.
+    any trailing shelf-op time leaves the carrier stationary at the target.
+    For Relocate (two moves chained by a take+place), we use the destination
+    as the visual endpoint and let the chained shelf-op time hold the carrier
+    there once the interpolation reaches 1.0. The source pose is implicit.
     """
     cs = facility.state.carriers[carrier_id]
     cmd = cs.current_command
@@ -467,11 +445,13 @@ def _interpolated_position(facility: Facility, carrier_id: str, anim_now: float)
 
 def _command_end_position(facility: Facility, cmd, carrier_id: str):
     topo = facility.topology
-    if isinstance(cmd, (Take, Give)):
-        s = topo.shelves[cmd.shelf_id]
-        return s.position_for[carrier_id]
-    if isinstance(cmd, MoveToRoom):
-        return topo.rooms[cmd.room_id].position
+    if isinstance(cmd, Relocate):
+        # Visual end is the destination — the source is just a waypoint.
+        if cmd.dst in topo.shelves:
+            return topo.shelves[cmd.dst].position_for[carrier_id]
+        if cmd.dst in topo.rooms:
+            return topo.rooms[cmd.dst].position
+        return None
     if isinstance(cmd, MoveToPartner):
         pair = (carrier_id, cmd.partner_id)
         if pair in topo.handoff_positions:

@@ -2,12 +2,11 @@
 
 from oos.sim.actions import (
     Command,
-    Give,
     Handoff,
+    LocationId,
     Move,
     MoveToPartner,
-    MoveToRoom,
-    Take,
+    Relocate,
     Wait,
 )
 from oos.sim.durations import DurationModel, LinearDurations
@@ -45,15 +44,15 @@ __all__ = [
     "Event",
     "Facility",
     "FacilityState",
-    "Give",
     "Handoff",
     "HandoffEdge",
     "LinearDurations",
+    "LocationId",
     "Move",
     "MoveToPartner",
-    "MoveToRoom",
     "Pallet",
     "Position",
+    "Relocate",
     "Retrieve",
     "Room",
     "RoomId",

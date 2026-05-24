@@ -13,11 +13,9 @@ from typing import Optional
 import pygame
 
 from oos.sim.actions import (
-    Give,
     Handoff,
     MoveToPartner,
-    MoveToRoom,
-    Take,
+    Relocate,
     Wait,
 )
 from oos.sim.state import Pallet
@@ -758,27 +756,63 @@ def _pallet_color(p: Pallet) -> tuple[int, int, int]:
 
 @dataclass
 class RoomView:
+    """A room is rendered as a 1-capacity shelf slot — matching the unified
+    action model where a room is a virtual shelf.
+
+    Layout (bottom-up): the colored chrome strip sits at the original baseline;
+    the shelf-style slot sits just above it; the room label sits ABOVE the slot.
+    `load` is the pallet currently held in the room (None when empty); when
+    present it's rendered with the standard pallet color/glow inside the slot.
+    """
+
     room_id: str
     cx: int
     cy: int
-    state: str   # "idle" | "ready" | "busy"
+    state: str                # "idle" | "ready" | "busy"
+    load: Optional["Pallet"] = None
 
     W = 36
     H = 22
+    SLOT_W = 26
+    SLOT_H = 18
+    GAP = 3                   # vertical gap between chrome strip and slot
+    LABEL_GAP = 3             # vertical gap between slot and label
 
     def draw(self, surface: pygame.Surface, fonts: Fonts) -> pygame.Rect:
-        rect = pygame.Rect(self.cx - self.W // 2, self.cy - self.H - 10, self.W, self.H)
+        # Chrome strip (room state indicator) — same baseline as before.
+        chrome = pygame.Rect(
+            self.cx - self.W // 2, self.cy - self.H - 10, self.W, self.H,
+        )
         color = {
             "idle": ROOM_IDLE,
             "ready": ROOM_READY,
             "busy": ROOM_BUSY,
         }.get(self.state, ROOM_IDLE)
         if self.state in ("ready", "busy"):
-            draw_glow_rect(surface, rect, color, layers=4, spread=3, base_alpha=70)
-        draw_beveled_rect(surface, rect, color, bevel=5)
-        draw_beveled_frame(surface, rect, BASE_BLACK, bevel=5, width=1)
-        _blit_text(surface, self.room_id, rect.center, fonts.small, (10, 6, 24), center=True)
-        return rect
+            draw_glow_rect(surface, chrome, color, layers=4, spread=3, base_alpha=70)
+        draw_beveled_rect(surface, chrome, color, bevel=5)
+        draw_beveled_frame(surface, chrome, BASE_BLACK, bevel=5, width=1)
+
+        # 1-capacity slot above the chrome strip.
+        slot = pygame.Rect(
+            self.cx - self.SLOT_W // 2,
+            chrome.top - self.GAP - self.SLOT_H,
+            self.SLOT_W, self.SLOT_H,
+        )
+        draw_beveled_rect(surface, slot, BASE_SHADOW, bevel=3)
+        draw_beveled_frame(surface, slot, BASE_MUTED, bevel=3, width=1)
+        if self.load is not None:
+            pallet_color = _pallet_color(self.load)
+            inner = slot.inflate(-6, -6)
+            draw_beveled_rect(surface, inner, pallet_color, bevel=2)
+
+        # Room label ABOVE the slot.
+        label_y = slot.top - self.LABEL_GAP - fonts.small.get_height() // 2
+        _blit_text(
+            surface, self.room_id, (self.cx, label_y),
+            fonts.small, MAGENTA_BRIGHT, center=True,
+        )
+        return chrome
 
 
 # ---------------------------------------------------------------------------
@@ -1767,16 +1801,12 @@ def draw_toasts(
 def short_action_label(cmd) -> str:
     if cmd is None:
         return "idle"
-    if isinstance(cmd, Take):
-        return f"take {cmd.shelf_id}"
-    if isinstance(cmd, Give):
-        return f"give {cmd.shelf_id}"
+    if isinstance(cmd, Relocate):
+        return f"reloc {cmd.src}→{cmd.dst}"
     if isinstance(cmd, Handoff):
         return f"handoff↔{cmd.receiver_id}"
     if isinstance(cmd, MoveToPartner):
         return f"meet {cmd.partner_id}"
-    if isinstance(cmd, MoveToRoom):
-        return f"room {cmd.room_id}"
     if isinstance(cmd, Wait):
         return "wait"
     return type(cmd).__name__.lower()

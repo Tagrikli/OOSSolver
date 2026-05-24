@@ -75,7 +75,8 @@ class Batch:
     querying: torch.Tensor       # [B] long, local carrier idx in [0, Nc)
     action_mask: torch.Tensor    # [B, N_max] bool
     type_per_slot: torch.Tensor  # [B, N_max] long (ActionType.value); 0 where invalid
-    target_per_slot: torch.Tensor  # [B, N_max] long (concat-node idx in [0, N)); 0 where invalid/WAIT
+    target_per_slot: torch.Tensor  # [B, N_max] long. For RELOCATE = dst node; for MOVE_TO_PARTNER = partner node; 0 for WAIT or invalid.
+    source_per_slot: torch.Tensor  # [B, N_max] long. RELOCATE-only — src node idx; 0 for non-RELOCATE/invalid.
 
     # Constants (handy for the network).
     n_carriers: int
@@ -118,19 +119,35 @@ class GraphCollator:
     # Lookup helpers
     # ------------------------------------------------------------------
 
+    def _location_node_idx(self, loc: str) -> int:
+        """Concat-space node idx for a location (shelf or room)."""
+        if loc in self._shelf_node:
+            return self._shelf_node[loc]
+        if loc in self._room_node:
+            return self._room_node[loc]
+        raise ValueError(f"unknown location {loc!r}")
+
     def _target_node_idx(self, entry: ActionEntry) -> int:
-        """Concat-space node idx for an action entry's target. Returns 0 for WAIT."""
+        """Concat-space node idx for an entry's primary target (the one the
+        pointer-attention scorer uses as the 'destination'-ish slot).
+        Returns 0 for WAIT."""
         if entry.type == ActionType.WAIT:
             return 0
-        t = entry.target
-        assert t is not None
-        if entry.type in (ActionType.TAKE, ActionType.GIVE):
-            return self._shelf_node[t]
-        if entry.type == ActionType.MOVE_TO_ROOM:
-            return self._room_node[t]
+        if entry.type == ActionType.RELOCATE:
+            assert entry.dst is not None
+            return self._location_node_idx(entry.dst)
         if entry.type == ActionType.MOVE_TO_PARTNER:
-            return self._carrier_node[t]
+            assert entry.target is not None
+            return self._carrier_node[entry.target]
         raise ValueError(f"unknown action type {entry.type}")
+
+    def _source_node_idx(self, entry: ActionEntry) -> int:
+        """Concat-space node idx for the entry's source location. Only
+        meaningful for RELOCATE; 0 otherwise."""
+        if entry.type == ActionType.RELOCATE:
+            assert entry.src is not None
+            return self._location_node_idx(entry.src)
+        return 0
 
     # ------------------------------------------------------------------
     # Collation
@@ -195,10 +212,12 @@ class GraphCollator:
         ).bool().to(device)
         type_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
         target_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
+        source_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
         for b, s in enumerate(samples):
             for i, entry in enumerate(s.action_entries):
                 type_per_slot[b, i] = int(entry.type)
                 target_per_slot[b, i] = self._target_node_idx(entry)
+                source_per_slot[b, i] = self._source_node_idx(entry)
 
         return Batch(
             carrier_x=carrier_x,
@@ -210,6 +229,7 @@ class GraphCollator:
             action_mask=action_mask,
             type_per_slot=type_per_slot,
             target_per_slot=target_per_slot,
+            source_per_slot=source_per_slot,
             n_carriers=self.n_c,
             n_shelves=self.n_s,
             n_rooms=self.n_r,
