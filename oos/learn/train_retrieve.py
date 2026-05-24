@@ -52,8 +52,118 @@ from oos.learn.batching import GraphCollator, sample_from_env_step
 from oos.learn.network import NetworkConfig, PolicyValueNet
 from oos.learn.normalize import RewardNormalizer
 from oos.learn.ppo import PPOConfig, ppo_update
+from oos.learn.accel import ACCELConfig, ACCELTeacher
+from oos.learn.layout import LayoutSnapshot, snapshot_from_facility
+
+
+def _fg(hex_color: str) -> str:
+    """24-bit truecolor foreground escape. Hex `#rrggbb`."""
+    r = int(hex_color[1:3], 16)
+    g = int(hex_color[3:5], 16)
+    b = int(hex_color[5:7], 16)
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+class _C:
+    """INDIGO Night City palette mirrored to ANSI truecolor escapes — same
+    hexes as ~/Desktop/Codes/IndigoBar/indigoshell/theme.py. Requires a
+    truecolor terminal (kitty/alacritty/wezterm). If piping to a file,
+    strip with `sed 's/\\x1b\\[[0-9;]*m//g'`.
+    """
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    # Palette
+    MUTED         = _fg("#5a4a78")  # BASE_MUTED — labels, throwaway info
+    MAGENTA_DIM   = _fg("#3a0a2a")
+    MAGENTA_MID   = _fg("#d1004f")
+    MAGENTA       = _fg("#ff2a6d")  # primary FG
+    MAGENTA_BLOOM = _fg("#ff80b0")
+    YELLOW        = _fg("#fcee0c")  # CLOCK_FG — high-info accent
+    YELLOW_MID    = _fg("#e0c020")
+    YELLOW_DIM    = _fg("#a89020")
+    CYAN          = _fg("#05d9e8")  # HIGHLIGHT — data
+    CYAN_MID      = _fg("#05a9c4")
+    LIME          = _fg("#ccff00")  # success / good
+    LIME_MID      = _fg("#99cc00")
+    VIOLET        = _fg("#b967ff")  # ICON — curriculum mode tags
+    VIOLET_MID    = _fg("#7700a6")
+    ERROR         = _fg("#ff003c")  # failure / critical
+
+
+# ── Per-metric color contract ──────────────────────────────────────────
+# Same metric → same color, always. Salience hierarchy (most → least eye-
+# grabbing):
+#   BOLD LIME       — headline success metrics (success_rate, hardest_K)
+#   BOLD YELLOW     — primary reward signal (return)
+#   BOLD MAGENTA    — structural anchors (env_steps, buffer_size)
+#   BOLD MAGENTA/VIOLET — categorical curriculum mode tag (REPLAY / EXPLORE)
+#   CYAN_MID        — uniform support color for PPO diagnostics + supporting data
+#   YELLOW_MID      — wall time (a single recurring number)
+#   MUTED           — labels, ep_len, n_eps, parenthetical timing breakdown
+#
+# Value-dependent coloring is deliberately avoided: a metric's color must
+# not change when its value moves, or the reader's brain has to re-parse
+# the palette every iter.
+C_SUCCESS    = _C.LIME           # success_rate, hardest_K
+C_RETURN     = _C.YELLOW         # mean return
+C_ANCHOR     = _C.MAGENTA        # env_steps, buffer size
+C_REPLAY     = _C.MAGENTA        # REPLAY mode tag
+C_EXPLORE    = _C.VIOLET         # EXPLORE mode tag
+C_SUPPORT    = _C.CYAN_MID       # all PPO metrics, target info, fullness, mean_regret
+C_WALL       = _C.YELLOW_MID     # wall seconds
+C_DIM        = _C.MUTED          # labels + small supporting numbers
+
+
+# ── Selective value-based coloring ─────────────────────────────────────
+# The vast majority of metrics keep a stable color per the contract above.
+# Three metrics get value-conditional coloring because their value *is* a
+# health indicator and a glance-check is genuinely useful:
+#   - success_rate / hardest_K  — the "is it working?" gradient
+#   - expl_var                  — critic-health sign
+#   - kl                        — PPO-divergence canary
+# No other metric flips color with its value, so the eye stays trained.
+def _color_success(rate: float) -> str:
+    if rate >= 0.8:
+        return _C.LIME
+    if rate >= 0.5:
+        return _C.YELLOW
+    return _C.ERROR
+
+
+def _color_ev(ev: float) -> str:
+    if ev > 0.5:
+        return _C.LIME
+    if ev > 0.0:
+        return _C.YELLOW
+    return _C.ERROR
+
+
+def _color_kl(kl: float) -> str:
+    return _C.ERROR if abs(kl) > 0.05 else C_SUPPORT
+
+
+# ── Startup banner helpers ─────────────────────────────────────────────
+def _banner(title: str) -> None:
+    """Section divider — bright bar + uppercase title in primary magenta."""
+    bar = f"{_C.BOLD}{C_REPLAY}▓▓▓▓{_C.RESET}"
+    print(f"{bar} {_C.BOLD}{C_REPLAY}{title.upper()}{_C.RESET} {bar}")
+
+
+def _kv(label: str, value: str) -> None:
+    """Aligned key/value print used in the startup banner."""
+    print(f"  {C_EXPLORE}▶{_C.RESET} {C_DIM}{label:<15}{_C.RESET} {value}")
+
+
+def _v_num(s: object) -> str:
+    """Format a numeric/structural anchor value (bold magenta)."""
+    return f"{_C.BOLD}{C_ANCHOR}{s}{_C.RESET}"
+
+
+def _v(s: object) -> str:
+    """Format a supporting value (uniform cyan-mid)."""
+    return f"{C_SUPPORT}{s}{_C.RESET}"
 from oos.learn.retrieve_env import RetrieveOnlyConfig, RetrieveOnlyEnv, TargetScope
-from oos.learn.tscl import TSCLConfig, TSCLTeacher
 from oos.learn.rollout import collect_rollout, collect_rollout_vec, make_collector
 from oos.learn.vec_env import VecEnv
 
@@ -101,6 +211,68 @@ def _retrieve_config(
     )
 
 
+def _retrieve_config_with_override(
+    args: argparse.Namespace, fullness: float, override: LayoutSnapshot | None,
+) -> RetrieveOnlyConfig:
+    """RetrieveOnlyConfig used by the rollout env when ACCEL is driving.
+
+    `fullness` is irrelevant when `override` is set (the snapshot pins the
+    exact layout), but we still pass a value so non-override iters during
+    ACCEL warmup behave sanely if they ever hit the random-shuffle path.
+    """
+    base = _retrieve_config(args, fullness)
+    return dataclasses.replace(base, layout_override=override)
+
+
+def _snapshot_fullness(snap: LayoutSnapshot) -> float:
+    """Fraction of non-empty pallets in a snapshot. Reported in the log so
+    a quick glance still tells you how dense the layout is, even though
+    ACCEL no longer parameterizes layouts by fullness directly."""
+    total = 0
+    filled = 0
+    for _, stk in snap.shelves:
+        for _, cnt in stk:
+            total += 1
+            if cnt != "empty":
+                filled += 1
+    return filled / total if total else 0.0
+
+
+def _target_summary(
+    snap: LayoutSnapshot, topology,
+) -> tuple[str, int] | None:
+    """(target shelf size_class, target depth-from-top) — for logging."""
+    for sid, stk in snap.shelves:
+        for i, (pid, _cnt) in enumerate(stk):
+            if pid == snap.target_pallet_id:
+                depth_from_top = len(stk) - 1 - i
+                return topology.shelves[sid].size_class, depth_from_top
+    return None
+
+
+def _generate_fresh_snapshot(
+    snapshot_env: RetrieveOnlyEnv,
+    fullness: float,
+    args: argparse.Namespace,
+    seed: int,
+) -> LayoutSnapshot | None:
+    """Generate a fresh random layout snapshot off the side env.
+
+    Cheap: one shuffle + one target-pick (no rollout). Falls through to
+    None if the target-picker can't find a candidate within the env's own
+    retry budget — caller treats None as "skip this iter's admission."
+    """
+    snapshot_env._retrieve_cfg = dataclasses.replace(
+        _retrieve_config(args, fullness),
+        layout_override=None,  # explicit: this env path runs the shuffle
+    )
+    snapshot_env.reset(seed=seed)
+    target_id = snapshot_env._target_pallet_id
+    if target_id is None:
+        return None
+    return snapshot_from_facility(snapshot_env._ctx.facility, target_id)  # type: ignore[union-attr]
+
+
 def _build_env(
     args: argparse.Namespace, fullness: float,
 ) -> RetrieveOnlyEnv:
@@ -123,7 +295,7 @@ def _save_checkpoint(
     reward_normalizer: RewardNormalizer | None = None,
     total_env_steps: int = 0,
     best_mean_success: float = -1.0,
-    tscl_teacher: TSCLTeacher | None = None,
+    accel_teacher: ACCELTeacher | None = None,
 ) -> None:
     payload: dict = {
         "iteration": iteration,
@@ -136,8 +308,8 @@ def _save_checkpoint(
     }
     if reward_normalizer is not None:
         payload["reward_normalizer"] = reward_normalizer.state_dict()
-    if tscl_teacher is not None:
-        payload["tscl_state"] = tscl_teacher.state_dict()
+    if accel_teacher is not None:
+        payload["accel_state"] = accel_teacher.state_dict()
     torch.save(payload, path)
 
 
@@ -213,45 +385,69 @@ def main() -> None:
                         "shelf slots. Concentrates pallets onto big shelves "
                         "so buffer-on-target scenarios arise at lower "
                         "fullness. Off by default.")
-    # TSCL (Teacher-Student Curriculum Learning). The bandit picks
-    # (fullness_bin, max_depth, shelf_size) per iteration based on per-arm
-    # absolute learning progress (|ALP|). See oos.learn.tscl for the algorithm.
-    p.add_argument("--tscl", action="store_true",
-                   help="Use TSCL bandit to pick (fullness, max_depth) per "
-                        "iteration. When off, fullness is sampled uniformly "
-                        "from [--fullness-min, --fullness-max] with no scope/"
-                        "depth filtering.")
-    p.add_argument("--tscl-fullness-min", type=float, default=0.3,
-                   help="Lower bound of the fullness axis (inclusive).")
-    p.add_argument("--tscl-fullness-max", type=float, default=1.0,
-                   help="Upper bound of the fullness axis (exclusive).")
-    p.add_argument("--tscl-fullness-bins", type=int, default=5,
-                   help="Number of fullness bins between min and max.")
-    p.add_argument("--tscl-depths", type=str, default="0,1,2,3,4",
-                   help="Comma-separated discrete depth values to expose as "
-                        "arms (each combined with each fullness bin).")
-    p.add_argument("--tscl-shelf-sizes", type=str, default="big,small",
-                   help="Comma-separated shelf-size buckets to expose as "
-                        "arms. Values: 'any' / 'big' / 'small'. "
-                        "Default 'big,small' explicitly separates the two; "
-                        "use 'any' to disable the shelf-size axis.")
-    p.add_argument("--tscl-window", type=int, default=50,
-                   help="Per-arm reward history length used for ALP estimation.")
-    p.add_argument("--tscl-temperature", type=float, default=1.0,
-                   help="Softmax temperature on ALP for arm selection. Lower "
-                        "= sharper exploit; higher = flatter exploration.")
-    p.add_argument("--tscl-eps", type=float, default=0.1,
-                   help="ε-greedy probability of sampling an arm uniformly at "
-                        "random instead of from the softmax.")
-    p.add_argument("--tscl-difficulty-weight", type=float, default=0.0,
-                   help="Adds `w * (1.0 - recent_mean)` to each well-sampled "
-                        "arm's score before the softmax. Biases sampling "
-                        "toward low-success arms regardless of slope — useful "
-                        "when ALP alone can't distinguish 'flat at 100%%' from "
-                        "'flat at 70%%'. 0.0 disables; try 0.1-0.5.")
-    p.add_argument("--tscl-log-every", type=int, default=10,
-                   help="Iterations between TB dumps of per-arm ALP/n_samples/"
-                        "recent_succ. Lower = more detail, more TB traffic.")
+    # ACCEL curriculum (instance-level regret-prioritized replay buffer with
+    # iterative single-edit mutation). Each iteration:
+    #   with prob --accel-p-replay: replay a stored LayoutSnapshot sampled in
+    #     proportion to its regret (= 1 - success_rate);
+    #   else: generate a fresh random snapshot (via the snapshot env), run
+    #     it, and admit to the buffer if it's hard enough.
+    # Every --accel-mutate-every iters, the top-K hardest entries spawn
+    # mutants via chained single-edit operators (swap_contents / shuffle_shelf
+    # / fill_one / empty_one / repick_target — see oos/learn/layout.py).
+    # Each mutant is a true layout-neighbor of its parent, not a re-roll of
+    # a perturbed parameter region.
+    p.add_argument("--accel", dest="accel", action="store_true", default=True,
+                   help="Use ACCEL curriculum (default ON). Disable with "
+                        "--no-accel to fall back to plain uniform fullness "
+                        "sampling with no curriculum at all.")
+    p.add_argument("--no-accel", dest="accel", action="store_false")
+    p.add_argument("--accel-buffer-capacity", type=int, default=1000,
+                   help="Max number of layout snapshots stored. Lowest-regret "
+                        "entries get evicted when over capacity.")
+    p.add_argument("--accel-p-replay", type=float, default=0.5,
+                   help="Probability of replaying a buffered snapshot instead "
+                        "of generating a fresh random one. 0 = pure random "
+                        "(no curriculum); 1 = never explore. Typical 0.5-0.7.")
+    p.add_argument("--accel-min-regret", type=float, default=0.05,
+                   help="Snapshots with EMA regret below this threshold are "
+                        "evicted (solved) or never admitted in the first "
+                        "place. Lower = retain borderline-easy entries longer.")
+    p.add_argument("--accel-regret-ema", type=float, default=0.5,
+                   help="EMA weight applied to newly observed regret when a "
+                        "replayed entry is rescored. Higher = faster forget.")
+    p.add_argument("--accel-sampling-temperature", type=float, default=1.0,
+                   help="Softmax temperature on per-entry regret for replay "
+                        "sampling. Lower = sharper bias toward hardest.")
+    p.add_argument("--accel-mutate-every", type=int, default=10,
+                   help="Iterations between mutation passes. 0 disables "
+                        "mutation entirely (reduces ACCEL to vanilla PLR).")
+    p.add_argument("--accel-mutation-parents", type=int, default=4,
+                   help="Number of top-regret entries used as mutation "
+                        "parents per pass.")
+    p.add_argument("--accel-edit-steps", type=int, default=3,
+                   help="Chain length of single-edit mutations per parent. "
+                        "Each link applies one randomly-picked operator and "
+                        "is admitted as its own buffer entry.")
+    p.add_argument("--accel-mutation-ops", type=str,
+                   default="swap_contents,shuffle_shelf,fill_one,empty_one,repick_target",
+                   help="Comma-separated mutation operators to enable. See "
+                        "oos.learn.layout.MUTATION_OPS for the registry.")
+    p.add_argument("--accel-require-solvable", dest="accel_require_solvable",
+                   action="store_true", default=True,
+                   help="Drop mutated snapshots that fail the conservative "
+                        "solvability check. On by default — matches the "
+                        "shuffle path's require_solvable semantics.")
+    p.add_argument("--no-accel-require-solvable",
+                   dest="accel_require_solvable", action="store_false")
+    p.add_argument("--accel-metric-top-k", type=int, default=5,
+                   help="Best-checkpoint metric averages success across this "
+                        "many highest-regret entries.")
+    p.add_argument("--accel-metric-min-visits", type=int, default=2,
+                   help="Entries with fewer visits aren't counted toward the "
+                        "best-checkpoint metric (not yet trusted).")
+    p.add_argument("--accel-log-every", type=int, default=10,
+                   help="Iterations between TB dumps of buffer-level "
+                        "diagnostics (size, mean regret, hardest-K metric).")
     # Optim.
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--clip-range", type=float, default=0.2)
@@ -335,42 +531,45 @@ def main() -> None:
     (run_dir / "tb").mkdir(exist_ok=True)
     with open(run_dir / "config.json", "w") as f:
         json.dump(vars(args), f, indent=2)
-    print(f"[train_retrieve] run dir: {run_dir}")
+    _banner("retrieve · accel curriculum")
+    _kv("run dir", _v(run_dir))
+    _kv("facility", _v(args.facility))
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device(args.device)
 
-    # TSCL teacher: when on, the bandit owns per-iteration task-parameter
-    # selection (fullness bin, exact depth, shelf-size class).
-    tscl_teacher: TSCLTeacher | None = None
-    if args.tscl:
-        depths = tuple(
-            int(s.strip()) for s in args.tscl_depths.split(",") if s.strip()
+    # ACCEL teacher: when on, owns per-iteration layout selection via a
+    # regret-prioritized replay buffer over concrete LayoutSnapshots, with
+    # iterative single-edit mutation of high-regret entries.
+    accel_teacher: ACCELTeacher | None = None
+    if args.accel:
+        mutation_ops = tuple(
+            s.strip() for s in args.accel_mutation_ops.split(",") if s.strip()
         )
-        shelf_sizes = tuple(
-            s.strip() for s in args.tscl_shelf_sizes.split(",") if s.strip()
+        accel_cfg = ACCELConfig(
+            buffer_capacity=args.accel_buffer_capacity,
+            min_regret_to_admit=args.accel_min_regret,
+            regret_ema=args.accel_regret_ema,
+            p_replay=args.accel_p_replay,
+            sampling_temperature=args.accel_sampling_temperature,
+            mutate_every=args.accel_mutate_every,
+            mutation_parents=args.accel_mutation_parents,
+            edit_steps=args.accel_edit_steps,
+            require_solvable=args.accel_require_solvable,
+            mutation_ops=mutation_ops,
+            metric_top_k=args.accel_metric_top_k,
+            metric_min_visits=args.accel_metric_min_visits,
         )
-        tscl_cfg = TSCLConfig(
-            fullness_lo=args.tscl_fullness_min,
-            fullness_hi=args.tscl_fullness_max,
-            n_fullness_bins=args.tscl_fullness_bins,
-            depths=depths,
-            shelf_sizes=shelf_sizes,
-            window=args.tscl_window,
-            temperature=args.tscl_temperature,
-            eps=args.tscl_eps,
-            difficulty_weight=args.tscl_difficulty_weight,
+        accel_teacher = ACCELTeacher(accel_cfg)
+        _kv(
+            "accel",
+            f"{_v_num('capacity ' + str(accel_cfg.buffer_capacity))}  "
+            f"{C_DIM}p_replay{_C.RESET} {_v(accel_cfg.p_replay)}  "
+            f"{C_DIM}mutate_every{_C.RESET} {_v(accel_cfg.mutate_every)}  "
+            f"{C_DIM}edit_steps{_C.RESET} {_v(accel_cfg.edit_steps)}",
         )
-        tscl_teacher = TSCLTeacher(tscl_cfg)
-        print(
-            f"[train_retrieve] TSCL ON  arms={len(tscl_teacher.arms)} "
-            f"(fullness∈[{args.tscl_fullness_min:.2f},{args.tscl_fullness_max:.2f}] "
-            f"× {args.tscl_fullness_bins} bins × depths={depths} "
-            f"× sizes={shelf_sizes})  "
-            f"window={args.tscl_window} temp={args.tscl_temperature} "
-            f"eps={args.tscl_eps} diff_w={args.tscl_difficulty_weight}"
-        )
+        _kv("ops", f" {C_DIM}·{_C.RESET} ".join(_v(op) for op in mutation_ops))
 
     fullness_rng = np.random.default_rng(args.seed)
 
@@ -383,6 +582,19 @@ def main() -> None:
     collator = GraphCollator(topo)
     n_max = env.action_space.n
     cur_fullness = initial_fullness
+    _kv(
+        "layout",
+        f"{_v_num(len(collator.carrier_ids))} {C_DIM}carriers{_C.RESET}  "
+        f"{_v_num(len(collator.shelf_ids))} {C_DIM}shelves{_C.RESET}  "
+        f"{_v_num(len(collator.room_ids))} {C_DIM}rooms{_C.RESET}",
+    )
+
+    # Side env for offline snapshot generation when ACCEL needs a fresh
+    # layout. Same facility/topology; only its reset() is called (never
+    # stepped), so it's cheap.
+    snapshot_env: RetrieveOnlyEnv | None = None
+    if args.accel:
+        snapshot_env = _build_env(args, initial_fullness)
 
     # Network.
     net_cfg = NetworkConfig(
@@ -401,7 +613,13 @@ def main() -> None:
         global_feat_dim=feat_dims["global"],
         cfg=net_cfg,
     ).to(device)
-    print(f"[train_retrieve] network params: {sum(p.numel() for p in net.parameters()):,}")
+    _kv(
+        "network",
+        f"{_v_num(f'{sum(p.numel() for p in net.parameters()):,}')} {C_DIM}params{_C.RESET}  "
+        f"{C_DIM}hidden{_C.RESET} {_v(args.hidden)}  "
+        f"{C_DIM}heads{_C.RESET} {_v(args.n_heads)}  "
+        f"{C_DIM}gat_layers{_C.RESET} {_v(args.n_gat_layers)}",
+    )
 
     optimizer = torch.optim.Adam(net.parameters(), lr=args.lr)
 
@@ -431,7 +649,7 @@ def main() -> None:
             facility_name=args.facility,
             retrieve_only_config=_retrieve_config(args, initial_fullness),
         )
-        print(f"[train_retrieve] vec_env started with {args.n_envs} workers")
+        _kv("workers", _v_num(args.n_envs))
     else:
         collector = make_collector(env, seed=args.seed)
 
@@ -441,7 +659,7 @@ def main() -> None:
         reward_normalizer = RewardNormalizer(
             n_envs=args.n_envs, gamma=ppo_cfg.gamma, clip=clip,
         )
-        print(f"[train_retrieve] reward scaling ON (clip={clip})")
+        _kv("reward scaling", f"{_v('ON')}  {C_DIM}clip {clip}{_C.RESET}")
 
     start_iter = 0
     total_env_steps = 0
@@ -452,16 +670,17 @@ def main() -> None:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if reward_normalizer is not None and "reward_normalizer" in ckpt:
             reward_normalizer.load_state_dict(ckpt["reward_normalizer"])
-        if tscl_teacher is not None and "tscl_state" in ckpt:
-            tscl_teacher.load_state_dict(ckpt["tscl_state"])
+        if accel_teacher is not None and "accel_state" in ckpt:
+            accel_teacher.load_state_dict(ckpt["accel_state"])
         start_iter = int(ckpt.get("iteration", 0)) + 1
         total_env_steps = int(ckpt.get("total_env_steps", 0))
         best_mean_success = float(ckpt.get("best_mean_success", -1.0))
         bms_str = f"{best_mean_success*100:.1f}%" if best_mean_success >= 0 else "—"
-        print(
-            f"[train_retrieve] resumed from {args.resume} — starting at "
-            f"iter {start_iter}, env_steps={total_env_steps}, "
-            f"best_mean_success={bms_str}"
+        _kv(
+            "resumed from",
+            f"{_v(args.resume)}  {C_DIM}@ iter{_C.RESET} {_v_num(start_iter)}  "
+            f"{C_DIM}env_steps{_C.RESET} {_v_num(f'{total_env_steps:,}')}  "
+            f"{C_DIM}best{_C.RESET} {_C.BOLD}{C_SUCCESS}{bms_str}{_C.RESET}",
         )
 
     # ------------------------------------------------------------------
@@ -540,38 +759,44 @@ def main() -> None:
     recent_success_rates: list[float] = []
     t0 = time.time()
 
+    _banner(f"training · {args.total_iterations} iters · seed {args.seed}")
+
     for it in range(start_iter, start_iter + args.total_iterations):
         it_t0 = time.time()
 
-        # Pick this iter's (fullness, max_depth). Two regimes:
-        #   1) TSCL on  → bandit picks an arm; arm.sample_fullness() draws
-        #      a fullness uniformly within the arm's bin; arm.max_depth is
-        #      a discrete cap applied to the target picker.
-        #   2) TSCL off → phase curriculum (or static CLI) controls bounds.
-        tscl_arm_idx: int | None = None
-        if tscl_teacher is not None:
-            tscl_arm_idx = tscl_teacher.pick_arm(fullness_rng)
-            arm = tscl_teacher.arms[tscl_arm_idx]
-            cur_fullness = arm.sample_fullness(fullness_rng)
-            # Exact-depth semantics for TSCL arms: an arm labeled "d=k"
-            # produces targets at depth EXACTLY k, not "depth up to k". Set
-            # both bounds equal to the arm's depth so the picker can't slip
-            # in trivial-depth-0 cases on what's supposed to be a hard arm.
-            cur_roc = RetrieveOnlyConfig(
-                fullness=cur_fullness,
-                failure_penalty=args.failure_penalty,
-                target_deepest=False,  # exact-depth makes this orthogonal flag irrelevant
-                max_depth=arm.max_depth,
-                min_depth=arm.max_depth,
-                target_scope="all",
-                target_size=arm.shelf_size,  # type: ignore[arg-type]
-                require_solvable=args.require_solvable,
-                idle_while_pending_penalty=args.idle_while_pending_penalty,
-                big_shelf_clearing_weight=args.big_shelf_clearing_weight,
-                big_shelf_clearing_depth_weight=args.big_shelf_clearing_depth_weight,
-                disable_wait=args.disable_wait,
-                prioritize_big=args.prioritize_big,
-            )
+        # Pick this iter's layout. Two regimes:
+        #   1) ACCEL on  → either sample a buffered snapshot for replay (the
+        #      hard ones get priority by regret) or generate a fresh random
+        #      snapshot via the side env. The chosen snapshot is pinned via
+        #      RetrieveOnlyConfig.layout_override so all rollout workers run
+        #      the *exact* same layout deterministically — N rollouts give a
+        #      stable per-instance regret signal.
+        #   2) ACCEL off → plain uniform fullness sample, no curriculum.
+        cur_snapshot: LayoutSnapshot | None = None
+        cur_buffer_idx: int | None = None
+        if accel_teacher is not None and snapshot_env is not None:
+            if accel_teacher.should_replay(fullness_rng):
+                cur_snapshot, cur_buffer_idx = accel_teacher.sample_replay(fullness_rng)
+            else:
+                accel_teacher.note_explore()
+                cur_snapshot = _generate_fresh_snapshot(
+                    snapshot_env,
+                    fullness=float(fullness_rng.uniform(
+                        args.fullness_min, args.fullness_max,
+                    )),
+                    args=args,
+                    seed=int(fullness_rng.integers(0, 2**31 - 1)),
+                )
+            if cur_snapshot is not None:
+                cur_fullness = _snapshot_fullness(cur_snapshot)
+                cur_roc = _retrieve_config_with_override(
+                    args, cur_fullness, cur_snapshot,
+                )
+            else:
+                # Fallback (rare): snapshot env couldn't pick a target; let
+                # the rollout env run a fresh shuffle on its own this iter.
+                cur_fullness = _sample_fullness()
+                cur_roc = _retrieve_config(args, cur_fullness)
         else:
             cur_fullness = _sample_fullness()
             cur_roc = _retrieve_config(args, cur_fullness)
@@ -663,66 +888,164 @@ def main() -> None:
             writer.add_scalar("layout/n_shelves", len(collator.shelf_ids), total_env_steps)
             writer.add_scalar("layout/n_rooms", len(collator.room_ids), total_env_steps)
 
-        # TSCL post-iter book-keeping. Record this iter's success rate as
-        # the picked arm's reward, then optionally dump per-arm stats to TB.
-        tscl_str = ""
-        if tscl_teacher is not None and tscl_arm_idx is not None:
+        # ACCEL post-iter book-keeping. Score this iter's success against the
+        # picked snapshot (EMA-update if replayed, admit-or-discard if fresh),
+        # then run the periodic mutation pass on top-regret entries.
+        if accel_teacher is not None and cur_snapshot is not None:
             if ep_returns_all:
-                tscl_teacher.record(tscl_arm_idx, success_rate)
-            arm = tscl_teacher.arms[tscl_arm_idx]
+                accel_teacher.record(cur_snapshot, cur_buffer_idx, success_rate)
+            n_mutated = accel_teacher.maybe_mutate(it, fullness_rng, topo)
             if tb_log_this_iter:
-                writer.add_scalar("tscl/picked_arm", tscl_arm_idx, total_env_steps)
-                writer.add_scalar("tscl/picked_fullness", cur_fullness, total_env_steps)
-                writer.add_scalar("tscl/picked_max_depth", arm.max_depth, total_env_steps)
                 writer.add_scalar(
-                    "tscl/picked_alp", tscl_teacher.alp(tscl_arm_idx), total_env_steps,
+                    "accel/picked_fullness", cur_fullness, total_env_steps,
                 )
-            if it % max(1, args.tscl_log_every) == 0:
-                for i, a in enumerate(tscl_teacher.arms):
-                    label = a.label()
+                tgt = _target_summary(cur_snapshot, topo)
+                if tgt is not None:
                     writer.add_scalar(
-                        f"tscl/arm/{label}/alp",
-                        tscl_teacher.alp(i),
-                        total_env_steps,
+                        "accel/picked_target_depth", tgt[1], total_env_steps,
                     )
+                writer.add_scalar(
+                    "accel/picked_was_replay",
+                    1 if cur_buffer_idx is not None else 0,
+                    total_env_steps,
+                )
+                writer.add_scalar(
+                    "accel/buffer_size", len(accel_teacher.buffer), total_env_steps,
+                )
+                writer.add_scalar(
+                    "accel/mean_regret", accel_teacher.mean_regret(), total_env_steps,
+                )
+                if n_mutated:
+                    writer.add_scalar("accel/mutants_added", n_mutated, total_env_steps)
+            if it % max(1, args.accel_log_every) == 0:
+                writer.add_scalar(
+                    "accel/n_replays", accel_teacher.n_replays, total_env_steps,
+                )
+                writer.add_scalar(
+                    "accel/n_explores", accel_teacher.n_explores, total_env_steps,
+                )
+                writer.add_scalar(
+                    "accel/n_admitted", accel_teacher.n_admitted, total_env_steps,
+                )
+                writer.add_scalar(
+                    "accel/n_evicted", accel_teacher.n_evicted, total_env_steps,
+                )
+                hardest = accel_teacher.hardest_k_success()
+                if hardest is not None:
                     writer.add_scalar(
-                        f"tscl/arm/{label}/n_samples",
-                        tscl_teacher.n_samples(i),
-                        total_env_steps,
+                        "accel/hardest_k_success", hardest, total_env_steps,
                     )
-                    writer.add_scalar(
-                        f"tscl/arm/{label}/recent_succ",
-                        tscl_teacher.recent_mean(i),
-                        total_env_steps,
-                    )
-            tscl_str = (
-                f" tscl=arm{tscl_arm_idx:02d}({arm.label()})"
+        wall = time.time() - t0
+
+        # ---- header: iteration / steps / wall time --------------------
+        header_line = (
+            f"{_C.BOLD}{_C.CYAN}━━━ iter {it:>4d} ━━━{_C.RESET}  "
+            f"{C_DIM}env_steps{_C.RESET} "
+            f"{_C.BOLD}{C_ANCHOR}{total_env_steps:>10,d}{_C.RESET}  "
+            f"{C_DIM}wall{_C.RESET} "
+            f"{C_WALL}{wall:>5.0f}s{_C.RESET}  "
+            f"{C_DIM}(collect {collect_secs:>4.1f}s + update {update_secs:>4.1f}s){_C.RESET}"
+        )
+
+        # ---- episode: return / length / success -----------------------
+        if ep_returns_all:
+            episode_line = (
+                f"  {C_DIM}▎ episode    {_C.RESET}"
+                f"{C_DIM}return{_C.RESET} {_C.BOLD}{C_RETURN}"
+                f"{mean_ret:>+8.1f}{_C.RESET}   "
+                f"{C_DIM}ep_len{_C.RESET} "
+                f"{C_DIM}{mean_len:>5.0f}{_C.RESET}   "
+                f"{C_DIM}success{_C.RESET} "
+                f"{_C.BOLD}{_color_success(success_rate)}"
+                f"{success_rate*100:>5.1f}%{_C.RESET}   "
+                f"{C_DIM}n_eps {len(ep_returns_all):>3d}{_C.RESET}"
+            )
+        else:
+            episode_line = (
+                f"  {C_DIM}▎ episode    "
+                f"(no completed episodes this iter){_C.RESET}"
             )
 
-        wall = time.time() - t0
-        succ_str = (
-            f" succ={success_rate*100:5.1f}%" if ep_returns_all else ""
+        # ---- policy: PPO update metrics (all CYAN_MID, uniform weight) -
+        policy_line = (
+            f"  {C_DIM}▎ policy     "
+            f"pi_loss{_C.RESET} "
+            f"{C_SUPPORT}{metrics.policy_loss:>+7.3f}{_C.RESET}   "
+            f"{C_DIM}v_loss{_C.RESET} "
+            f"{C_SUPPORT}{metrics.value_loss:>7.2f}{_C.RESET}   "
+            f"{C_DIM}entropy{_C.RESET} "
+            f"{C_SUPPORT}{metrics.entropy:>6.3f}{_C.RESET}   "
+            f"{C_DIM}kl{_C.RESET} "
+            f"{_color_kl(metrics.approx_kl)}"
+            f"{metrics.approx_kl:>+8.4f}{_C.RESET}   "
+            f"{C_DIM}clip_frac{_C.RESET} "
+            f"{C_SUPPORT}{metrics.clip_fraction:>4.2f}{_C.RESET}   "
+            f"{C_DIM}expl_var{_C.RESET} "
+            f"{_color_ev(metrics.explained_variance)}"
+            f"{metrics.explained_variance:>+6.2f}{_C.RESET}"
         )
-        layout_str = (
-            f" layout={len(collator.carrier_ids)}C/{len(collator.shelf_ids)}S/"
-            f"{len(collator.room_ids)}R full={cur_fullness:.2f}"
-        )
-        print(
-            f"[it {it:4d}] env_steps={total_env_steps:>8d} "
-            f"ret={mean_ret:8.1f} ep_len={mean_len:6.0f}{succ_str} "
-            f"pi_loss={metrics.policy_loss:+.3f} v_loss={metrics.value_loss:.2f} "
-            f"ent={metrics.entropy:.3f} kl={metrics.approx_kl:+.4f} "
-            f"clipfrac={metrics.clip_fraction:.2f} ev={metrics.explained_variance:+.2f}"
-            f"{tscl_str}{layout_str} "
-            f"({collect_secs:.1f}s+{update_secs:.1f}s, wall={wall:.0f}s)"
-        )
+
+        # ---- curriculum: ACCEL state OR uniform-sampling fallback -----
+        if accel_teacher is not None and cur_snapshot is not None:
+            if cur_buffer_idx is not None:
+                mode_str = f"{C_REPLAY}{_C.BOLD}❮REPLAY ❯{_C.RESET}"
+            else:
+                mode_str = f"{C_EXPLORE}{_C.BOLD}❮EXPLORE❯{_C.RESET}"
+            hardest = accel_teacher.hardest_k_success()
+            if hardest is not None:
+                # 6-char field: "XX.X%" (5) + 1 space — matches the
+                # placeholder width below so the next column stays aligned.
+                hardest_str = (
+                    f"{C_DIM}hardest_K{_C.RESET} "
+                    f"{_C.BOLD}{_color_success(hardest)}"
+                    f"{hardest*100:>5.1f}%{_C.RESET}"
+                )
+            else:
+                hardest_str = (
+                    f"{C_DIM}hardest_K{_C.RESET} "
+                    f"{C_DIM}  —  %{_C.RESET}"
+                )
+            tgt = _target_summary(cur_snapshot, topo)
+            if tgt is not None:
+                tgt_size, tgt_depth = tgt
+                # Pad to 9 chars so "big@d=N  " and "small@d=N" line up.
+                tgt_field = f"{tgt_size}@d={tgt_depth}"
+                tgt_str = (
+                    f"{C_DIM}tgt{_C.RESET} "
+                    f"{C_SUPPORT}{tgt_field:<9}{_C.RESET}  "
+                )
+            else:
+                tgt_str = f"{C_DIM}tgt{_C.RESET} {C_DIM}{'—':<9}{_C.RESET}  "
+            curriculum_line = (
+                f"  {C_DIM}▎ curriculum {_C.RESET}{mode_str}  "
+                f"{tgt_str}"
+                f"{C_DIM}fullness{_C.RESET} "
+                f"{C_SUPPORT}{cur_fullness:.2f}{_C.RESET}   "
+                f"{C_DIM}buffer{_C.RESET} "
+                f"{_C.BOLD}{C_ANCHOR}{len(accel_teacher.buffer):>4d}{_C.RESET}   "
+                f"{C_DIM}mean_regret{_C.RESET} "
+                f"{C_SUPPORT}{accel_teacher.mean_regret():.2f}{_C.RESET}   "
+                f"{hardest_str}"
+            )
+        else:
+            curriculum_line = (
+                f"  {C_DIM}▎ curriculum {_C.RESET}"
+                f"{C_DIM}uniform   fullness {cur_fullness:.2f}{_C.RESET}"
+            )
+
+        # Layout line dropped — facility is fixed for the whole run, so
+        # carriers/shelves/rooms counts are constant and just add visual
+        # noise per iter. They're surfaced once in the startup banner instead.
+        print("\n".join([
+            header_line, episode_line, policy_line, curriculum_line,
+        ]))
 
         _save_checkpoint(
             run_dir / "ckpt_latest.pt", net, optimizer, it, net_cfg, feat_dims,
             reward_normalizer=reward_normalizer,
             total_env_steps=total_env_steps,
             best_mean_success=best_mean_success,
-            tscl_teacher=tscl_teacher,
+            accel_teacher=accel_teacher,
         )
         if (it + 1) % args.ckpt_every == 0:
             _save_checkpoint(
@@ -731,24 +1054,24 @@ def main() -> None:
                 reward_normalizer=reward_normalizer,
                 total_env_steps=total_env_steps,
                 best_mean_success=best_mean_success,
-                tscl_teacher=tscl_teacher,
+                accel_teacher=accel_teacher,
             )
         # "Best" tracks the most honest signal of policy capability we have.
         # Two regimes:
-        #   - TSCL on  → worst-arm recent success (gated to arms with ≥5
-        #     samples). Robust to which arm the bandit happened to sample
-        #     recently; rises only when the policy genuinely improves on
-        #     its hardest currently-tracked arm.
-        #   - TSCL off → windowed mean across recent iters. Noisier than the
-        #     worst-arm signal but the only thing available without per-arm
+        #   - ACCEL on  → mean success across the top-K hardest entries (gated
+        #     to entries with ≥metric_min_visits samples). Robust to which
+        #     task the buffer happened to sample recently; rises only when
+        #     the policy genuinely improves on its hardest currently-stored
+        #     scenarios — including post-mastery, since regret-based ranking
+        #     keeps fragile-but-mostly-solved configs in the top-K.
+        #   - ACCEL off → windowed mean across recent iters. Noisier than the
+        #     hardest-K signal but the only thing available without buffer
         #     bookkeeping.
         candidate_metric: float | None = None
         metric_label = ""
-        if tscl_teacher is not None:
-            candidate_metric = tscl_teacher.worst_arm_recent_succ(
-                min_samples=5, last_k=10,
-            )
-            metric_label = "worst-arm succ"
+        if accel_teacher is not None:
+            candidate_metric = accel_teacher.hardest_k_success()
+            metric_label = "hardest-K succ"
         elif len(recent_success_rates) >= 3:
             candidate_metric = float(np.mean(recent_success_rates[-5:]))
             metric_label = "mean succ"
@@ -761,19 +1084,21 @@ def main() -> None:
                 reward_normalizer=reward_normalizer,
                 total_env_steps=total_env_steps,
                 best_mean_success=best_mean_success,
-                tscl_teacher=tscl_teacher,
+                accel_teacher=accel_teacher,
             )
             prev_str = f"{prev*100:.1f}%" if prev >= 0 else "—"
             print(
-                f"           ↳ new ckpt_best ({metric_label}: "
-                f"{prev_str} → {candidate_metric*100:.1f}%)"
+                f"  {_C.LIME}{_C.BOLD}▶ new ckpt_best{_C.RESET} "
+                f"{_C.LIME_MID}({metric_label}: {prev_str} → "
+                f"{candidate_metric*100:.1f}%){_C.RESET}"
             )
 
     writer.close()
     if vec_env is not None:
         vec_env.close()
     bms_str = f"{best_mean_success*100:.1f}%" if best_mean_success >= 0 else "—"
-    print(f"[train_retrieve] done; best windowed mean success rate = {bms_str}")
+    _banner("done")
+    _kv("best", f"{_C.BOLD}{C_SUCCESS}{bms_str}{_C.RESET}")
 
 
 if __name__ == "__main__":

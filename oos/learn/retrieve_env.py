@@ -31,6 +31,7 @@ from oos.env.env import FacilityFactory, OOSEnv
 from oos.env.observation import ObservationConfig
 from oos.env.reward import RewardConfig
 from oos.config.schema import ExperimentConfig
+from oos.learn.layout import LayoutSnapshot, apply_snapshot_to_facility
 from oos.sim.shuffle import shuffle_state
 from oos.sim.tasks import Retrieve
 
@@ -123,6 +124,12 @@ class RetrieveOnlyConfig:
     # mid-move) become unavailable, so use temporarily during hard-arm
     # training, not as a permanent default.
     disable_wait: bool = False
+    # ACCEL hook: when set, `reset()` skips the random shuffle + target-picker
+    # entirely and loads this exact LayoutSnapshot into the facility, using
+    # `layout_override.target_pallet_id` as the per-episode target. Lets the
+    # ACCEL replay buffer reproduce a stored hard layout byte-for-byte every
+    # iteration. None falls back to the default random shuffle path.
+    layout_override: LayoutSnapshot | None = None
 
 
 class RetrieveOnlyEnv(OOSEnv):
@@ -156,34 +163,36 @@ class RetrieveOnlyEnv(OOSEnv):
         # the episode. The single target is injected explicitly below.
         facility.set_auto_arrivals(False)
 
-        # Retry the random shuffle until BOTH conditions hold:
-        #   - the layout passes the worst-case retrievability check
-        #     (`require_solvable`, handled inside shuffle_state), AND
-        #   - the configured target picker actually returns a non-None
-        #     candidate under the current filter (target_size, max_depth,
-        #     target_deepest, target_scope).
-        # The second condition fixes the corner where the filter is tight
-        # enough that most random layouts have no candidate target — most
-        # visibly at (max_depth=0, target_size=small, low fullness) where
-        # ~20% of layouts would otherwise produce a None target and get
-        # silently counted as "failures" by the success metric.
-        # Re-roll the random shuffle until the target picker finds a
-        # candidate satisfying the depth / size / scope filter. No cap —
-        # tight filters can need many tries, and a phantom "success" from
-        # giving up with target=None is worse than spending a few extra ms.
-        # If a config is genuinely infeasible (e.g. depth=4 on a 4-cap
-        # shelf at low fullness), reset() will loop forever; that's a
-        # diagnostic, not a bug.
-        target_id: int | None = None
-        while target_id is None:
-            shuffle_state(
-                facility,
-                fullness=self._retrieve_cfg.fullness,
-                rng=rng,
-                require_solvable=self._retrieve_cfg.require_solvable,
-                prioritize_big=self._retrieve_cfg.prioritize_big,
-            )
-            target_id = self._pick_target_pallet(rng)
+        # ACCEL replay path: when `layout_override` is set, the trainer has
+        # pinned an exact layout for this episode (sampled from the buffer
+        # or freshly generated + admitted). Skip shuffle + target-picker
+        # entirely and load the snapshot deterministically.
+        if self._retrieve_cfg.layout_override is not None:
+            apply_snapshot_to_facility(facility, self._retrieve_cfg.layout_override)
+            target_id = self._retrieve_cfg.layout_override.target_pallet_id
+        else:
+            # Default random-shuffle path. Retry the random shuffle until BOTH
+            # conditions hold:
+            #   - the layout passes the worst-case retrievability check
+            #     (`require_solvable`, handled inside shuffle_state), AND
+            #   - the configured target picker actually returns a non-None
+            #     candidate under the current filter (target_size, max_depth,
+            #     target_deepest, target_scope).
+            # The second condition fixes the corner where the filter is tight
+            # enough that most random layouts have no candidate target — most
+            # visibly at (max_depth=0, target_size=small, low fullness) where
+            # ~20% of layouts would otherwise produce a None target and get
+            # silently counted as "failures" by the success metric.
+            target_id: int | None = None
+            while target_id is None:
+                shuffle_state(
+                    facility,
+                    fullness=self._retrieve_cfg.fullness,
+                    rng=rng,
+                    require_solvable=self._retrieve_cfg.require_solvable,
+                    prioritize_big=self._retrieve_cfg.prioritize_big,
+                )
+                target_id = self._pick_target_pallet(rng)
         self._target_pallet_id = target_id
         if target_id is not None:
             facility.queue.add(
