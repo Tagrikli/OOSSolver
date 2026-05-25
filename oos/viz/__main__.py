@@ -10,12 +10,22 @@ from oos.env.env import OOSEnv
 from oos.facilities import FACILITIES, get_facility
 from oos.viz.app import run_app
 from oos.viz.player import random_policy
+from oos.viz.state_store import load_viz_state
 
 if __name__ == "__main__":
+    # Defaults pull from the persisted viz state so re-launching picks up
+    # whatever you were last looking at. Explicit --facility on the CLI
+    # always wins over the persisted value.
+    persisted = load_viz_state()
+    default_facility = persisted.facility_name or "dev"
+    if default_facility not in FACILITIES:
+        default_facility = "dev"
+
     p = argparse.ArgumentParser()
-    p.add_argument("--facility", type=str, default="dev",
+    p.add_argument("--facility", type=str, default=default_facility,
                    choices=sorted(FACILITIES.keys()),
-                   help="Which hand-authored facility to visualize.")
+                   help="Which hand-authored facility to visualize. "
+                        "Defaults to the last opened facility if persisted.")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 

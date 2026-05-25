@@ -16,6 +16,7 @@ from oos.sim.topology import (
     RoomId,
     Shelf,
     ShelfId,
+    ShelfOrientation,
     Topology,
 )
 
@@ -53,6 +54,7 @@ class ShelfPlacement:
     partner: CarrierId | None         # other carrier if transfer shelf
     partner_x: int | None             # x in the partner strip (for connector hint)
     partner_strip_track_y: int | None
+    orientation: ShelfOrientation = "up"   # "up" → above track, "down" → below
 
 
 @dataclass
@@ -80,6 +82,12 @@ class Layout:
     canvas_rect: tuple[int, int, int, int]
     sidebar_rect: tuple[int, int, int, int]
     queue_strip_rect: tuple[int, int, int, int]
+    # Scrollable region for the stacked carrier strips. The renderer clips
+    # carrier drawing to this rect and applies a scroll offset when the
+    # total stacked height exceeds carriers_visible_h.
+    carriers_top: int
+    carriers_visible_h: int
+    strip_row_h: int            # pitch per carrier row (strip_h + strip_pad)
     strips: dict[CarrierId, StripGeom]
     shelves: list[ShelfPlacement] = field(default_factory=list)
     rooms: list[RoomPlacement] = field(default_factory=list)
@@ -101,6 +109,11 @@ class LayoutConfig:
     canvas_pad: int = 24
     track_right_pad: int = 80   # extra room on the right of the track for end-of-track shelf labels
     queue_strip_h: int = 86     # top-of-canvas customer queue strip height
+    # Each carrier strip is a FIXED size — they do not stretch to fill the
+    # canvas. When N carriers overflow the canvas vertically the renderer
+    # scrolls them; the strip itself never gets squished.
+    strip_h: int = 200          # fixed strip height (incl. internal pad)
+    strip_w_max: int = 1400     # max strip width; adapts down for narrow windows
 
 
 def compute_layout(topo: Topology, cfg: LayoutConfig | None = None) -> Layout:
@@ -124,20 +137,24 @@ def compute_layout(topo: Topology, cfg: LayoutConfig | None = None) -> Layout:
     )
     carriers_top = cfg.canvas_pad + cfg.queue_strip_h + cfg.strip_pad
 
-    n = len(topo.carriers)
-    inner_h = canvas_h - carriers_top - cfg.canvas_pad
-    strip_h = inner_h // max(n, 1)
+    # Fixed-size strips. Width adapts down for narrow windows but never
+    # exceeds strip_w_max; height is always strip_h. When the total carrier
+    # column exceeds the visible canvas, the renderer scrolls.
+    strip_w = min(cfg.strip_w_max, canvas_w - 2 * cfg.canvas_pad)
+    strip_h = cfg.strip_h
+    strip_row_h = strip_h + cfg.strip_pad   # pitch per row
+
+    track_x_start = cfg.canvas_pad + cfg.strip_label_w
+    track_x_end = cfg.canvas_pad + strip_w - cfg.track_right_pad
 
     # Order carriers by id for a stable visual layout.
     ordered = sorted(topo.carriers.values(), key=lambda c: c.id)
 
     strips: dict[CarrierId, StripGeom] = {}
     for i, c in enumerate(ordered):
-        y0 = carriers_top + i * strip_h
-        rect = (cfg.canvas_pad, y0, canvas_w - 2 * cfg.canvas_pad, strip_h - cfg.strip_pad)
-        track_y = y0 + (strip_h - cfg.strip_pad) // 2 + 20
-        track_x_start = cfg.canvas_pad + cfg.strip_label_w
-        track_x_end = canvas_w - cfg.canvas_pad - cfg.track_right_pad
+        y0 = carriers_top + i * strip_row_h
+        rect = (cfg.canvas_pad, y0, strip_w, strip_h)
+        track_y = y0 + strip_h // 2 + 20
         strips[c.id] = StripGeom(
             carrier_id=c.id,
             rect=rect,
@@ -145,7 +162,7 @@ def compute_layout(topo: Topology, cfg: LayoutConfig | None = None) -> Layout:
             track_x_start=track_x_start,
             track_x_end=track_x_end,
             positions=c.positions,
-            label_rect=(cfg.canvas_pad, y0, cfg.strip_label_w, strip_h - cfg.strip_pad),
+            label_rect=(cfg.canvas_pad, y0, cfg.strip_label_w, strip_h),
         )
 
     shelf_placements: list[ShelfPlacement] = []
@@ -165,6 +182,7 @@ def compute_layout(topo: Topology, cfg: LayoutConfig | None = None) -> Layout:
                     partner=partner if s.is_transfer else None,
                     partner_x=partner_x if s.is_transfer else None,
                     partner_strip_track_y=partner_track_y if s.is_transfer else None,
+                    orientation=s.orientation_at(cid),
                 )
             )
 
@@ -196,6 +214,9 @@ def compute_layout(topo: Topology, cfg: LayoutConfig | None = None) -> Layout:
         canvas_rect=(canvas_x, canvas_y, canvas_w, canvas_h),
         sidebar_rect=(sidebar_x, sidebar_y, sidebar_w, sidebar_h),
         queue_strip_rect=queue_strip_rect,
+        carriers_top=carriers_top,
+        carriers_visible_h=max(0, canvas_h - carriers_top - cfg.canvas_pad),
+        strip_row_h=strip_row_h,
         strips=strips,
         shelves=shelf_placements,
         rooms=room_placements,

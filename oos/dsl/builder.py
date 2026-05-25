@@ -5,10 +5,11 @@ Construction order is flexible; validation runs at build() time.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Mapping
 
 from oos.dsl.refs import HandoffRef, RoomRef, ShelfRef
+from oos.sim.topology import ShelfOrientation
 
 SizeClass = Literal["small", "big"]
 
@@ -22,6 +23,10 @@ class _ShelfSpec:
     positions: dict[str, int]  # carrier_name -> position
     is_transfer: bool
     transfer_partners: tuple[str, str] | None
+    # carrier_name -> "up" | "down". Missing entries default to "up" at
+    # compile time. Purely visual; the sim treats both orientations as
+    # the same LIFO storage unit.
+    orientations: dict[str, ShelfOrientation] = field(default_factory=dict)
 
 
 @dataclass
@@ -60,7 +65,14 @@ class CarrierBuilder:
         at: int,
         capacity: int,
         size: SizeClass,
+        orientation: Literal["up", "down"] = "up",
     ) -> ShelfRef:
+        """Declare a shelf at `at` on this carrier's track.
+
+        `orientation`: "up" → drawn above the track (default); "down" →
+        drawn below. Two shelves may share the same `at` if their
+        orientations differ — one above, one below.
+        """
         spec = _ShelfSpec(
             name=name,
             owner=self.name,
@@ -69,6 +81,7 @@ class CarrierBuilder:
             positions={self.name: at},
             is_transfer=False,
             transfer_partners=None,
+            orientations={self.name: orientation},
         )
         self._facility._register_shelf(spec)
         return ShelfRef(name=name)
@@ -117,14 +130,23 @@ class Facility:
         between: tuple[CarrierBuilder, CarrierBuilder],
         at: Mapping[CarrierBuilder, int],
         size: SizeClass,
+        orientation: Mapping[CarrierBuilder, Literal["up", "down"]] | None = None,
     ) -> ShelfRef:
         """A single-slot buffer accessible by two carriers.
 
         Capacity is implicitly 1 — one carrier deposits, the other picks up
         later (decoupled in time). For synchronous co-located swaps with no
         buffer, use `fac.handoff(...)` instead.
+
+        `orientation`: optional per-carrier visual orientation. e.g.
+        `orientation={a: "up", b: "down"}` makes it appear above a's track
+        and below b's. Defaults to "up" on both strips.
         """
         a, b = between
+        orientations: dict[str, ShelfOrientation] = {a.name: "up", b.name: "up"}
+        if orientation is not None:
+            for cb, o in orientation.items():
+                orientations[cb.name] = o
         spec = _ShelfSpec(
             name=name,
             owner=None,
@@ -133,6 +155,7 @@ class Facility:
             positions={a.name: at[a], b.name: at[b]},
             is_transfer=True,
             transfer_partners=(a.name, b.name),
+            orientations=orientations,
         )
         self._register_shelf(spec)
         return ShelfRef(name=name)

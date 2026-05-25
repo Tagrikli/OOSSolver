@@ -290,6 +290,9 @@ class Facility:
                 not self.auto_arrivals_enabled
                 and next_ev is not None
                 and next_ev.kind in ("task_arrival", "retrieve_arrival")
+                # scheduled_store_arrival is NOT silently dropped — it's the
+                # env's deliberate Store-arrival mechanism and runs regardless
+                # of auto_arrivals_enabled.
             ):
                 self.scheduler.pop()
                 continue
@@ -326,6 +329,15 @@ class Facility:
             self._on_command_done(ev.payload, completions)
         elif kind == "task_arrival":
             self._on_task_arrival(arrivals, dropped, completions)
+        elif kind == "scheduled_store_arrival":
+            # Out-of-band Store arrival pushed by the env (not via the task
+            # stream). Adds the Store to the queue and immediately scans
+            # rooms for auto-serve. Same semantics as _on_task_arrival's
+            # Store branch but bypasses task_stream + auto_arrivals_enabled.
+            task = Store(arrived_at=self.state.time, size=ev.payload["size"])
+            self.queue.add(task)
+            arrivals.append(task)
+            self._scan_all_for_auto_serve_rooms(completions)
         elif kind == "retrieve_arrival":
             self._on_retrieve_arrival(ev.payload, arrivals, completions)
         else:
@@ -478,6 +490,15 @@ class Facility:
         """
         rs = self.state.rooms[room_id]
         if rs.load is None:
+            return
+        # Skip if the pallet at this room is the source of an in-flight
+        # Relocate/MultiRelocate. Engine state keeps the pallet at `rs.load`
+        # until the command completes (the carrier visually "holds" it), and
+        # mutating its contents mid-transit would corrupt the in-flight
+        # delivery — the carrier ends up dropping a filled pallet where it
+        # promised to drop an empty one.
+        from oos.sim.actions import _pending_src_count
+        if _pending_src_count(self.state, room_id) > 0:
             return
         pallet = rs.load
         # A pending Retrieve for THIS pallet (regardless of contents) wins.

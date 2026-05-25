@@ -138,6 +138,16 @@ def enumerate_actions(
             ps = state.carriers[partner]
             if not ps.is_idle or ps.load is not None:
                 continue
+            # Partner with an active cleanup obligation (must_relocate_from
+            # pointing at a still-loaded room) cannot be recruited — being
+            # the MultiRelocate partner would let them walk away from the
+            # room without satisfying the constraint. Auto-clear if the room
+            # has been emptied since the flag was set.
+            if ps.must_relocate_from is not None:
+                room_id = ps.must_relocate_from
+                if room_id in state.rooms and state.rooms[room_id].load is not None:
+                    continue
+                ps.must_relocate_from = None
             partner_reachable: list[LocationId] = list(
                 topo.accessible_shelves[partner]
             )
@@ -159,7 +169,11 @@ def enumerate_actions(
                         ))
 
     # WAIT: always legal. Carrier sits out this decision instant and gets
-    # re-queried after any scheduler event fires.
+    # re-queried after any scheduler event fires. Crucially WAIT is allowed
+    # even when must_relocate_from is active — the carrier may legitimately
+    # want to idle at the room (e.g., parked with an empty pallet waiting
+    # for a Store to arrive and fill it). The constraint only restricts the
+    # carrier's *next Relocate* to src=room, not whether it must act now.
     entries.append(ActionEntry(type=ActionType.WAIT))
     return entries
 

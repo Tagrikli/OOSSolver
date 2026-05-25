@@ -1,16 +1,17 @@
-"""Smoke tests for the random pallet-shuffle and the RetrieveOnlyEnv."""
+"""Smoke tests for the random pallet-shuffle and the two-phase EpisodeEnv."""
 
 from __future__ import annotations
 
 import numpy as np
 
-from oos.config.schema import EpisodeConfig, ExperimentConfig, TaskStreamConfig
+from oos.config.schema import EpisodeConfig as ExpEpisodeConfig
+from oos.config.schema import ExperimentConfig, TaskStreamConfig
 from oos.facilities import get_facility
-from oos.learn.retrieve_env import RetrieveOnlyConfig, RetrieveOnlyEnv
+from oos.learn.episode_env import EpisodeConfig, EpisodeEnv
 from oos.sim.durations import LinearDurations
 from oos.sim.facility import Facility
 from oos.sim.shuffle import shuffle_state
-from oos.sim.tasks import Retrieve
+from oos.sim.tasks import Store
 
 
 def _fresh_facility(name: str = "tiny") -> Facility:
@@ -61,39 +62,41 @@ def test_shuffle_is_deterministic_with_same_rng_seed():
     assert snap1 == snap2
 
 
-def test_retrieve_only_env_seeds_a_single_retrieve():
-    env = RetrieveOnlyEnv(
+def test_episode_env_starts_in_storing_phase_with_one_store_scheduled():
+    env = EpisodeEnv(
         facility_factory=get_facility("tiny"),
-        retrieve_only_config=RetrieveOnlyConfig(fullness=0.7),
+        episode_scenario_config=EpisodeConfig(big_prob=0.15, store_arrival_delay=10.0),
         experiment_config=ExperimentConfig(
             task_stream=TaskStreamConfig(store_rate=0.0),
-            episode=EpisodeConfig(max_steps=200),
+            episode=ExpEpisodeConfig(max_steps=400),
         ),
     )
     obs, info = env.reset(seed=0)
     facility = env._ctx.facility
-    retrieves = [t for t in facility.queue.pending if isinstance(t, Retrieve)]
-    assert len(retrieves) == 1
-    assert retrieves[0].pallet == info["retrieve_target"]
-    # Pallet must exist on a shelf at episode start.
-    target = info["retrieve_target"]
-    found = any(
-        p.id == target for ss in facility.state.shelves.values() for p in ss.stack
-    )
-    assert found, f"target pallet {target} not on any shelf"
+    assert info["episode_phase"] == "storing"
+    # All pallets start empty (shuffle with fullness=0).
+    contents = [p.contents for ss in facility.state.shelves.values() for p in ss.stack]
+    assert all(c == "empty" for c in contents)
+    # No Store in the queue yet — it's scheduled at t=10 via the scheduler.
+    stores_in_queue = [t for t in facility.queue.pending if isinstance(t, Store)]
+    assert len(stores_in_queue) == 0
+    scheduled = [
+        ev for ev in facility.scheduler._heap
+        if ev.kind == "scheduled_store_arrival"
+    ]
+    assert len(scheduled) == 1
+    assert scheduled[0].when == 10.0
 
 
-def test_retrieve_only_env_truncation_applies_failure_penalty():
-    """A random policy almost certainly fails within 20 steps; the final
+def test_episode_env_truncation_applies_failure_penalty():
+    """A random policy almost certainly fails within 30 steps; the final
     reward should include the failure penalty."""
-    env = RetrieveOnlyEnv(
+    env = EpisodeEnv(
         facility_factory=get_facility("tiny"),
-        retrieve_only_config=RetrieveOnlyConfig(
-            fullness=0.7, failure_penalty=100.0,
-        ),
+        episode_scenario_config=EpisodeConfig(failure_penalty=100.0),
         experiment_config=ExperimentConfig(
             task_stream=TaskStreamConfig(store_rate=0.0),
-            episode=EpisodeConfig(max_steps=20),
+            episode=ExpEpisodeConfig(max_steps=30),
         ),
     )
     obs, info = env.reset(seed=0)
@@ -107,9 +110,6 @@ def test_retrieve_only_env_truncation_applies_failure_penalty():
         obs, last_reward, last_term, last_trunc, last_info = env.step(rng.choice(valid))
         if last_term or last_trunc:
             break
-    # Either succeeded (terminated) or hit truncation. The smoke target is
-    # the truncation path with penalty applied.
     if last_trunc and not last_term:
-        assert last_info.get("retrieve_served") is False
-        assert last_info.get("retrieve_failure_penalty") == 100.0
-        assert last_reward <= -50.0  # at least the penalty, minus any other costs
+        assert last_info.get("episode_failure_penalty") == 100.0
+        assert last_reward <= -50.0

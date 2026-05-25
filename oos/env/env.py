@@ -24,7 +24,7 @@ from oos.env.observation import (
     build_observation,
     shelf_feature_count,
 )
-from oos.env.reward import RewardConfig, compute_reward
+from oos.env.reward import RewardConfig, compute_reward, potential
 from oos.sim.durations import LinearDurations
 from oos.sim.facility import Facility, SeedingConfig
 from oos.sim.tasks import PoissonTaskStream
@@ -279,6 +279,7 @@ class OOSEnv(gym.Env):
         dropped = []
         total_dt = 0.0
         movement_distance = 0.0
+        phi_before = potential(facility, self._reward_cfg)
         if not ctx.pending_idle:
             # Snapshot positions so we can charge a per-slot travel penalty.
             # Each command moves monotonically in one direction, so summed
@@ -305,6 +306,7 @@ class OOSEnv(gym.Env):
                     )
                     ctx.decoder = ActionDecoder(entries, self._n_max)
 
+        phi_after = potential(facility, self._reward_cfg)
         reward = compute_reward(
             facility=facility,
             task_cfg=self._experiment_cfg.task_stream,
@@ -313,6 +315,8 @@ class OOSEnv(gym.Env):
             n_pending_at_start=len(facility.queue),
             completions=completions,
             movement_distance=movement_distance,
+            phi_before=phi_before,
+            phi_after=phi_after,
         )
 
         self._step_count += 1

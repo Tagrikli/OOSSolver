@@ -29,10 +29,10 @@ def make_facility() -> tuple[Topology, SeedingConfig]:
     C1 = fac.carrier("C1", positions=6)
     C2 = fac.carrier("C2", positions=6)
 
-    C1.shelf("A1", at=2, capacity=4, size="big")
-    C1.shelf("A2", at=3, capacity=4, size="small")
-    C2.shelf("B1", at=2, capacity=4, size="big")
-    C2.shelf("B2", at=3, capacity=4, size="small")
+    C1.shelf("A1", at=2, capacity=3, size="big")
+    C1.shelf("A2", at=3, capacity=3, size="small")
+    C2.shelf("B1", at=2, capacity=3, size="big")
+    C2.shelf("B2", at=3, capacity=3, size="small")
 
     C1.room("R1", at=0)
 

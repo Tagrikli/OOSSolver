@@ -12,6 +12,16 @@ Position = int
 
 SizeClass = Literal["small", "big"]
 
+# Visual orientation of a shelf relative to the carrier's track. Same LIFO
+# storage either way; orientation only flips the rendering:
+#   "up"   : shelf drawn above the track, carrier reaches up to take/place.
+#   "down" : shelf drawn below the track, carrier reaches down. The visual
+#            stack is reversed — top-of-LIFO sits at the TOP of the box
+#            (closest to the track), older items hang deeper down.
+# Two shelves may share the same (carrier, position) provided their
+# orientations differ — i.e. one above, one below.
+ShelfOrientation = Literal["up", "down"]
+
 
 @dataclass(frozen=True)
 class Carrier:
@@ -42,12 +52,24 @@ class Shelf:
     # Transfer shelves are implicit single-slot buffers (capacity forced to 1).
     # For synchronous co-located swaps with no buffer, use a Handoff pose.
 
+    # Per-(shelf, carrier) visual orientation. Missing entries default to
+    # "up", so existing facilities that don't specify orientation behave
+    # exactly as before. This is purely a viz hint; the sim ignores it.
+    orientation_for: Mapping[CarrierId, ShelfOrientation] | None = None
+
     def accepts(self, item_size: SizeClass | None) -> bool:
         if item_size is None:
             return True
         if self.size_class == "big":
             return True
         return item_size == "small"
+
+    def orientation_at(self, carrier_id: CarrierId) -> ShelfOrientation:
+        """Return the orientation this shelf takes on `carrier_id`'s strip.
+        Defaults to 'up' when unspecified."""
+        if self.orientation_for is None:
+            return "up"
+        return self.orientation_for.get(carrier_id, "up")
 
 
 @dataclass(frozen=True)
@@ -173,6 +195,20 @@ def validate_topology(topo: Topology) -> None:
                 raise TopologyValidationError(
                     f"shelf {sid} position {pos} out of range for carrier {cid}"
                 )
+
+    # Two shelves may share a (carrier, position) slot if their orientations
+    # differ — one above the track, one below. Reject any (carrier, position,
+    # orientation) collision.
+    seen_slots: dict[tuple[CarrierId, Position, ShelfOrientation], ShelfId] = {}
+    for sid, s in topo.shelves.items():
+        for cid in s.access:
+            key = (cid, s.position_for[cid], s.orientation_at(cid))
+            if key in seen_slots:
+                raise TopologyValidationError(
+                    f"shelves {seen_slots[key]!r} and {sid!r} collide at "
+                    f"carrier={cid} position={key[1]} orientation={key[2]}"
+                )
+            seen_slots[key] = sid
 
     for rid, r in topo.rooms.items():
         if r.id != rid:

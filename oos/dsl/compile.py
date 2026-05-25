@@ -35,6 +35,8 @@ def compile_facility(fac: "Facility") -> tuple[Topology, SeedingConfig]:
     shelves: dict[str, Shelf] = {}
     for sname, s in fac._shelves.items():
         access = tuple(s.positions.keys())
+        # Default any missing per-carrier orientation to "up".
+        orientations = {cid: s.orientations.get(cid, "up") for cid in access}
         shelves[sname] = Shelf(
             id=sname,
             size_class=s.size,
@@ -42,6 +44,7 @@ def compile_facility(fac: "Facility") -> tuple[Topology, SeedingConfig]:
             access=access,
             position_for=dict(s.positions),
             is_transfer=s.is_transfer,
+            orientation_for=orientations,
         )
 
     rooms = {

@@ -8,6 +8,8 @@ from oos.facilities.dibaji import make_facility as make_dibaji_facility
 from oos.facilities.medipol import make_facility as make_medipol_facility
 from oos.facilities.random_gen import make_random_facility
 from oos.facilities.tiny import make_facility as make_tiny_facility
+from oos.facilities.tiny_tall import make_facility as make_tiny_tall_facility
+from oos.facilities.tiny_wide import make_facility as make_tiny_wide_facility
 from oos.sim.facility import SeedingConfig
 from oos.sim.topology import Topology
 
@@ -16,6 +18,8 @@ FacilityFactory = Callable[[], tuple[Topology, SeedingConfig]]
 FACILITIES: dict[str, FacilityFactory] = {
     "dev": make_dev_facility,
     "tiny": make_tiny_facility,
+    "tiny_tall": make_tiny_tall_facility,
+    "tiny_wide": make_tiny_wide_facility,
     "big_retr": make_big_retr_facility,
     "dibaji": make_dibaji_facility,
     "medipol": make_medipol_facility,

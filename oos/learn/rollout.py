@@ -38,6 +38,12 @@ class RolloutBuffer:
     ep_completions: list[int] = field(default_factory=list)
     ep_sim_times: list[float] = field(default_factory=list)
     ep_constraint_costs: list[float] = field(default_factory=list)
+    # Two-phase scenario progress: how many of the planned retrieves were
+    # actually served by episode end. retr_total may be 0 if the episode
+    # truncated before phase 2 even started.
+    ep_retrieves_completed: list[int] = field(default_factory=list)
+    ep_retrieves_total: list[int] = field(default_factory=list)
+    ep_stores_completed: list[int] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.actions)
@@ -147,6 +153,9 @@ def collect_rollout(
             buf.ep_completions.append(state.ep_completions)
             buf.ep_sim_times.append(float(next_info.get("sim_time", 0)))
             buf.ep_constraint_costs.append(state.ep_constraint_cost)
+            buf.ep_retrieves_completed.append(int(next_info.get("retrieves_completed", 0)))
+            buf.ep_retrieves_total.append(int(next_info.get("retrieves_total", 0)))
+            buf.ep_stores_completed.append(int(next_info.get("stores_completed", 0)))
             state.ep_return = 0
             state.ep_length = 0
             state.ep_completions = 0
@@ -247,6 +256,9 @@ def collect_rollout_vec(
                 buf.ep_completions.append(int(res.ep_completions))
                 buf.ep_sim_times.append(float(res.ep_sim_time))
                 buf.ep_constraint_costs.append(float(res.ep_constraint_cost))
+                buf.ep_retrieves_completed.append(int(res.ep_retrieves_completed or 0))
+                buf.ep_retrieves_total.append(int(res.ep_retrieves_total or 0))
+                buf.ep_stores_completed.append(int(res.ep_stores_completed or 0))
             current[i] = res.sample
 
         if terminal_samples:
