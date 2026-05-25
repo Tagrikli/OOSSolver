@@ -1,23 +1,46 @@
 """Phase-aware position interpolation for carriers mid-command.
 
-The sim treats Relocate / MultiRelocate as atomic commands — the carrier
-becomes busy at start() and the world snaps forward at complete(). The viz
-needs to show the physical trajectory through each sub-phase (travel, take,
-travel, place, etc.) so the carrier appears to move smoothly between its
-endpoints. These helpers synthesize that visual position from the live
-Facility state + an animation timestamp.
+The sim is event-driven: Relocate / MultiRelocate become atomic at start()
+and complete(). The viz reconstructs the carrier's physical trajectory
+between those events using the SAME `MotionProfile` the sim uses for
+timing. That's the unification: there is exactly one source of truth for
+"how does a carrier move from A to B over time" — `carrier.profile`.
 
-Pure functions; no pygame import. Renderer calls into here per frame.
+  - Total move time: `carrier.profile.travel_time(d)`     (used by sim)
+  - Position at t:   `carrier.profile.traveled_at(t, d)`  (used by viz)
+
+These functions never integrate velocity numerically per frame; they read
+position at a point in time via the closed-form trapezoidal/triangular
+formulas. Frame-rate-independent and consistent with the sim's clock.
+
+Pure functions; no pygame import.
 """
 
 from __future__ import annotations
 
 from oos.sim.actions import MultiRelocate, Relocate
 from oos.sim.facility import Facility
+from oos.sim.topology import Carrier
+
+
+def _position_at(
+    carrier: Carrier, start: float, end: float, elapsed: float,
+) -> float:
+    """Smoothly-interpolated mm position at `elapsed` seconds into a move
+    from `start`→`end`, using the carrier's motion profile.
+
+    Returns `start` at elapsed=0 and `end` at elapsed ≥ travel_time.
+    """
+    if start == end:
+        return float(start)
+    d = abs(end - start)
+    traveled = carrier.profile.traveled_at(max(0.0, elapsed), d)
+    sign = 1.0 if end >= start else -1.0
+    return float(start) + sign * traveled
 
 
 def interpolated_position(facility: Facility, carrier_id: str, anim_now: float) -> float:
-    """Carrier x-position along its track at `anim_now`.
+    """Carrier mm-position along its track at `anim_now`.
 
     Only the MOVE portion of a command's duration is used for interpolation;
     any trailing shelf-op time leaves the carrier stationary at the target.
@@ -36,20 +59,15 @@ def interpolated_position(facility: Facility, carrier_id: str, anim_now: float) 
         cs.command_start_position if cs.command_start_position is not None else cs.position
     )
     carrier = facility.topology.carriers[carrier_id]
-    move_dur = facility.durations.move(carrier, start_pos, end_pos)
-    if move_dur <= 0:
-        return float(end_pos)
     elapsed = max(0.0, anim_now - cs.command_started_at)
-    frac = min(1.0, elapsed / move_dur)
-    return start_pos + frac * (end_pos - start_pos)
+    return _position_at(carrier, float(start_pos), float(end_pos), elapsed)
 
 
 def location_visual_pos(loc: str, carrier_id: str, topo) -> int | None:
-    """Carrier-track x-position (discrete slot index) of a Relocate endpoint
-    — a real shelf or a room. Matches the sim's discrete `Position` type so
-    duration calculations get the integer arguments they expect; the visual
-    smoothing that interpolates between two such positions happens at the
-    call site and is the only place that produces fractional values."""
+    """Mm position of a Relocate endpoint — a real shelf or a room —
+    expressed in the carrier's coordinate system. Returned as int (mm);
+    fractional values arise only during in-flight interpolation at the
+    call site."""
     if loc in topo.shelves:
         return topo.shelves[loc].position_for[carrier_id]
     if loc in topo.rooms:
@@ -65,9 +83,9 @@ def relocate_visual_state(facility: Facility, carrier_id: str, anim_now: float):
     interpolates the carrier through four physical sub-phases for an
     accurate motion trajectory:
 
-      Phase 1: travel to src       — position interpolates start→src
+      Phase 1: travel to src       — profile interpolates start→src
       Phase 2: shelf-op take       — position holds at src
-      Phase 3: travel to dst       — position interpolates src→dst
+      Phase 3: travel to dst       — profile interpolates src→dst
       Phase 4: shelf-op place      — position holds at dst
 
     The carrier's *visual load* is decided separately by the observation's
@@ -103,16 +121,14 @@ def relocate_visual_state(facility: Facility, carrier_id: str, anim_now: float):
     elapsed = max(0.0, anim_now - (cs.command_started_at or 0.0))
 
     if elapsed < move1:
-        frac = elapsed / max(move1, 1e-9)
-        return start_pos + frac * (src_pos - start_pos), None
+        return _position_at(carrier, float(start_pos), float(src_pos), elapsed), None
     elapsed -= move1
     if elapsed < take_op:
-        return src_pos, None
+        return float(src_pos), None
     elapsed -= take_op
     if elapsed < move2:
-        frac = elapsed / max(move2, 1e-9)
-        return src_pos + frac * (dst_pos - src_pos), None
-    return dst_pos, None
+        return _position_at(carrier, float(src_pos), float(dst_pos), elapsed), None
+    return float(dst_pos), None
 
 
 def multi_relocate_visual_position(
@@ -172,27 +188,23 @@ def multi_relocate_visual_position(
 
     if carrier_id == cmd.carrier_id:
         if elapsed < a_to_src:
-            frac = elapsed / max(a_to_src, 1e-9)
-            return a_start + frac * (src_pos - a_start)
+            return _position_at(a_car, float(a_start), float(src_pos), elapsed)
         e = elapsed - a_to_src
         if e < take_op:
             return float(src_pos)
         e -= take_op
         if e < a_to_handoff:
-            frac = e / max(a_to_handoff, 1e-9)
-            return src_pos + frac * (a_pose - src_pos)
+            return _position_at(a_car, float(src_pos), float(a_pose), e)
         return float(a_pose)
 
     if carrier_id == cmd.partner_id:
         if elapsed < b_to_handoff:
-            frac = elapsed / max(b_to_handoff, 1e-9)
-            return b_start + frac * (b_pose - b_start)
+            return _position_at(b_car, float(b_start), float(b_pose), elapsed)
         if elapsed < handoff_done_t:
             return float(b_pose)
         e = elapsed - handoff_done_t
         if e < b_to_dst:
-            frac = e / max(b_to_dst, 1e-9)
-            return b_pose + frac * (dst_pos - b_pose)
+            return _position_at(b_car, float(b_pose), float(dst_pos), e)
         return float(dst_pos)
 
     return float(state.carriers[carrier_id].position)

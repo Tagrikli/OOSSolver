@@ -19,8 +19,10 @@ class RewardConfig:
     # future steps cost less" — a sparse long-horizon signal that PPO
     # struggles to credit-assign through.
     completion_bonus: float = 50.0
-    # Penalty per slot of carrier travel during the step.
-    movement_weight: float = 1.0
+    # Penalty per millimetre of carrier travel during the step. Rescaled
+    # from the old "per slot" weight of 1.0 by the canonical 1 slot ≈ 1 m
+    # conversion (so a 1 m move now costs the same as the old 1-slot move).
+    movement_weight: float = 0.001
     # Per-room potential φ_max for being "ready to store": serving carrier
     # parked at the room, idle, holding an empty pallet, AND no Retrieve
     # task pending. Applied as potential-based shaping (γ·φ(s') − φ(s)),

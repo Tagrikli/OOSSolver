@@ -1,285 +1,327 @@
-"""Fluent Python builder for facilities.
+"""Declarative facility DSL.
 
-Construction order is flexible; validation runs at build() time.
+Each entity (Carrier, Shelf, Room, Handoff, TransferShelf) is declared as
+a standalone object. Carriers gather their per-side parts via
+`register_shelves`, `register_rooms`, `register_handoffs`. The Facility
+collects all carriers via `register_carriers`, then pairs up the two
+sides of cross-carrier links (handoffs and transfer shelves) via
+`fac.pair(a, b)`. `fac.build()` compiles to a frozen sim Topology.
+
+Example:
+
+    from oos.dsl import Carrier, Shelf, Room, Handoff, Facility
+    from oos.sim.motion import MotionProfile
+
+    C1 = Carrier("C1", min_pos=0, max_pos=11000, initial_pos=0, kind="shuttle")
+    C2 = Carrier("C2", min_pos=0, max_pos=11000, initial_pos=0, kind="shuttle")
+
+    A1 = Shelf("A1", position=5500,  capacity=3, size="big")
+    A2 = Shelf("A2", position=11000, capacity=3, size="small")
+    R1 = Room("R1", position=0)
+
+    h_C1 = Handoff("h12_a", position=2000)
+    h_C2 = Handoff("h12_b", position=2000)
+
+    C1.register_shelves(A1, A2)
+    C1.register_rooms(R1)
+    C1.register_handoffs(h_C1)
+    C2.register_handoffs(h_C2)
+
+    fac = Facility("tiny")
+    fac.register_carriers(C1, C2)
+    fac.pair(h_C1, h_C2)
+    fac.seed_pool()
+    topo, seeding = fac.build()
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Mapping
+from typing import Optional, Union
 
-from oos.dsl.refs import HandoffRef, RoomRef, ShelfRef
-from oos.sim.topology import ShelfOrientation
+from oos.sim.motion import (
+    LIFT_PROFILE,
+    SHUTTLE_PROFILE,
+    MotionProfile,
+)
+from oos.sim.topology import CarrierKind, ShelfOrientation, SizeClass
 
-SizeClass = Literal["small", "big"]
+
+# ---------------------------------------------------------------------------
+# Per-carrier parts: stand on their own, then get registered to a Carrier.
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class _ShelfSpec:
+class Shelf:
+    """A LIFO storage unit at a single track position on one carrier."""
+
     name: str
-    owner: str | None  # carrier name; None for transfer shelves
+    position: int                           # mm on the owning carrier's track
     capacity: int
     size: SizeClass
-    positions: dict[str, int]  # carrier_name -> position
-    is_transfer: bool
-    transfer_partners: tuple[str, str] | None
-    # carrier_name -> "up" | "down". Missing entries default to "up" at
-    # compile time. Purely visual; the sim treats both orientations as
-    # the same LIFO storage unit.
-    orientations: dict[str, ShelfOrientation] = field(default_factory=dict)
+    orientation: ShelfOrientation = "up"
+
+    # Set when registered to a Carrier; do not touch directly.
+    _carrier: Optional["Carrier"] = field(default=None, repr=False, compare=False)
 
 
 @dataclass
-class _RoomSpec:
+class Room:
     name: str
-    served_by: str
-    position: int
+    position: int                           # mm on the serving carrier's track
+
+    _carrier: Optional["Carrier"] = field(default=None, repr=False, compare=False)
 
 
 @dataclass
-class _HandoffSpec:
-    a: str
-    b: str
-    positions: dict[str, int]
+class Handoff:
+    """One SIDE of a handoff pose — a position on one carrier. Pair two of
+    these (one per carrier) via `fac.pair(a, b)` to materialize a sim
+    handoff between them."""
+
+    name: str
+    position: int                           # mm on the owning carrier's track
+
+    _carrier: Optional["Carrier"] = field(default=None, repr=False, compare=False)
 
 
-class CarrierBuilder:
-    def __init__(
-        self,
-        facility: "Facility",
-        name: str,
-        positions: int,
-        default_position: int = 0,
-        speed: float = 4.0,
-    ) -> None:
-        self._facility = facility
-        self.name = name
-        self.positions = positions
-        self.default_position = default_position
-        self.speed = speed
+@dataclass
+class TransferShelf:
+    """One SIDE of a cross-carrier transfer shelf — a single-slot buffer
+    accessible from two carriers, one of whom deposits and the other picks
+    up later. Pair two of these (one per carrier) via `fac.pair(a, b)`.
 
-    def shelf(
-        self,
-        name: str,
-        *,
-        at: int,
-        capacity: int,
-        size: SizeClass,
-        orientation: Literal["up", "down"] = "up",
-    ) -> ShelfRef:
-        """Declare a shelf at `at` on this carrier's track.
+    Both sides must use the same `name` (which becomes the sim shelf id),
+    same `capacity` (must be 1), same `size`. `position` and `orientation`
+    are per-side."""
 
-        `orientation`: "up" → drawn above the track (default); "down" →
-        drawn below. Two shelves may share the same `at` if their
-        orientations differ — one above, one below.
-        """
-        spec = _ShelfSpec(
-            name=name,
-            owner=self.name,
-            capacity=capacity,
-            size=size,
-            positions={self.name: at},
-            is_transfer=False,
-            transfer_partners=None,
-            orientations={self.name: orientation},
-        )
-        self._facility._register_shelf(spec)
-        return ShelfRef(name=name)
+    name: str
+    position: int                           # mm on the owning carrier's track
+    capacity: int = 1
+    size: SizeClass = "big"
+    orientation: ShelfOrientation = "up"
 
-    def room(self, name: str, *, at: int) -> RoomRef:
-        spec = _RoomSpec(name=name, served_by=self.name, position=at)
-        self._facility._register_room(spec)
-        return RoomRef(name=name, served_by=self.name)
+    _carrier: Optional["Carrier"] = field(default=None, repr=False, compare=False)
+
+
+PerCarrierPart = Union[Shelf, Room, Handoff, TransferShelf]
+PairableHalf = Union[Handoff, TransferShelf]
+
+
+# ---------------------------------------------------------------------------
+# Carrier
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Carrier:
+    """A carrier on a 1D track, mm-addressed. Profile is filled at compile
+    time from the Facility's default-for-kind unless overridden here."""
+
+    name: str
+    min_pos: int                            # mm (inclusive)
+    max_pos: int                            # mm (inclusive)
+    initial_pos: int = 0                    # mm
+    kind: CarrierKind = "shuttle"
+    profile: Optional[MotionProfile] = None  # None → resolved at compile time
+
+    _shelves:  list[Shelf]         = field(default_factory=list, repr=False)
+    _rooms:    list[Room]          = field(default_factory=list, repr=False)
+    _handoffs: list[Handoff]       = field(default_factory=list, repr=False)
+    _transfers: list[TransferShelf] = field(default_factory=list, repr=False)
+
+    def register_shelves(self, *shelves: Shelf) -> None:
+        for s in shelves:
+            self._attach(s, self._shelves)
+
+    def register_rooms(self, *rooms: Room) -> None:
+        for r in rooms:
+            self._attach(r, self._rooms)
+
+    def register_handoffs(self, *handoffs: Handoff) -> None:
+        for h in handoffs:
+            self._attach(h, self._handoffs)
+
+    def register_transfers(self, *transfers: TransferShelf) -> None:
+        for t in transfers:
+            self._attach(t, self._transfers)
+
+    def _attach(self, part: PerCarrierPart, bucket: list) -> None:
+        if part._carrier is not None and part._carrier is not self:
+            raise ValueError(
+                f"{type(part).__name__} {part.name!r} already registered to "
+                f"carrier {part._carrier.name!r}"
+            )
+        part._carrier = self
+        bucket.append(part)
+
+
+# ---------------------------------------------------------------------------
+# Facility — registers carriers, pairs cross-carrier halves, seeds pallets,
+# compiles to a sim Topology + SeedingConfig.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Pair:
+    a: PairableHalf
+    b: PairableHalf
 
 
 class Facility:
-    def __init__(self, name: str, *, max_chain_depth: int | None = 2) -> None:
-        self.name = name
-        self.max_chain_depth = max_chain_depth
-        self._carriers: dict[str, CarrierBuilder] = {}
-        self._shelves: dict[str, _ShelfSpec] = {}
-        self._rooms: dict[str, _RoomSpec] = {}
-        self._handoffs: list[_HandoffSpec] = []
-        self._seeding: dict[str, int] = {}
-
-    # ------------------------------------------------------------------
-    # Carrier constructors
-    # ------------------------------------------------------------------
-
-    def carrier(
-        self, name: str, *, positions: int, default_position: int = 0, speed: float = 4.0
-    ) -> CarrierBuilder:
-        return self._register_carrier(
-            CarrierBuilder(self, name, positions, default_position, speed)
-        )
-
-    def _register_carrier(self, cb: CarrierBuilder) -> CarrierBuilder:
-        if cb.name in self._carriers:
-            raise ValueError(f"duplicate carrier name {cb.name}")
-        self._carriers[cb.name] = cb
-        return cb
-
-    # ------------------------------------------------------------------
-    # Cross-carrier
-    # ------------------------------------------------------------------
-
-    def transfer_shelf(
+    def __init__(
         self,
         name: str,
         *,
-        between: tuple[CarrierBuilder, CarrierBuilder],
-        at: Mapping[CarrierBuilder, int],
-        size: SizeClass,
-        orientation: Mapping[CarrierBuilder, Literal["up", "down"]] | None = None,
-    ) -> ShelfRef:
-        """A single-slot buffer accessible by two carriers.
+        max_chain_depth: Optional[int] = 2,
+        lift_profile: MotionProfile = LIFT_PROFILE,
+        shuttle_profile: MotionProfile = SHUTTLE_PROFILE,
+    ) -> None:
+        self.name = name
+        self.max_chain_depth = max_chain_depth
+        self.lift_profile = lift_profile
+        self.shuttle_profile = shuttle_profile
 
-        Capacity is implicitly 1 — one carrier deposits, the other picks up
-        later (decoupled in time). For synchronous co-located swaps with no
-        buffer, use `fac.handoff(...)` instead.
+        self._carriers: list[Carrier] = []
+        self._pairs: list[_Pair] = []
+        self._seeding: dict[str, int] = {}
 
-        `orientation`: optional per-carrier visual orientation. e.g.
-        `orientation={a: "up", b: "down"}` makes it appear above a's track
-        and below b's. Defaults to "up" on both strips.
-        """
-        a, b = between
-        orientations: dict[str, ShelfOrientation] = {a.name: "up", b.name: "up"}
-        if orientation is not None:
-            for cb, o in orientation.items():
-                orientations[cb.name] = o
-        spec = _ShelfSpec(
-            name=name,
-            owner=None,
-            capacity=1,
-            size=size,
-            positions={a.name: at[a], b.name: at[b]},
-            is_transfer=True,
-            transfer_partners=(a.name, b.name),
-            orientations=orientations,
-        )
-        self._register_shelf(spec)
-        return ShelfRef(name=name)
+    # ---- registration ------------------------------------------------------
 
-    def handoff(
-        self,
-        *,
-        between: tuple[CarrierBuilder, CarrierBuilder],
-        at: Mapping[CarrierBuilder, int],
-    ) -> HandoffRef:
-        a, b = between
-        spec = _HandoffSpec(a=a.name, b=b.name, positions={a.name: at[a], b.name: at[b]})
-        self._handoffs.append(spec)
-        return HandoffRef(a=a.name, b=b.name)
+    def register_carriers(self, *carriers: Carrier) -> None:
+        seen = {c.name for c in self._carriers}
+        for c in carriers:
+            if c.name in seen:
+                raise ValueError(f"duplicate carrier name {c.name!r}")
+            seen.add(c.name)
+            self._carriers.append(c)
 
-    # ------------------------------------------------------------------
-    # Registration callbacks (used by CarrierBuilder)
-    # ------------------------------------------------------------------
+    def pair(self, a: PairableHalf, b: PairableHalf) -> None:
+        """Pair the two sides of a handoff or transfer shelf. Both halves
+        must already have been registered to their respective carriers,
+        and the two carriers must differ."""
+        if type(a) is not type(b):
+            raise ValueError(
+                f"pair() halves must be the same type; got "
+                f"{type(a).__name__} and {type(b).__name__}"
+            )
+        if a._carrier is None or b._carrier is None:
+            raise ValueError(
+                "pair() halves must be registered to a carrier first"
+            )
+        if a._carrier is b._carrier:
+            raise ValueError(
+                f"pair() halves must be on different carriers; "
+                f"both are on {a._carrier.name!r}"
+            )
+        self._pairs.append(_Pair(a=a, b=b))
 
-    def _register_shelf(self, spec: _ShelfSpec) -> None:
-        if spec.name in self._shelves:
-            raise ValueError(f"duplicate shelf name {spec.name}")
-        self._shelves[spec.name] = spec
+    # ---- seeding -----------------------------------------------------------
 
-    def _register_room(self, spec: _RoomSpec) -> None:
-        if spec.name in self._rooms:
-            raise ValueError(f"duplicate room name {spec.name}")
-        self._rooms[spec.name] = spec
-
-    # ------------------------------------------------------------------
-    # Seeding
-    # ------------------------------------------------------------------
-
-    def seed_empties(self, on: str | ShelfRef, count: int) -> None:
-        name = on.name if isinstance(on, ShelfRef) else on
-        if name not in self._shelves:
-            raise ValueError(f"seeding references unknown shelf {name}")
+    def seed_empties(self, on: Union[str, Shelf], count: int) -> None:
+        name = on.name if isinstance(on, Shelf) else on
+        if not self._has_shelf(name):
+            raise ValueError(f"seed_empties references unknown shelf {name!r}")
         self._seeding[name] = self._seeding.get(name, 0) + count
 
-    def seed_pool(self, reserve: int | None = None) -> None:
-        """Seed empty pallets system-wide up to a target total.
+    def seed_pool(self, reserve: Optional[int] = None) -> None:
+        """Seed empty pallets system-wide up to `total_cap - reserve`.
 
-        Total count = `sum(all shelf capacities) - reserve`. Default `reserve`
-        is the capacity of the largest BIG-class shelf in the facility — i.e.
-        we leave one big-shelf's worth of slack open, so a big-size store can
-        always find space.
-
-        Fill order (smaller value = filled earlier):
-          1. small shelves first (so big shelves remain open for big items)
-          2. within the big tier, shelves on carriers WITHOUT a room are
-             filled first; big shelves accessible by a room-serving carrier
-             are filled last. The slack shelf therefore lands in a region
-             reachable from a room, so a freshly-stored big item from that
-             room can land nearby without needing to handoff to a mediator.
-          3. smaller capacity first, name tiebreak
+        Fill order favours small shelves first (so big shelves stay open
+        for big items), then big shelves not adjacent to a room, then the
+        rest — same priority as before, restated against the new DSL.
         """
-        all_shelves = list(self._shelves.values())
+        all_shelves = self._all_shelves()
         if not all_shelves:
             return
-        total_cap = sum(s.capacity for s in all_shelves)
+        total_cap = sum(s.capacity for _, s in all_shelves)
         if reserve is None:
-            big_caps = [s.capacity for s in all_shelves if s.size == "big"]
-            reserve = max(big_caps) if big_caps else max(s.capacity for s in all_shelves)
+            big_caps = [s.capacity for _, s in all_shelves if s.size == "big"]
+            reserve = (
+                max(big_caps) if big_caps
+                else max(s.capacity for _, s in all_shelves)
+            )
         n_to_seed = max(0, total_cap - reserve)
 
-        room_carriers = {r.served_by for r in self._rooms.values()}
+        room_carriers = {
+            r._carrier.name for c in self._carriers for r in c._rooms
+            if r._carrier is not None
+        }
 
-        def is_room_adjacent(s) -> bool:
-            # Owner is set for per-carrier shelves; transfer shelves carry
-            # multiple carriers via `positions`.
-            if s.owner is not None:
-                return s.owner in room_carriers
-            return any(c in room_carriers for c in s.positions)
+        def is_room_adjacent(sname: str) -> bool:
+            for c in self._carriers:
+                for ss in c._shelves + c._transfers:  # type: ignore[operator]
+                    if ss.name == sname and c.name in room_carriers:
+                        return True
+            return False
 
-        def sort_key(s):
+        def sort_key(item):
+            sname, s = item
             is_big = s.size == "big"
-            big_room_adj_penalty = 1 if (is_big and is_room_adjacent(s)) else 0
+            big_room_adj_penalty = 1 if (is_big and is_room_adjacent(sname)) else 0
             return (
                 0 if s.size == "small" else 1,
                 big_room_adj_penalty,
                 s.capacity,
-                s.name,
+                sname,
             )
 
         remaining = n_to_seed
-        for s in sorted(all_shelves, key=sort_key):
+        for sname, s in sorted(all_shelves, key=sort_key):
             if remaining <= 0:
                 break
-            free = s.capacity - self._seeding.get(s.name, 0)
+            free = s.capacity - self._seeding.get(sname, 0)
             add = min(free, remaining)
             if add > 0:
-                self._seeding[s.name] = self._seeding.get(s.name, 0) + add
+                self._seeding[sname] = self._seeding.get(sname, 0) + add
                 remaining -= add
 
     def auto_seed_empties(self, per_room: int = 2) -> None:
-        """Distribute empties so each room has staging capacity within reach.
+        """For each room, fill the nearest shelves on the serving carrier
+        until `per_room` empties have been seeded near it."""
+        for c in self._carriers:
+            for r in c._rooms:
+                shelves_owned = [
+                    (s.name, s) for s in c._shelves + c._transfers  # type: ignore[operator]
+                ]
+                shelves_owned.sort(key=lambda item: abs(item[1].position - r.position))
+                remaining = per_room
+                for sname, s in shelves_owned:
+                    if remaining <= 0:
+                        break
+                    free = s.capacity - self._seeding.get(sname, 0)
+                    add = min(free, remaining)
+                    if add > 0:
+                        self._seeding[sname] = self._seeding.get(sname, 0) + add
+                        remaining -= add
 
-        Simple v1 algorithm: for each room, fill its serving carrier's nearest
-        shelves (by absolute position distance) until per_room empties are
-        seated there.
+    # ---- helpers used internally + by compile/validate ---------------------
+
+    def _has_shelf(self, name: str) -> bool:
+        return any(name == sname for sname, _ in self._all_shelves())
+
+    def _all_shelves(self) -> list[tuple[str, Union[Shelf, TransferShelf]]]:
+        """All registered shelves (regular + transfer), deduplicated by name.
+
+        Transfer shelves are paired across two carriers — we surface a
+        single entry per (paired) name.
         """
-        for r in self._rooms.values():
-            served_by = r.served_by
-            shelves_owned = [
-                s for s in self._shelves.values() if served_by in s.positions
-            ]
-            shelves_owned.sort(
-                key=lambda s: abs(s.positions[served_by] - r.position)
-            )
-            remaining = per_room
-            for s in shelves_owned:
-                if remaining <= 0:
-                    break
-                room_for = s.capacity - self._seeding.get(s.name, 0)
-                add = min(room_for, remaining)
-                if add > 0:
-                    self._seeding[s.name] = self._seeding.get(s.name, 0) + add
-                    remaining -= add
+        seen: set[str] = set()
+        out: list[tuple[str, Union[Shelf, TransferShelf]]] = []
+        for c in self._carriers:
+            for s in c._shelves:
+                if s.name not in seen:
+                    out.append((s.name, s))
+                    seen.add(s.name)
+            for t in c._transfers:
+                if t.name not in seen:
+                    out.append((t.name, t))
+                    seen.add(t.name)
+        return out
 
-    # ------------------------------------------------------------------
-    # Build
-    # ------------------------------------------------------------------
+    # ---- build -------------------------------------------------------------
 
     def build(self):  # type: ignore[no-untyped-def]
         from oos.dsl.compile import compile_facility
-
         return compile_facility(self)

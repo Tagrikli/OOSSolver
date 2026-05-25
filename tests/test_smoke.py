@@ -1,4 +1,8 @@
-"""Smoke tests: DSL builds, env resets, random rollout runs to truncation."""
+"""Smoke tests: DSL builds, env resets, random rollout runs to truncation.
+
+Run against the `tiny` facility — the smallest layout the DSL produces.
+The exact carrier/shelf counts below assert against tiny's authored shape.
+"""
 
 from __future__ import annotations
 
@@ -6,21 +10,18 @@ import numpy as np
 
 from oos.config.schema import EpisodeConfig, ExperimentConfig, TaskStreamConfig
 from oos.env import OOSEnv
-from oos.facilities import make_facility
+from oos.facilities import get_facility
+
+make_facility = get_facility("tiny")
 
 
-def test_dsl_builds_dev_facility():
+def test_dsl_builds_tiny_facility():
     topo, seed = make_facility()
-    assert {"C1", "C2", "C3"} <= set(topo.carriers)
-    assert "R1" in topo.rooms and "R2" in topo.rooms
-    # No room on the mediator.
-    assert not any(r.served_by == "C3" for r in topo.rooms.values())
-    # Two handoffs total: C1<->C3 and C2<->C3; no direct C1<->C2.
-    assert len(topo.handoffs) == 2
-    pairs = {frozenset(h.carriers) for h in topo.handoffs}
-    assert frozenset(("C1", "C3")) in pairs
-    assert frozenset(("C2", "C3")) in pairs
-    assert frozenset(("C1", "C2")) not in pairs
+    assert set(topo.carriers) == {"C1", "C2"}
+    assert set(topo.rooms) == {"R1"}
+    assert topo.rooms["R1"].served_by == "C1"
+    assert len(topo.handoffs) == 1
+    assert frozenset(topo.handoffs[0].carriers) == frozenset(("C1", "C2"))
     assert sum(seed.empties_on_shelf.values()) >= 1
 
 
@@ -28,7 +29,7 @@ def test_env_reset_and_random_rollout():
     cfg = ExperimentConfig(
         task_stream=TaskStreamConfig(
             store_rate=0.10,
-            mean_dwell_seconds=60.0,    # short for fast tests
+            mean_dwell_seconds=60.0,
             std_dwell_seconds=30.0,
         ),
         episode=EpisodeConfig(max_sim_time=200.0, max_steps=500),
@@ -36,10 +37,10 @@ def test_env_reset_and_random_rollout():
     env = OOSEnv(facility_factory=make_facility, experiment_config=cfg)
     obs, info = env.reset(seed=42)
 
-    # Shapes match the dev facility: 3 carriers, 24 shelves, 2 rooms.
-    assert obs["carrier_features"].shape[0] == 3
-    assert obs["shelf_features"].shape[0] == 24
-    assert obs["room_features"].shape[0] == 2
+    # tiny: 2 carriers, 4 shelves, 1 room.
+    assert obs["carrier_features"].shape[0] == 2
+    assert obs["shelf_features"].shape[0] == 4
+    assert obs["room_features"].shape[0] == 1
     assert obs["action_mask"].sum() >= 1  # at least WAIT
 
     rng = np.random.default_rng(0)
@@ -57,11 +58,9 @@ def test_env_reset_and_random_rollout():
 
 def test_pallet_count_conserved():
     """Pallet count must never change — pallets are physical, conserved objects."""
-    from oos.facilities import make_facility
-
     cfg = ExperimentConfig(
         task_stream=TaskStreamConfig(
-            store_rate=0.20,            # high store rate to exercise store cycles
+            store_rate=0.20,
             mean_dwell_seconds=40.0,
             std_dwell_seconds=20.0,
         ),
@@ -78,9 +77,8 @@ def test_pallet_count_conserved():
         for cs in fac.state.carriers.values():
             if cs.load is not None:
                 n += 1
-        # Unified-action model: rooms are 1-capacity virtual shelves; a pallet
-        # may sit in `room.load` between a Relocate-into-room and the next
-        # Relocate-out-of-room.
+        # Rooms are 1-capacity virtual shelves; a pallet may sit in
+        # `room.load` between a Relocate-into-room and the next out.
         for rs in fac.state.rooms.values():
             if rs.load is not None:
                 n += 1
@@ -93,7 +91,6 @@ def test_pallet_count_conserved():
         legal = np.flatnonzero(mask)
         a = int(rng.choice(legal))
         obs, _, term, trunc, _ = env.step(a)
-        # Check after every step — catches the bug immediately if it regresses.
         assert count_pallets() == initial, (
             f"pallet count drifted: started at {initial}, now {count_pallets()}"
         )
@@ -107,7 +104,6 @@ def test_big_stores_dropped_when_big_capacity_exhausted():
     arrivals) get silently dropped — not as a rejection, just as natural
     capacity behavior. Small Stores are unaffected.
     """
-    from oos.facilities import make_facility
     from oos.sim.facility import Facility, SeedingConfig
     from oos.sim.durations import LinearDurations
     from oos.sim.state import Pallet
@@ -121,8 +117,6 @@ def test_big_stores_dropped_when_big_capacity_exhausted():
         task_stream=None,
     )
 
-    # 1) With big shelves mixed (default seed has empties on big shelves
-    #    too), big capacity is fine.
     # Pre-load each big shelf to capacity with big items only.
     next_id = 100
     for sid, shelf in topo.shelves.items():
@@ -135,7 +129,7 @@ def test_big_stores_dropped_when_big_capacity_exhausted():
 
     assert not fac._can_accept_big_item()
 
-    # 2) A pending big Store already in the queue should get swept.
+    # A pending big Store already in the queue should get swept.
     fac.queue.add(Store(arrived_at=fac.state.time, size="big"))
     fac.queue.add(Store(arrived_at=fac.state.time, size="small"))
     fac.queue.add(Store(arrived_at=fac.state.time, size="big"))
@@ -145,11 +139,10 @@ def test_big_stores_dropped_when_big_capacity_exhausted():
     remaining = [t for t in fac.queue.pending if isinstance(t, Store)]
     assert len(remaining) == 1 and remaining[0].size == "small"
 
-    # 3) Free one slot by replacing a big-content pallet with an empty pallet → capacity returns.
+    # Free one slot by replacing a big-content pallet with an empty → capacity returns.
     first_big = next(sid for sid, s in topo.shelves.items() if s.size_class == "big")
     fac.state.shelves[first_big].stack[-1] = Pallet(id=9999, contents="empty")
     assert fac._can_accept_big_item()
-    # Sweep again — no-op because capacity exists.
     dropped.clear()
     fac.queue.add(Store(arrived_at=fac.state.time, size="big"))
     fac._sweep_unservable_bigs(dropped)
@@ -163,7 +156,7 @@ def test_determinism_across_seeds():
     cfg = ExperimentConfig(
         task_stream=TaskStreamConfig(
             store_rate=0.10,
-            mean_dwell_seconds=60.0,    # short for fast tests
+            mean_dwell_seconds=60.0,
             std_dwell_seconds=30.0,
         ),
         episode=EpisodeConfig(max_sim_time=100.0, max_steps=200),

@@ -1,16 +1,26 @@
-"""Static facility structure: carriers, shelves, rooms, handoffs."""
+"""Static facility structure: carriers, shelves, rooms, handoffs.
+
+Positions are in MILLIMETRES (`int`). Every distance, position, and travel
+calculation downstream assumes mm consistently.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal, Mapping
 
+from oos.sim.motion import MotionProfile
+
 CarrierId = str
 ShelfId = str
 RoomId = str
-Position = int
+Position = int   # mm
 
 SizeClass = Literal["small", "big"]
+
+# A carrier's physical type. Used by the viz for coloring and by the DSL
+# to pick a default motion profile + recommended shelf spacing.
+CarrierKind = Literal["lift", "shuttle"]
 
 # Visual orientation of a shelf relative to the carrier's track. Same LIFO
 # storage either way; orientation only flips the rendering:
@@ -25,20 +35,27 @@ ShelfOrientation = Literal["up", "down"]
 
 @dataclass(frozen=True)
 class Carrier:
-    """A carrier moves a pallet along a 1D track of `positions` slots.
+    """A carrier moves a pallet along a 1D track addressed in millimetres.
 
-    The physical orientation of the track (horizontal shuttle, vertical lift,
-    diagonal, etc.) is a real-world detail that does not affect planning:
-    every carrier is a 1D mover with at most one pallet on board.
+    Travel time and in-flight position both come from `profile` (closed-form
+    trapezoidal/triangular motion). `kind` is metadata for the viz; the sim
+    treats lifts and shuttles identically apart from their profile.
     """
 
     id: CarrierId
-    positions: int
-    default_position: Position = 0
-    speed: float = 4.0
+    min_pos: Position           # mm (inclusive)
+    max_pos: Position           # mm (inclusive)
+    initial_pos: Position       # mm — where the carrier starts each episode
+    profile: MotionProfile
+    kind: CarrierKind = "shuttle"
 
     def valid_position(self, p: Position) -> bool:
-        return 0 <= p < self.positions
+        return self.min_pos <= p <= self.max_pos
+
+    @property
+    def span(self) -> int:
+        """max_pos - min_pos. Always >= 0 after validation."""
+        return self.max_pos - self.min_pos
 
 
 @dataclass(frozen=True)
@@ -155,11 +172,14 @@ def validate_topology(topo: Topology) -> None:
     for cid, c in topo.carriers.items():
         if c.id != cid:
             raise TopologyValidationError(f"carrier id mismatch: key={cid} id={c.id}")
-        if c.positions <= 0:
-            raise TopologyValidationError(f"carrier {cid} has non-positive positions")
-        if not c.valid_position(c.default_position):
+        if c.max_pos < c.min_pos:
             raise TopologyValidationError(
-                f"carrier {cid} default_position {c.default_position} out of range"
+                f"carrier {cid} max_pos {c.max_pos} < min_pos {c.min_pos}"
+            )
+        if not c.valid_position(c.initial_pos):
+            raise TopologyValidationError(
+                f"carrier {cid} initial_pos {c.initial_pos} out of range "
+                f"[{c.min_pos}, {c.max_pos}]"
             )
 
     for sid, s in topo.shelves.items():

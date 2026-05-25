@@ -33,15 +33,17 @@ class StripGeom:
     carrier_id: CarrierId
     rect: tuple[int, int, int, int]  # x, y, w, h of the whole strip region
     track_y: int                      # y coordinate of the carrier track
-    track_x_start: int                # x where position=0 lands
-    track_x_end: int                  # x where position=(N-1) lands
-    positions: int                    # carrier's number of positions
+    track_x_start: int                # x where position=min_pos lands
+    track_x_end: int                  # x where position=max_pos lands
+    min_pos: int                      # carrier's min position (mm)
+    max_pos: int                      # carrier's max position (mm)
     label_rect: tuple[int, int, int, int]  # area reserved for the carrier label
 
     def pos_to_x(self, p: float) -> int:
-        if self.positions <= 1:
+        span = self.max_pos - self.min_pos
+        if span <= 0:
             return self.track_x_start
-        frac = p / (self.positions - 1)
+        frac = (p - self.min_pos) / span
         return int(self.track_x_start + frac * (self.track_x_end - self.track_x_start))
 
 
@@ -161,7 +163,8 @@ def compute_layout(topo: Topology, cfg: LayoutConfig | None = None) -> Layout:
             track_y=track_y,
             track_x_start=track_x_start,
             track_x_end=track_x_end,
-            positions=c.positions,
+            min_pos=c.min_pos,
+            max_pos=c.max_pos,
             label_rect=(cfg.canvas_pad, y0, cfg.strip_label_w, strip_h),
         )
 

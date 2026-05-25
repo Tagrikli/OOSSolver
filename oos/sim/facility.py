@@ -97,7 +97,7 @@ class Facility:
 
     def _initial_state(self, seeding: SeedingConfig) -> FacilityState:
         carriers = {
-            cid: CarrierState(position=c.default_position)
+            cid: CarrierState(position=c.initial_pos)
             for cid, c in self.topology.carriers.items()
         }
         shelves: dict[str, ShelfState] = {sid: ShelfState() for sid in self.topology.shelves}

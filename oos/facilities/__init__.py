@@ -2,11 +2,6 @@
 
 from typing import Callable
 
-from oos.facilities.big_retr import make_facility as make_big_retr_facility
-from oos.facilities.dev import make_facility as make_dev_facility
-from oos.facilities.dibaji import make_facility as make_dibaji_facility
-from oos.facilities.medipol import make_facility as make_medipol_facility
-from oos.facilities.random_gen import make_random_facility
 from oos.facilities.tiny import make_facility as make_tiny_facility
 from oos.facilities.tiny_tall import make_facility as make_tiny_tall_facility
 from oos.facilities.tiny_wide import make_facility as make_tiny_wide_facility
@@ -16,21 +11,10 @@ from oos.sim.topology import Topology
 FacilityFactory = Callable[[], tuple[Topology, SeedingConfig]]
 
 FACILITIES: dict[str, FacilityFactory] = {
-    "dev": make_dev_facility,
-    "tiny": make_tiny_facility,
+    "tiny":      make_tiny_facility,
     "tiny_tall": make_tiny_tall_facility,
     "tiny_wide": make_tiny_wide_facility,
-    "big_retr": make_big_retr_facility,
-    "dibaji": make_dibaji_facility,
-    "medipol": make_medipol_facility,
-    # Each call returns a fresh layout (wall-clock-seeded). The viz can
-    # bypass the picker's "active" cache via the 'g' hotkey to re-roll
-    # without having to switch facilities first.
-    "random": lambda: make_random_facility(seed=None),
 }
-
-# Back-compat default: anything still importing `make_facility` keeps getting dev.
-make_facility = make_dev_facility
 
 
 def get_facility(name: str) -> FacilityFactory:
@@ -43,4 +27,4 @@ def get_facility(name: str) -> FacilityFactory:
         ) from e
 
 
-__all__ = ["FACILITIES", "FacilityFactory", "get_facility", "make_facility"]
+__all__ = ["FACILITIES", "FacilityFactory", "get_facility"]

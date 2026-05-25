@@ -13,7 +13,8 @@ from oos.env.observation import (
     ROOM_FEATURE_NAMES,
     shelf_feature_count,
 )
-from oos.facilities import make_facility
+from oos.facilities import get_facility
+make_facility = get_facility("tiny")
 from oos.learn.batching import GraphCollator, sample_from_env_step
 from oos.learn.network import NetworkConfig, PolicyValueNet
 

@@ -1,4 +1,10 @@
-"""Duration models for sim primitives. v1 default is deterministic linear."""
+"""Duration models for sim primitives.
+
+`move()` delegates to the carrier's MotionProfile (closed-form trapezoidal
+or triangular travel time), so the sim time-to-target matches what the viz
+will animate to the millisecond. Shelf op + handoff stay constant; customer
+interactions are zero-duration (instant).
+"""
 
 from __future__ import annotations
 
@@ -17,9 +23,8 @@ class DurationModel(Protocol):
 
 @dataclass(frozen=True)
 class LinearDurations:
-    """Travel = |dpos| / speed. Shelf op + handoff constant. Customer
-    interactions are zero-duration (instant) in the unified-action model;
-    no duration knob is exposed for them."""
+    """Travel = carrier.profile.travel_time(|to - frm|). Shelf op + handoff
+    are constant. Name kept for back-compat; motion is no longer linear."""
 
     shelf_op_time: SimTime = 0.5
     handoff_time: SimTime = 1.0
@@ -27,7 +32,7 @@ class LinearDurations:
     def move(self, carrier: Carrier, frm: int, to: int) -> SimTime:
         if frm == to:
             return 0.0
-        return abs(to - frm) / max(carrier.speed, 1e-9)
+        return carrier.profile.travel_time(abs(to - frm))
 
     def shelf_op(self, kind: Literal["give", "take"], shelf: Shelf) -> SimTime:
         return self.shelf_op_time

@@ -63,7 +63,7 @@ def _eta_to_ready(facility: Facility, room_id: RoomId) -> float:
     if cs.busy_until is not None:
         eta += max(0.0, cs.busy_until - state.time)
     # Distance from current (or end-of-command estimated) position to room.
-    eta += abs(cs.position - r.position) / max(c.speed, 1e-9)
+    eta += c.profile.travel_time(abs(cs.position - r.position))
     # If not carrying an empty pallet, add a shelf-op cost as a proxy.
     if cs.load is None or not cs.load.is_empty:
         eta += facility.durations.shelf_op("take", next(iter(topo.shelves.values())))

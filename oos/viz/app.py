@@ -32,7 +32,6 @@ from oos.viz.pickers import FacilityPickerWidget, PolicyPickerWidget
 from oos.viz.player import Player, PolicyFn, random_policy
 from oos.viz.policy_swap import (
     load_policy,
-    make_random_layout,
     rewrap_with_mcts,
     swap_facility,
 )
@@ -264,16 +263,6 @@ class VizApp:
                         picker.toggle()
                     elif event.key == pygame.K_f:
                         facility_picker.toggle()
-                    elif event.key == pygame.K_g:
-                        renderer = make_random_layout(
-                            player, facility, self.window_w, self.window_h, toasts,
-                        )
-                        facility = player.env._ctx.facility  # type: ignore[attr-defined]
-                        topo = facility.topology
-                        anim_time = facility.state.time
-                        facility_picker.active = "random"
-                        self.facility_name = "random"
-                        active_policy_label = "(random policy)"
                     elif event.key == pygame.K_n:
                         mode = "step" if mode == "anim" else "anim"
                         if mode == "anim":

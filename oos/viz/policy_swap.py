@@ -125,34 +125,3 @@ def swap_facility(
     return Renderer(new_layout, new_topo)
 
 
-def make_random_layout(
-    player: Player,
-    facility,
-    window_w: int,
-    window_h: int,
-    toasts: ToastManager,
-) -> Renderer:
-    """Generate a fresh random facility and rebuild the env + renderer."""
-    from oos.facilities.random_gen import make_random_facility
-    preserve_auto = facility.auto_arrivals_enabled
-    old_env = player.env
-    new_env = OOSEnv(
-        facility_factory=lambda: make_random_facility(),
-        experiment_config=old_env._experiment_cfg,  # type: ignore[attr-defined]
-        reward_config=old_env._reward_cfg,          # type: ignore[attr-defined]
-    )
-    player.env = new_env
-    player.policy = random_policy
-    player.reset()
-    new_facility = player.env._ctx.facility  # type: ignore[attr-defined]
-    new_facility.set_auto_arrivals(preserve_auto)
-    new_topo = new_facility.topology
-    new_layout = compute_layout(
-        new_topo, LayoutConfig(window_w=window_w, window_h=window_h),
-    )
-    toasts.accent(
-        f"RANDOM LAYOUT  "
-        f"{len(new_topo.carriers)}C/{len(new_topo.shelves)}S/{len(new_topo.rooms)}R",
-        lifetime=4.0,
-    )
-    return Renderer(new_layout, new_topo)

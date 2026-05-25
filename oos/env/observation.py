@@ -258,7 +258,7 @@ def build_observation(
         cs = state.carriers[cid]
         # Effective load: in-transit pallet if mid-Relocate, else cs.load.
         eff_load = in_flight_loads.get(cid, cs.load)
-        carrier_features[i, 0] = cs.position / max(c.positions - 1, 1)
+        carrier_features[i, 0] = (cs.position - c.min_pos) / max(c.span, 1)
         if eff_load is None:
             carrier_features[i, 1] = 1.0
         elif eff_load.is_empty:

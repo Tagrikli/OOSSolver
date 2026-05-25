@@ -35,24 +35,24 @@ class CarrierPanel:
         track_x_start: int,
         track_x_end: int,
         label_rect: tuple[int, int, int, int],
-        positions: int,
+        min_pos: int,
+        max_pos: int,
         shelf_specs: Iterable[tuple] = (),
         room_specs: Iterable[tuple] = (),
         handoff_positions: Iterable[int] = (),
     ):
         """Args:
+            min_pos, max_pos: carrier's mm bounds — used by pos_to_x.
             shelf_specs: iterable of
                 (shelf_id, cx, capacity, size_class, is_transfer,
                  partner_or_None, orientation)
-                where orientation is "up" (drawn above the track) or
-                "down" (drawn below). Trailing orientation is optional
-                and defaults to "up" for back-compat.
             room_specs: iterable of (room_id, cx)
             handoff_positions: x coords on the track where this carrier
                 meets a partner for a handoff.
         """
         self.carrier_id = carrier_id
-        self.positions = positions
+        self.min_pos = min_pos
+        self.max_pos = max_pos
         self.track_y = track_y
         self.track_x_start = track_x_start
         self.track_x_end = track_x_end
@@ -71,14 +71,8 @@ class CarrierPanel:
         self.icon = CarrierIconWidget(carrier_id, track_y)
         self.shelves: dict[str, ShelfWidget] = {}
         for spec in shelf_specs_list:
-            # Accept legacy 6-tuple (orientation defaults to "up") and
-            # the new 7-tuple form with explicit orientation.
-            if len(spec) == 6:
-                shelf_id, cx, capacity, size_class, is_transfer, partner = spec
-                orientation = "up"
-            else:
-                (shelf_id, cx, capacity, size_class,
-                 is_transfer, partner, orientation) = spec
+            (shelf_id, cx, capacity, size_class,
+             is_transfer, partner, orientation) = spec
             self.shelves[shelf_id] = ShelfWidget(
                 shelf_id=shelf_id, cx=cx, cy=track_y,
                 capacity=capacity, size_class=size_class,
@@ -92,9 +86,11 @@ class CarrierPanel:
     # ---- geometry ----------------------------------------------------------
 
     def pos_to_x(self, p: float) -> int:
-        if self.positions <= 1:
+        """Map a mm position on the carrier's track to a pixel x coord."""
+        span = self.max_pos - self.min_pos
+        if span <= 0:
             return self.track_x_start
-        frac = p / (self.positions - 1)
+        frac = (p - self.min_pos) / span
         return int(self.track_x_start + frac * (self.track_x_end - self.track_x_start))
 
     def set_y(self, new_top_y: int) -> None:

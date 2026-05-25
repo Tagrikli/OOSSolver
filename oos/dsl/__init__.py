@@ -1,14 +1,21 @@
 """Python embedded DSL for authoring facilities."""
 
-from oos.dsl.builder import CarrierBuilder, Facility
-from oos.dsl.refs import HandoffRef, RoomRef, ShelfRef
+from oos.dsl.builder import (
+    Carrier,
+    Facility,
+    Handoff,
+    Room,
+    Shelf,
+    TransferShelf,
+)
 from oos.dsl.validate import FacilityValidationError
 
 __all__ = [
-    "CarrierBuilder",
+    "Carrier",
     "Facility",
     "FacilityValidationError",
-    "HandoffRef",
-    "RoomRef",
-    "ShelfRef",
+    "Handoff",
+    "Room",
+    "Shelf",
+    "TransferShelf",
 ]
