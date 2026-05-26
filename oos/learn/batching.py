@@ -127,36 +127,6 @@ class GraphCollator:
         self._room_node = {rid: self.n_c + self.n_s + i for i, rid in enumerate(self.room_ids)}
 
     # ------------------------------------------------------------------
-    # Lookup helpers
-    # ------------------------------------------------------------------
-
-    def _location_node_idx(self, loc: str) -> int:
-        """Concat-space node idx for a location (shelf or room)."""
-        if loc in self._shelf_node:
-            return self._shelf_node[loc]
-        if loc in self._room_node:
-            return self._room_node[loc]
-        raise ValueError(f"unknown location {loc!r}")
-
-    def _target_node_idx(self, entry: ActionEntry) -> int:
-        """Concat-space node idx for an entry's destination — the dst
-        location for RELOCATE and MULTI_RELOCATE. Returns 0 for WAIT."""
-        if entry.type == ActionType.WAIT:
-            return 0
-        if entry.type in (ActionType.RELOCATE, ActionType.MULTI_RELOCATE):
-            assert entry.dst is not None
-            return self._location_node_idx(entry.dst)
-        raise ValueError(f"unknown action type {entry.type}")
-
-    def _source_node_idx(self, entry: ActionEntry) -> int:
-        """Concat-space node idx for the entry's source location. Meaningful
-        for both RELOCATE and MULTI_RELOCATE; 0 otherwise."""
-        if entry.type in (ActionType.RELOCATE, ActionType.MULTI_RELOCATE):
-            assert entry.src is not None
-            return self._location_node_idx(entry.src)
-        return 0
-
-    # ------------------------------------------------------------------
     # Collation
     # ------------------------------------------------------------------
 
@@ -169,6 +139,9 @@ class GraphCollator:
         B = len(samples)
         N = self.n_total
 
+        # ----- node features -----
+        # np.stack copies into one contiguous buffer; torch.from_numpy is
+        # zero-copy on CPU. The float() cast is the only real work here.
         carrier_x = torch.from_numpy(
             np.stack([s.carrier_features for s in samples])
         ).float().to(device)
@@ -182,57 +155,107 @@ class GraphCollator:
             np.stack([s.global_features for s in samples])
         ).float().to(device)
 
-        # ----- edges in flat (B*N) space -----
-        per_type: dict[str, list[np.ndarray]] = {t: [] for t in EDGE_TYPES}
-        for b, s in enumerate(samples):
-            off = b * N
-
-            def push(name: str, e: np.ndarray, also_rev: str | None) -> None:
-                if e.size == 0:
-                    return
-                shifted = e + off
-                per_type[name].append(shifted)
-                if also_rev is not None:
-                    per_type[also_rev].append(shifted[[1, 0]])
-
-            push("accesses", s.edges_accesses, "accesses_rev")
-            # handoff is already bidirectional in the env obs; do not duplicate.
-            push("handoff", s.edges_handoff, None)
-            push("transfer", s.edges_transfer, "transfer_rev")
-            push("committed", s.edges_committed, "committed_rev")
-            push("in_flight_src", s.edges_in_flight_src, "in_flight_src_rev")
-            # in_flight_partner is already bidirectional in the env obs (both
-            # A→B and B→A are emitted); don't duplicate via also_rev.
-            push("in_flight_partner", s.edges_in_flight_partner, None)
-
-        edges: dict[str, torch.Tensor] = {}
-        for t in EDGE_TYPES:
-            if per_type[t]:
-                arr = np.concatenate(per_type[t], axis=1)
-            else:
-                arr = np.zeros((2, 0), dtype=np.int64)
-            edges[t] = torch.from_numpy(arr).long().to(device)
-
-        # ----- action layout -----
-        querying = torch.tensor(
-            [s.querying_carrier for s in samples], dtype=torch.long, device=device
-        )
-
+        # ----- action mask + querying carrier -----
         action_mask = torch.from_numpy(
             np.stack([s.action_mask for s in samples])
         ).bool().to(device)
-        type_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
-        target_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
-        source_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
-        partner_per_slot = torch.zeros((B, n_max), dtype=torch.long, device=device)
+        querying = torch.from_numpy(
+            np.fromiter(
+                (s.querying_carrier for s in samples),
+                dtype=np.int64,
+                count=B,
+            )
+        ).to(device)
+
+        # ----- action layout -----
+        # Fill numpy buffers in the inner loop (scalar np writes are
+        # ~50–100× cheaper than scalar torch writes), then ship each one
+        # to torch with a single from_numpy. Padding rows (i ≥ len(entries))
+        # stay zero from the np.zeros init.
+        type_np = np.zeros((B, n_max), dtype=np.int64)
+        target_np = np.zeros((B, n_max), dtype=np.int64)
+        source_np = np.zeros((B, n_max), dtype=np.int64)
+        partner_np = np.zeros((B, n_max), dtype=np.int64)
+
+        # Local rebinds — Python attribute lookups inside the hot loop
+        # are not free at 100k+ iterations.
+        shelf_node = self._shelf_node
+        room_node = self._room_node
+        carrier_node = self._carrier_node
+        RELOC = int(ActionType.RELOCATE)
+        MULTI = int(ActionType.MULTI_RELOCATE)
+
         for b, s in enumerate(samples):
-            for i, entry in enumerate(s.action_entries):
-                type_per_slot[b, i] = int(entry.type)
-                target_per_slot[b, i] = self._target_node_idx(entry)
-                source_per_slot[b, i] = self._source_node_idx(entry)
-                if entry.type == ActionType.MULTI_RELOCATE:
-                    assert entry.partner is not None
-                    partner_per_slot[b, i] = self._carrier_node[entry.partner]
+            entries = s.action_entries
+            if not entries:
+                continue
+            t_row = type_np[b]
+            tg_row = target_np[b]
+            sr_row = source_np[b]
+            pr_row = partner_np[b]
+            for i, e in enumerate(entries):
+                tval = int(e.type)
+                t_row[i] = tval
+                if tval == RELOC or tval == MULTI:
+                    dst = e.dst
+                    tg_row[i] = (
+                        shelf_node[dst] if dst in shelf_node else room_node[dst]
+                    )
+                    src = e.src
+                    sr_row[i] = (
+                        shelf_node[src] if src in shelf_node else room_node[src]
+                    )
+                    if tval == MULTI:
+                        pr_row[i] = carrier_node[e.partner]
+                # WAIT: tg/sr/pr stay 0 (matches legacy: _target/_source
+                # return 0 for WAIT, partner is never set).
+
+        type_per_slot = torch.from_numpy(type_np).to(device)
+        target_per_slot = torch.from_numpy(target_np).to(device)
+        source_per_slot = torch.from_numpy(source_np).to(device)
+        partner_per_slot = torch.from_numpy(partner_np).to(device)
+
+        # ----- edges -----
+        # One pass over samples, six edge-type slots per sample, with
+        # batched per-sample offset `b * N` so all B graphs share one
+        # node-index space. Reverse-edge mirrors via row-permute [1,0]
+        # for the asymmetric families. Concatenate per type at the end.
+        per_type: dict[str, list[np.ndarray]] = {t: [] for t in EDGE_TYPES}
+        _edge_spec = (
+            ("accesses", "accesses_rev"),
+            ("handoff", None),
+            ("transfer", "transfer_rev"),
+            ("committed", "committed_rev"),
+            ("in_flight_src", "in_flight_src_rev"),
+            ("in_flight_partner", None),
+        )
+        _edge_attrs = (
+            "edges_accesses",
+            "edges_handoff",
+            "edges_transfer",
+            "edges_committed",
+            "edges_in_flight_src",
+            "edges_in_flight_partner",
+        )
+        for b, s in enumerate(samples):
+            off = b * N
+            for (name, rev_name), attr in zip(_edge_spec, _edge_attrs):
+                arr = getattr(s, attr)
+                if arr.size == 0:
+                    continue
+                shifted = arr + off
+                per_type[name].append(shifted)
+                if rev_name is not None:
+                    per_type[rev_name].append(shifted[::-1])
+
+        edges: dict[str, torch.Tensor] = {}
+        for t in EDGE_TYPES:
+            chunks = per_type[t]
+            if chunks:
+                arr = np.concatenate(chunks, axis=1)
+            else:
+                arr = np.zeros((2, 0), dtype=np.int64)
+            edges[t] = torch.from_numpy(arr).long().to(device)
 
         return Batch(
             carrier_x=carrier_x,
@@ -250,7 +273,6 @@ class GraphCollator:
             n_shelves=self.n_s,
             n_rooms=self.n_r,
         )
-
 
 def sample_from_env_step(
     obs: dict,
