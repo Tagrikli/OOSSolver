@@ -88,28 +88,3 @@ def test_episode_env_starts_in_storing_phase_with_one_store_scheduled():
     assert scheduled[0].when == 10.0
 
 
-def test_episode_env_truncation_applies_failure_penalty():
-    """A random policy almost certainly fails within 30 steps; the final
-    reward should include the failure penalty."""
-    env = EpisodeEnv(
-        facility_factory=get_facility("tiny"),
-        episode_scenario_config=EpisodeConfig(failure_penalty=100.0),
-        experiment_config=ExperimentConfig(
-            task_stream=TaskStreamConfig(store_rate=0.0),
-            episode=ExpEpisodeConfig(max_steps=30),
-        ),
-    )
-    obs, info = env.reset(seed=0)
-    import random
-    rng = random.Random(0)
-    last_reward = 0.0
-    last_term = last_trunc = False
-    last_info = info
-    while True:
-        valid = [i for i, v in enumerate(obs["action_mask"]) if v]
-        obs, last_reward, last_term, last_trunc, last_info = env.step(rng.choice(valid))
-        if last_term or last_trunc:
-            break
-    if last_trunc and not last_term:
-        assert last_info.get("episode_failure_penalty") == 100.0
-        assert last_reward <= -50.0

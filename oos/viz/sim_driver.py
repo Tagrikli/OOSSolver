@@ -110,6 +110,19 @@ class SimDriver:
             else:
                 label = "task done"
             self.toasts.success(f"✓ {label}  cost={comp.cost:.1f}", lifetime=3.5)
+        # Reward-event toasts so a stage/unstage is visibly attributed even
+        # when the per-step `last R` display is overwritten before render.
+        n_stage = int(info.get("n_stage_events", 0))
+        n_unstage = int(info.get("n_unstage_events", 0))
+        n_wrong = int(info.get("n_wrong_item_events", 0))
+        for _ in range(n_stage):
+            self.toasts.success("+STAGE", lifetime=3.5)
+        for _ in range(n_unstage):
+            self.toasts.error("−UNSTAGE", lifetime=3.5)
+        for _ in range(n_wrong):
+            self.toasts.error("−WRONG ITEM", lifetime=3.5)
+        if info.get("idle_with_retrieve", False):
+            self.toasts.error("−IDLE", lifetime=1.5)
 
     # ---- internal ---------------------------------------------------------
 
@@ -117,4 +130,10 @@ class SimDriver:
         self.player.obs = obs
         self.player.info = info
         self.player.total_reward += reward
+        # Roll this reward into the per-action display so the sidebar's
+        # "last R" reflects the actual time-advancing reward (movement +
+        # stage/unstage events + completions), not just the 0-duration
+        # submit advance which always shows ~0.
+        if self.player.last_record is not None:
+            self.player.last_record.reward += reward
         self.emit_toasts(info)

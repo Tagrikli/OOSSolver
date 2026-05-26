@@ -22,6 +22,7 @@ BINDINGS: list[tuple[str, str]] = [
     ("p / f",     "policy / facility"),
     ("d",         "(in picker) deterministic"),
     ("s",         "(in picker) MCTS search"),
+    ("shift+wheel", "zoom carrier tracks"),
     ("q / esc",   "quit"),
     ("1 / 2 / 3", "set hovered pallet to empty/small/big"),
     ("click header", "collapse panel"),

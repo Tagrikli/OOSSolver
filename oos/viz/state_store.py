@@ -25,6 +25,8 @@ _STATE_FILENAME = ".viz_state.json"
 class VizState:
     facility_name: Optional[str] = None
     policy_path: Optional[str] = None  # absolute path to .pt, or None for random
+    zoom: float = 1.0                  # canvas px-per-mm zoom multiplier
+    speed: float = 1.0                 # animation speed multiplier (+/- keys)
 
 
 def _state_path(runs_dir: str) -> str:
@@ -50,9 +52,25 @@ def load_viz_state(runs_dir: str = "runs") -> VizState:
             policy_path = None
     else:
         policy_path = None
+    raw_zoom = data.get("zoom", 1.0)
+    try:
+        zoom = float(raw_zoom)
+        if not (zoom > 0.0):
+            zoom = 1.0
+    except (TypeError, ValueError):
+        zoom = 1.0
+    raw_speed = data.get("speed", 1.0)
+    try:
+        speed = float(raw_speed)
+        if not (speed > 0.0):
+            speed = 1.0
+    except (TypeError, ValueError):
+        speed = 1.0
     return VizState(
         facility_name=facility if isinstance(facility, str) else None,
         policy_path=policy_path,
+        zoom=zoom,
+        speed=speed,
     )
 
 
@@ -60,9 +78,11 @@ def save_viz_state(
     runs_dir: str = "runs",
     facility_name: Optional[str] = None,
     policy_path: Optional[str] = None,
+    zoom: Optional[float] = None,
+    speed: Optional[float] = None,
 ) -> None:
-    """Persist the current viz selection. Either arg can be None to leave
-    that field unset. Silent on write failure (e.g., read-only fs)."""
+    """Persist the current viz selection. Any arg can be None to leave that
+    field unset. Silent on write failure (e.g., read-only fs)."""
     os.makedirs(runs_dir, exist_ok=True)
     state = load_viz_state(runs_dir)
     if facility_name is not None:
@@ -73,9 +93,15 @@ def save_viz_state(
         state.policy_path = (
             os.path.abspath(policy_path) if policy_path else None
         )
+    if zoom is not None and zoom > 0.0:
+        state.zoom = float(zoom)
+    if speed is not None and speed > 0.0:
+        state.speed = float(speed)
     payload = {
         "facility_name": state.facility_name,
         "policy_path": state.policy_path,
+        "zoom": state.zoom,
+        "speed": state.speed,
     }
     try:
         with open(_state_path(runs_dir), "w") as f:

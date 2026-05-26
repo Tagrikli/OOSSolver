@@ -88,8 +88,13 @@ class DistributionContent:
 
         legal_indices = list(np.flatnonzero(mask))
         gap = 1
+        # Cap bar width so a single-legal-action distribution doesn't paint
+        # one giant rectangle across the whole panel. Bars stay anchored to
+        # the left of the chart area in that case.
+        max_bar_w = 28
         cell_w = max(2, (chart_w + gap) // n_legal)
-        bar_w = max(1, cell_w - gap)
+        bar_w = max(1, min(max_bar_w, cell_w - gap))
+        cell_w = min(cell_w, bar_w + gap)
 
         pygame.draw.line(
             surface, BASE_GUTTER,

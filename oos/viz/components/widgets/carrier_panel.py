@@ -37,6 +37,7 @@ class CarrierPanel:
         label_rect: tuple[int, int, int, int],
         min_pos: int,
         max_pos: int,
+        kind: str = "shuttle",
         shelf_specs: Iterable[tuple] = (),
         room_specs: Iterable[tuple] = (),
         handoff_positions: Iterable[int] = (),
@@ -51,6 +52,7 @@ class CarrierPanel:
                 meets a partner for a handoff.
         """
         self.carrier_id = carrier_id
+        self.kind = kind
         self.min_pos = min_pos
         self.max_pos = max_pos
         self.track_y = track_y
@@ -65,6 +67,7 @@ class CarrierPanel:
             track_x_start=track_x_start,
             track_x_end=track_x_end,
             label_rect=pygame.Rect(*label_rect),
+            kind=kind,
             shelf_positions=[spec[1] for spec in shelf_specs_list],
             handoff_positions=handoff_positions,
         )
@@ -132,12 +135,6 @@ class CarrierPanel:
         # Action label is painted by the strip background in the top-right
         # corner of the carrier's panel — not under the icon.
         self.background.set_action_label(label)
-
-    def set_carrier_querying(self, q: bool) -> None:
-        self.icon.set_querying(q)
-
-    def set_carrier_pulse(self, phase: float) -> None:
-        self.icon.set_pulse_phase(phase)
 
     def set_pulsing_items(self, items: frozenset) -> None:
         """Distribute the pulsing-items set to every shelf and the icon —

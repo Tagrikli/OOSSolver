@@ -510,10 +510,16 @@ class Facility:
             completions.append(TaskCompletion(task=retrieve, cost=cost))
             # Instant mutation: contents → empty; id preserved.
             rs.load = Pallet(id=pallet.id, contents="empty")
+            pallet = rs.load
             for cs in self.state.carriers.values():
                 cs.voluntarily_idle = False
-            return
-        # Otherwise — if the pallet is empty — try the oldest pending Store.
+            # Fall through to Store check — the post-Retrieve empty pallet
+            # is exactly the condition that should trigger a pending Store
+            # at this room. Without falling through, a Retrieve completion
+            # would leave the leftover empty sitting around even when a
+            # Store could immediately consume it.
+        # If the pallet is empty (either originally or just-emptied by a
+        # Retrieve above), try the oldest pending Store.
         if pallet.is_empty:
             store = self._find_pending_store()
             if store is None:

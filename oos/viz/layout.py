@@ -107,15 +107,25 @@ class LayoutConfig:
     window_h: int = 1080
     sidebar_w: int = 460
     strip_pad: int = 18
-    strip_label_w: int = 130
+    strip_label_w: int = 56     # left gutter — holds the [L1] / [S2] tag
     canvas_pad: int = 24
-    track_right_pad: int = 80   # extra room on the right of the track for end-of-track shelf labels
+    track_right_pad: int = 56   # right gutter — kept equal to strip_label_w
+                                # so both track endpoints sit the same
+                                # distance from the strip's vertical edges
+
     queue_strip_h: int = 86     # top-of-canvas customer queue strip height
     # Each carrier strip is a FIXED size — they do not stretch to fill the
     # canvas. When N carriers overflow the canvas vertically the renderer
     # scrolls them; the strip itself never gets squished.
     strip_h: int = 200          # fixed strip height (incl. internal pad)
-    strip_w_max: int = 1400     # max strip width; adapts down for narrow windows
+
+    # Track length is mm-driven: width_px = (max_pos - min_pos) * px_per_mm.
+    # `base_px_per_mm` is the px-per-mm at zoom=1.0; `zoom` is the user-
+    # controllable multiplier (Shift+wheel in the canvas). The LEFT
+    # endpoint stays anchored to `canvas_pad + strip_label_w`; zoom only
+    # extends/contracts the right end.
+    base_px_per_mm: float = 0.05
+    zoom: float = 1.0
 
 
 def compute_layout(topo: Topology, cfg: LayoutConfig | None = None) -> Layout:
@@ -139,15 +149,15 @@ def compute_layout(topo: Topology, cfg: LayoutConfig | None = None) -> Layout:
     )
     carriers_top = cfg.canvas_pad + cfg.queue_strip_h + cfg.strip_pad
 
-    # Fixed-size strips. Width adapts down for narrow windows but never
-    # exceeds strip_w_max; height is always strip_h. When the total carrier
-    # column exceeds the visible canvas, the renderer scrolls.
-    strip_w = min(cfg.strip_w_max, canvas_w - 2 * cfg.canvas_pad)
+    # Strip width is mm-driven: track_len = (max_pos - min_pos) * px_per_mm.
+    # Each carrier gets its own strip width; left endpoint stays anchored at
+    # canvas_pad + strip_label_w. Zoom multiplies px_per_mm. If a strip
+    # extends past the canvas right edge, drawing is clipped to the canvas
+    # area (already handled per-frame for vertical overflow).
     strip_h = cfg.strip_h
     strip_row_h = strip_h + cfg.strip_pad   # pitch per row
-
+    px_per_mm = cfg.base_px_per_mm * cfg.zoom
     track_x_start = cfg.canvas_pad + cfg.strip_label_w
-    track_x_end = cfg.canvas_pad + strip_w - cfg.track_right_pad
 
     # Order carriers by id for a stable visual layout.
     ordered = sorted(topo.carriers.values(), key=lambda c: c.id)
@@ -155,6 +165,9 @@ def compute_layout(topo: Topology, cfg: LayoutConfig | None = None) -> Layout:
     strips: dict[CarrierId, StripGeom] = {}
     for i, c in enumerate(ordered):
         y0 = carriers_top + i * strip_row_h
+        track_len_px = max(1, int((c.max_pos - c.min_pos) * px_per_mm))
+        track_x_end = track_x_start + track_len_px
+        strip_w = cfg.strip_label_w + track_len_px + cfg.track_right_pad
         rect = (cfg.canvas_pad, y0, strip_w, strip_h)
         track_y = y0 + strip_h // 2 + 20
         strips[c.id] = StripGeom(

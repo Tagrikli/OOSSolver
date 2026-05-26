@@ -24,9 +24,7 @@ from oos.viz.components.palette import (
     STRIP_BORDER,
     TEXT,
     TRACK,
-    VIOLET_BRIGHT,
     Fonts,
-    blit_text,
 )
 from oos.viz.components.primitives import (
     beveled_polygon,
@@ -61,10 +59,12 @@ class CarrierStripBackground:
         track_x_start: int,
         track_x_end: int,
         label_rect: pygame.Rect,
+        kind: str = "shuttle",
         shelf_positions: Iterable[int] = (),
         handoff_positions: Iterable[int] = (),
     ):
         self.carrier_id = carrier_id
+        self.kind = kind
         self.rect = rect
         self.track_y = track_y
         self.track_x_start = track_x_start
@@ -76,6 +76,19 @@ class CarrierStripBackground:
         self._action_label: str = ""
         self._state: str = "idle"
 
+    @property
+    def display_tag(self) -> str:
+        """Bracketed tag shown on the strip — kind initial + the digit
+        suffix of the carrier id. Examples:
+            ("C1",  "lift")    → "L1"
+            ("C2",  "shuttle") → "S2"
+            ("Bay7","lift")    → "L7"
+            ("X",   "shuttle") → "S"     (no digits → bare prefix)
+        """
+        prefix = "L" if self.kind == "lift" else "S"
+        digits = "".join(ch for ch in self.carrier_id if ch.isdigit())
+        return f"{prefix}{digits}"
+
     def set_action_label(self, label: str) -> None:
         self._action_label = label
 
@@ -86,15 +99,12 @@ class CarrierStripBackground:
         draw_beveled_rect(surface, self.rect, STRIP_BG, bevel=10, alpha=210)
         draw_beveled_frame(surface, self.rect, STRIP_BORDER, bevel=10, width=1)
 
-        # Left: bracketed carrier-id label.
+        # Left: bracketed kind-tag label (e.g. [L1] for a lift, [S2] for a shuttle).
         draw_bracketed_title(
-            surface, self.carrier_id,
+            surface, self.display_tag,
             (self.label_rect.left + 8, self.label_rect.top + 8),
             fonts.head, title_color=MAGENTA_BRIGHT, bracket_color=CYAN_BRIGHT,
         )
-        blit_text(surface, "CARRIER",
-                  (self.label_rect.left + 8, self.label_rect.top + 30),
-                  fonts.tiny, VIOLET_BRIGHT)
 
         # Track line — glow then crisp.
         draw_glow_line(

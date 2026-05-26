@@ -37,8 +37,6 @@ class CarrierIconWidget:
         self._x: float = 0.0
         self._load: Optional[Pallet] = None
         self._state: str = "idle"
-        self._is_querying: bool = False
-        self._pulse_phase: float = 0.0
         self._pulsing_items: frozenset = frozenset()
         self._wall_now: float = 0.0
 
@@ -51,12 +49,6 @@ class CarrierIconWidget:
     def set_state(self, s: str) -> None:
         self._state = s
 
-    def set_querying(self, q: bool) -> None:
-        self._is_querying = q
-
-    def set_pulse_phase(self, phase: float) -> None:
-        self._pulse_phase = phase
-
     def set_pulsing(self, items: frozenset) -> None:
         self._pulsing_items = items
 
@@ -66,20 +58,15 @@ class CarrierIconWidget:
     def draw(self, surface: pygame.Surface, fonts: Fonts) -> pygame.Rect:
         x = int(self._x)
         rect = pygame.Rect(x - self.W // 2, self.track_y - self.H // 2, self.W, self.H)
-        base_color = {
+        color = {
             "idle": CARRIER_IDLE,
             "busy": CARRIER_BUSY,
             "customer": CARRIER_CUST,
         }.get(self._state, CARRIER_IDLE)
-        # Same pulse model as the pallets: brighten/dim the body in its
-        # own colour while busy or being queried. Glow underneath stays
-        # static (no per-frame spread/alpha churn).
-        if self._is_querying or self._state == "busy":
-            body_color = pulsed_color(base_color, self._wall_now)
-        else:
-            body_color = base_color
-        draw_glow_rect(surface, rect, base_color, spread=3, base_alpha=60)
-        draw_beveled_rect(surface, rect, body_color, bevel=6)
+        # Carriers always render with a steady base colour — no pulsing.
+        # State is distinguished by the base colour alone.
+        draw_glow_rect(surface, rect, color, spread=3, base_alpha=60)
+        draw_beveled_rect(surface, rect, color, bevel=6)
         draw_beveled_frame(surface, rect, BASE_BLACK, bevel=6, width=2)
 
         glyph = self.carrier_id[:1].upper()

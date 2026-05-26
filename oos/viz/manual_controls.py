@@ -49,14 +49,17 @@ def handle_queue_button(
     the click was a known button (so the caller can short-circuit)."""
     if btn == "queue small":
         facility.enqueue_store("small")
+        _refresh_player(player, facility)
         toasts.accent("+ STORE small", lifetime=2.0)
         return True
     if btn == "queue big":
         facility.enqueue_store("big")
+        _refresh_player(player, facility)
         toasts.accent("+ STORE big", lifetime=2.0)
         return True
     if btn == "queue clear":
         facility.clear_queue()
+        _refresh_player(player, facility)
         toasts.warn("QUEUE CLEARED", lifetime=2.0)
         return True
     if btn == "randomize":

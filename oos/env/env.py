@@ -24,10 +24,10 @@ from oos.env.observation import (
     build_observation,
     shelf_feature_count,
 )
-from oos.env.reward import RewardConfig, compute_reward, potential
+from oos.env.reward import RewardConfig, compute_reward
 from oos.sim.durations import LinearDurations
 from oos.sim.facility import Facility, SeedingConfig
-from oos.sim.tasks import PoissonTaskStream
+from oos.sim.tasks import PoissonTaskStream, Retrieve, Store
 from oos.sim.topology import CarrierId, Topology
 
 
@@ -279,13 +279,28 @@ class OOSEnv(gym.Env):
         dropped = []
         total_dt = 0.0
         movement_distance = 0.0
-        phi_before = potential(facility, self._reward_cfg)
+        n_stage_events = 0
+        n_unstage_events = 0
+        n_wrong_item_events = 0
         if not ctx.pending_idle:
             # Snapshot positions so we can charge a per-slot travel penalty.
             # Each command moves monotonically in one direction, so summed
             # |Δposition| over the advance interval equals total slots travelled.
             positions_before = {
                 cid: cs.position for cid, cs in facility.state.carriers.items()
+            }
+            # Snapshot room loads so we can detect agent (un)stage events
+            # during the advance. We track three states: "free" (load None),
+            # "empty" (empty pallet), "filled" (item pallet). Only None ↔
+            # empty transitions count as agent (un)stages — anything
+            # involving the filled state is a Store / Retrieve auto-serve.
+            def _room_state(load) -> str:
+                if load is None:
+                    return "free"
+                return "empty" if load.is_empty else "filled"
+            room_was = {
+                rid: _room_state(rs.load)
+                for rid, rs in facility.state.rooms.items()
             }
             res = facility.advance_until(time_limit)
             total_dt = res.dt
@@ -296,6 +311,50 @@ class OOSEnv(gym.Env):
                 abs(facility.state.carriers[cid].position - p0)
                 for cid, p0 in positions_before.items()
             )
+            # (Un)stage detection: gated on "no Retrieve currently pending."
+            # Rules, all keyed off room.load transitions during the advance:
+            #   free  → empty                       : +1 stage (visible).
+            #   free  → filled AND Store completed  : +1 stage (Store auto-
+            #                                         served the empty within
+            #                                         the same advance — the
+            #                                         empty state was real but
+            #                                         invisible to our snapshot;
+            #                                         the Store completion is
+            #                                         proof it happened).
+            #   empty → free                        : +1 unstage.
+            # `filled → free` (cleanup of a Store-filled pallet) is a
+            # necessary act for the next storing cycle and carries no penalty.
+            # Retrieve completion (target arriving at room) is handled
+            # separately via Retrieve TaskCompletions in compute_reward.
+            no_retrieve_pending = not any(
+                isinstance(t, Retrieve) for t in facility.queue.pending
+            )
+            store_credits = sum(
+                1 for c in completions if isinstance(c.task, Store)
+            )
+            for rid, rs in facility.state.rooms.items():
+                prev = room_was[rid]
+                curr = _room_state(rs.load)
+                if prev == "free" and curr == "empty":
+                    if no_retrieve_pending:
+                        n_stage_events += 1
+                elif prev == "free" and curr == "filled":
+                    if store_credits > 0:
+                        store_credits -= 1
+                        if no_retrieve_pending:
+                            n_stage_events += 1
+                    else:
+                        # Agent placed a filled pallet at a free room and
+                        # no Store consumed it. If it had been a target,
+                        # the Retrieve auto-serve would have fired and the
+                        # room would be `empty` now, not `filled`. So this
+                        # is definitively a non-target filled pallet —
+                        # either phase-2 wrong delivery or phase-1
+                        # pointless shuffle.
+                        n_wrong_item_events += 1
+                elif prev == "empty" and curr == "free":
+                    if no_retrieve_pending:
+                        n_unstage_events += 1
             # If we reached a decision instant, set up the next query.
             if facility.idle_carriers():
                 ctx.pending_idle = self._fresh_pending_idle(facility)
@@ -306,17 +365,27 @@ class OOSEnv(gym.Env):
                     )
                     ctx.decoder = ActionDecoder(entries, self._n_max)
 
-        phi_after = potential(facility, self._reward_cfg)
+        # Idle-with-retrieve: penalty fires once per env step if a Retrieve
+        # is pending AND no carrier is mid-command. Includes WAITing
+        # carriers as "idle" because the underlying complaint is "nobody's
+        # working on the pending task right now."
+        retrieve_pending = any(
+            isinstance(t, Retrieve) for t in facility.queue.pending
+        )
+        no_carrier_working = all(
+            cs.current_command is None
+            for cs in facility.state.carriers.values()
+        )
+        idle_with_retrieve = retrieve_pending and no_carrier_working
+
         reward = compute_reward(
-            facility=facility,
-            task_cfg=self._experiment_cfg.task_stream,
             cfg=self._reward_cfg,
-            dt=total_dt,
-            n_pending_at_start=len(facility.queue),
             completions=completions,
             movement_distance=movement_distance,
-            phi_before=phi_before,
-            phi_after=phi_after,
+            n_stage_events=n_stage_events,
+            n_unstage_events=n_unstage_events,
+            n_wrong_item_events=n_wrong_item_events,
+            idle_with_retrieve=idle_with_retrieve,
         )
 
         self._step_count += 1
@@ -329,6 +398,10 @@ class OOSEnv(gym.Env):
             facility, total_dt, completions, arrivals, dropped
         )
         info["sim_time"] = facility.state.time
+        info["n_stage_events"] = n_stage_events
+        info["n_unstage_events"] = n_unstage_events
+        info["n_wrong_item_events"] = n_wrong_item_events
+        info["idle_with_retrieve"] = idle_with_retrieve
         return obs, float(reward), terminated, truncated, info
 
     # ------------------------------------------------------------------
@@ -382,7 +455,6 @@ class OOSEnv(gym.Env):
             "action_mask": mask,
             "querying_carrier": obs["querying_carrier"],
         }
-        from oos.sim.tasks import Retrieve
         n_pending_retrieves = sum(
             1 for t in facility.queue.pending if isinstance(t, Retrieve)
         )

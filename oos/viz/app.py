@@ -75,9 +75,16 @@ class VizApp:
         # the user opts in (press 'm' to resume auto arrivals).
         facility.set_auto_arrivals(False)
         topo = facility.topology
+
+        # Restore last-saved canvas zoom (Shift+wheel adjusts it during play)
+        # and animation speed (+/- keys).
+        _persisted_state = load_viz_state(self.runs_dir)
+        zoom = _persisted_state.zoom
+
         layout = compute_layout(
             topo,
-            LayoutConfig(window_w=self.window_w, window_h=self.window_h),
+            LayoutConfig(window_w=self.window_w, window_h=self.window_h,
+                         zoom=zoom),
         )
         renderer = Renderer(layout, topo)
 
@@ -86,7 +93,7 @@ class VizApp:
 
         mode = "anim"
         paused = True
-        speed = self.initial_speed
+        speed = _persisted_state.speed
         anim_time = facility.state.time
         wall_start = time.monotonic()
 
@@ -120,12 +127,13 @@ class VizApp:
 
         def relayout(new_w: int, new_h: int) -> Renderer:
             """Recompute layout for a new window size and build a fresh
-            Renderer. Sidebar width stays fixed; canvas absorbs the rest."""
+            Renderer. Sidebar width stays fixed; canvas absorbs the rest.
+            Carries the current zoom so the track length stays put."""
             self.window_w = new_w
             self.window_h = new_h
             new_layout = compute_layout(
                 facility.topology,
-                LayoutConfig(window_w=new_w, window_h=new_h),
+                LayoutConfig(window_w=new_w, window_h=new_h, zoom=zoom),
             )
             return Renderer(new_layout, facility.topology)
 
@@ -153,6 +161,25 @@ class VizApp:
                         facility_picker.handle_wheel(event.y)
                     else:
                         mouse_pos = pygame.mouse.get_pos()
+                        shift_held = bool(
+                            pygame.key.get_mods() & pygame.KMOD_SHIFT
+                        )
+                        # Shift+wheel over the canvas zooms the px-per-mm
+                        # mapping of all carrier tracks. Left endpoint of
+                        # each track stays anchored — only the right end
+                        # extends/contracts. The setting persists.
+                        if (
+                            shift_held
+                            and renderer.carrier_area_rect.collidepoint(mouse_pos)
+                        ):
+                            zoom_step = 1.15 ** event.y    # ~15% per notch
+                            new_zoom = max(0.1, min(8.0, zoom * zoom_step))
+                            if abs(new_zoom - zoom) > 1e-6:
+                                zoom = new_zoom
+                                renderer = relayout(self.window_w, self.window_h)
+                                save_viz_state(self.runs_dir, zoom=zoom)
+                                toasts.info(f"ZOOM {zoom:.2f}×", lifetime=1.5)
+                            continue
                         handled_by_sidebar = False
                         for panel, mult in (
                             (renderer.queue_panel,    3),
@@ -280,8 +307,10 @@ class VizApp:
                             anim_time = facility.state.time
                     elif event.key in (pygame.K_PLUS, pygame.K_EQUALS):
                         speed = min(speed * 1.5, 1000.0)
+                        save_viz_state(self.runs_dir, speed=speed)
                     elif event.key == pygame.K_MINUS:
                         speed = max(speed / 1.5, 0.1)
+                        save_viz_state(self.runs_dir, speed=speed)
                     elif event.key == pygame.K_r:
                         preserve_auto = facility.auto_arrivals_enabled
                         player.reset()

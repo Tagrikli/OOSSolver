@@ -52,22 +52,12 @@ class EpisodeConfig:
     # Probability that a sampled store request is for a big item (otherwise
     # small). The three-gate check on big can still force-downgrade to small.
     big_prob: float = 0.15
-    # Penalty applied at truncation if any retrieves remain unserved. Size
-    # it to at least cancel the completion_bonus the agent would have
-    # collected on success, so failure costs net negative.
-    failure_penalty: float = 50.0
-    # Per-WAIT penalty while any task (Store or Retrieve) is pending. Small
-    # nudge that keeps the agent moving when there's work to do.
-    idle_while_pending_penalty: float = 5.0
     # Hard-disable WAIT in the action mask. Use temporarily if the policy
     # has fallen into a WAIT sink it can't unlearn.
     disable_wait: bool = False
     # Sim-seconds between consecutive Store arrivals. Each Store is scheduled
     # at `t = now + store_arrival_delay`, giving the agent a window to stage
-    # an empty pallet at the room before the Store fires. Without this gap
-    # (D=0), the Store would be in-queue the instant a pallet hits the room
-    # and prep_potential could never accumulate. Tune D to span a typical
-    # fetch-and-deliver round trip (~10-20 sim-sec on tiny).
+    # an empty pallet at the room before the Store fires.
     store_arrival_delay: float = 10.0
 
 
@@ -132,23 +122,7 @@ class EpisodeEnv(OOSEnv):
         return obs, info
 
     def step(self, action: int):
-        cfg = self._cfg
         facility = self._ctx.facility  # type: ignore[union-attr]
-        chosen_entry = None
-        if 0 <= action < len(self._ctx.decoder.entries):  # type: ignore[union-attr]
-            chosen_entry = self._ctx.decoder.entries[action]  # type: ignore[union-attr]
-        # Idle-while-pending: charge the per-WAIT nudge if the policy waits
-        # while any task is pending. Sampled BEFORE step so the queue state
-        # is the one the policy actually saw.
-        idle_pending_penalty = 0.0
-        if (
-            cfg.idle_while_pending_penalty != 0.0
-            and chosen_entry is not None
-            and chosen_entry.type == ActionType.WAIT
-            and len(facility.queue.pending) > 0
-        ):
-            idle_pending_penalty = -cfg.idle_while_pending_penalty
-
         obs, reward, terminated, truncated, info = super().step(action)
         facility = self._ctx.facility  # type: ignore[union-attr]
 
@@ -180,13 +154,6 @@ class EpisodeEnv(OOSEnv):
         ):
             terminated = True
 
-        if truncated and not terminated:
-            # Some retrieves never made it — punish.
-            reward = float(reward) - cfg.failure_penalty
-            info["episode_failure_penalty"] = cfg.failure_penalty
-
-        reward = float(reward) + idle_pending_penalty
-        info["shaping/idle_pending"] = idle_pending_penalty
         self._populate_info(info)
         self._apply_action_mask_overrides(obs)
         return obs, float(reward), terminated, truncated, info

@@ -129,21 +129,18 @@ def _experiment_config(args: argparse.Namespace) -> ExperimentConfig:
 
 def _reward_config(args: argparse.Namespace) -> RewardConfig:
     return RewardConfig(
-        pending_weight=args.pending_weight,
-        responsiveness_weight=args.responsiveness_weight,
-        completion_bonus=args.completion_bonus,
+        reward_retrieve=args.reward_retrieve,
+        reward_stage_room=args.reward_stage_room,
+        penalty_unstage_room=args.penalty_unstage_room,
+        penalty_wrong_item_to_room=args.penalty_wrong_item_to_room,
+        penalty_idle_with_retrieve=args.penalty_idle_with_retrieve,
         movement_weight=args.movement_weight,
-        prep_potential=args.prep_potential,
-        gamma=args.gamma,
-        time_penalty=args.time_penalty,
     )
 
 
 def _episode_config(args: argparse.Namespace) -> EpisodeConfig:
     return EpisodeConfig(
         big_prob=args.big_prob,
-        failure_penalty=args.failure_penalty,
-        idle_while_pending_penalty=args.idle_while_pending_penalty,
         disable_wait=args.disable_wait,
         store_arrival_delay=args.store_arrival_delay,
     )
@@ -202,10 +199,6 @@ def main() -> None:
                    help="Probability a sampled Store is big (else small). "
                         "Three-gate check on big (headroom + slot + "
                         "retrievability) may force-downgrade to small.")
-    p.add_argument("--failure-penalty", type=float, default=50.0,
-                   help="Penalty at truncation if any retrieves remain.")
-    p.add_argument("--idle-while-pending-penalty", type=float, default=5.0,
-                   help="Penalty per WAIT while any task is pending.")
     p.add_argument("--disable-wait", action="store_true",
                    help="Mask WAIT out of the action space entirely.")
     p.add_argument("--store-arrival-delay", type=float, default=10.0,
@@ -223,18 +216,27 @@ def main() -> None:
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--n-epochs", type=int, default=4)
     p.add_argument("--minibatch-size", type=int, default=256)
-    # Reward shaping
-    p.add_argument("--pending-weight", type=float, default=0.0)
-    p.add_argument("--responsiveness-weight", type=float, default=0.0)
-    p.add_argument("--completion-bonus", type=float, default=100.0,
-                   help="Per-task-completion reward. Both Stores and "
-                        "Retrieves trigger this — phase 1 alone yields many "
-                        "completions, so size relative to phase counts.")
-    p.add_argument("--movement-weight", type=float, default=1.0)
-    p.add_argument("--prep-potential", type=float, default=5.0,
-                   help="φ_max for potential-based 'room ready to store' "
-                        "shaping. γ·φ(s')−φ(s); policy-invariant.")
-    p.add_argument("--time-penalty", type=float, default=0.0)
+    # Reward
+    p.add_argument("--reward-retrieve", type=float, default=50.0,
+                   help="Per Retrieve completion (target pallet delivered).")
+    p.add_argument("--reward-stage-room", type=float, default=5.0,
+                   help="Per 'empty pallet placed at a free room' event, "
+                        "gated on no Retrieve currently pending.")
+    p.add_argument("--penalty-unstage-room", type=float, default=5.0,
+                   help="Per 'empty pallet removed from a room' event, "
+                        "same gate. Symmetric with --reward-stage-room so "
+                        "place-then-take cycles net to zero.")
+    p.add_argument("--penalty-wrong-item-to-room", type=float, default=5.0,
+                   help="Per 'filled pallet placed at a free room that is "
+                        "not a target retrieve and not a Store-fill' event. "
+                        "Ungated — fires in both phases. Discourages "
+                        "delivering non-target pallets and pointless "
+                        "filled-pallet shuffling.")
+    p.add_argument("--penalty-idle-with-retrieve", type=float, default=1.0,
+                   help="Per-step penalty when a Retrieve is pending AND no "
+                        "carrier is mid-command. Time pressure during the "
+                        "retrieval phase — catches WAIT-spam and stalls.")
+    p.add_argument("--movement-weight", type=float, default=0.01)
     # Network
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--n-heads", type=int, default=4)

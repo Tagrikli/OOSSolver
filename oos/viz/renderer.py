@@ -140,6 +140,7 @@ class Renderer:
                 label_rect=strip.label_rect,
                 min_pos=strip.min_pos,
                 max_pos=strip.max_pos,
+                kind=topology.carriers[cid].kind,
                 shelf_specs=shelf_specs,
                 room_specs=room_specs,
                 handoff_positions=handoffs_by_cid.get(cid, []),
@@ -344,7 +345,6 @@ class Renderer:
         # Per-carrier update + draw. Each CarrierPanel is self-contained:
         # we just push the latest shelf stacks, room load, carrier pose into
         # its setters, then ask it to paint.
-        pulse_phase = (rs.wall_now * 1.5) % 1.0
         for cid, panel in self._panels.items():
             # Apply the scroll offset to this panel's vertical position.
             panel.set_y(self._panel_virtual_top[cid] - self._carrier_scroll)
@@ -380,8 +380,6 @@ class Renderer:
             panel.set_carrier_load(visual_load)
             panel.set_carrier_state("busy" if cmd is not None else "idle")
             panel.set_carrier_action(short_action_label(cmd))
-            panel.set_carrier_querying(cid == rs.querying)
-            panel.set_carrier_pulse(pulse_phase)
 
             panel.draw(
                 surface, self.fonts,

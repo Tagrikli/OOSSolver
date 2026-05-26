@@ -34,6 +34,11 @@ CARRIER_FEATURE_NAMES = (
     # both as the same carrier-load state, and tends to deliver everything
     # to a room.
     "load_is_requested",
+    # Carrier kind one-hot. Motion profiles (and therefore move durations)
+    # differ between lift and shuttle, so the policy needs to see which
+    # kind it's planning for.
+    "kind_lift",
+    "kind_shuttle",
 )
 
 # Global hard cap on shelf capacity. Real systems in this domain never have
@@ -279,6 +284,11 @@ def build_observation(
             and eff_load.id in requested_pallets
         ):
             carrier_features[i, 8] = 1.0
+        # kind_lift / kind_shuttle one-hot.
+        if c.kind == "lift":
+            carrier_features[i, 9] = 1.0
+        else:
+            carrier_features[i, 10] = 1.0
 
     per_slot_dim = SHELF_PER_SLOT_DIM
     total_shelf_dim = shelf_feature_count()
