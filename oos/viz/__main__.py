@@ -8,8 +8,8 @@ import argparse
 from oos.config.schema import EpisodeConfig, ExperimentConfig, TaskStreamConfig
 from oos.env.env import OOSEnv
 from oos.facilities import FACILITIES, get_facility
+from oos.agent import random_policy
 from oos.viz.app import run_app
-from oos.viz.player import random_policy
 from oos.viz.state_store import load_viz_state
 
 if __name__ == "__main__":

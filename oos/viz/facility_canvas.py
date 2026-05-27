@@ -22,8 +22,8 @@ from __future__ import annotations
 
 import pygame
 
+from oos.facility import Facility
 from oos.sim.actions import MultiRelocate, Relocate
-from oos.sim.facility import Facility
 from oos.sim.tasks import Retrieve, Store, TaskQueue
 from oos.sim.topology import Topology
 from oos.viz.animation import (
@@ -203,6 +203,9 @@ class FacilityCanvas:
                 "relayout(rect, zoom) at least once first.",
             )
         rect = self._rect
+        # Sim engine — most helpers below want the inner sim.Facility,
+        # not the user-facing wrapper. Resolve once.
+        sim = facility.sim
 
         # Grid background inside our rect.
         draw_grid_background(surface, rect, spacing=24)
@@ -223,7 +226,7 @@ class FacilityCanvas:
         # In-flight overlay (commitment projection — same one the obs
         # builder uses to decide where a mid-transit pallet visually lives).
         from oos.env.observation import compute_in_flight_overlay
-        in_flight_loads, pickups_in_flight = compute_in_flight_overlay(facility)
+        in_flight_loads, pickups_in_flight = compute_in_flight_overlay(sim)
 
         # Reset hit-test caches each frame.
         self.pallet_hit_areas = []
@@ -242,29 +245,29 @@ class FacilityCanvas:
 
             # Shelves.
             for sid in panel.shelves:
-                ss = facility.state.shelves[sid]
+                ss = sim.state.shelves[sid]
                 panel.update_shelf(
                     sid, ss.stack, n_hidden=pickups_in_flight.get(sid, 0),
                 )
 
             # Rooms.
             for rid in panel.rooms:
-                rs_room = facility.state.rooms[rid]
+                rs_room = sim.state.rooms[rid]
                 visual_load = rs_room.load if pickups_in_flight.get(rid, 0) == 0 else None
                 state_name = "ready" if visual_load is None else "idle"
                 panel.update_room(rid, visual_load, state_name)
 
             # Carrier icon — interpolated position over the current command.
-            cs = facility.state.carriers[cid]
+            cs = sim.state.carriers[cid]
             cmd = cs.current_command
             if isinstance(cmd, Relocate) and cs.command_started_at is not None:
-                pos_now, _ = relocate_visual_state(facility, cid, anim_now)
+                pos_now, _ = relocate_visual_state(sim, cid, anim_now)
             elif isinstance(cmd, MultiRelocate) and cs.command_started_at is not None:
                 pos_now = multi_relocate_visual_position(
-                    facility, cid, cmd, anim_now,
+                    sim, cid, cmd, anim_now,
                 )
             else:
-                pos_now = interpolated_position(facility, cid, anim_now)
+                pos_now = interpolated_position(sim, cid, anim_now)
             visual_load = in_flight_loads.get(cid, cs.load)
 
             panel.set_carrier_position(panel.pos_to_x(pos_now))
@@ -302,7 +305,7 @@ class FacilityCanvas:
             rect.bottom - ov.H - self.SOLVABILITY_PAD,
             ov.W, ov.H,
         ))
-        ov.update(_layout_is_solvable(facility))
+        ov.update(_layout_is_solvable(sim))
         ov.draw(surface, self.fonts)
 
     def _draw_carrier_scrollbar(self, surface: pygame.Surface) -> None:

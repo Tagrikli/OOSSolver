@@ -5,7 +5,7 @@ passed to each handler. The main loop is small (poll events, dispatch,
 tick sim, render); per-event handlers are methods on `VizApp`.
 
 Layers (each method touches only its layer):
-  * sim mutations           — player.env, facility, anim_time
+  * sim mutations           — agent.facility, anim_time
   * viz / UI state          — renderer, pickers, mode, paused, speed, zoom
   * driver / toasts         — SimDriver advances the sim with toast side-effects
 
@@ -27,8 +27,9 @@ from typing import Optional
 
 import pygame
 
+from oos.agent import Agent, PolicyFn, random_policy
 from oos.env.env import OOSEnv
-from oos.sim.facility import Facility
+from oos.facility import Facility
 from oos.viz.components import ToastManager
 from oos.viz.layout import LayoutConfig, compute_layout
 from oos.viz.manual_controls import (
@@ -39,7 +40,6 @@ from oos.viz.manual_controls import (
     set_pallet_contents,
 )
 from oos.viz.pickers import FacilityPickerWidget, PolicyPickerWidget
-from oos.viz.player import Player, PolicyFn, random_policy
 from oos.viz.policy_swap import (
     generate_single_task,
     load_policy,
@@ -63,24 +63,26 @@ class _RunState:
     Grouped so every handler can read/mutate without needing closures.
     Layer hint per field:
 
-      sim    — `player`, `facility`, `anim_time`, `original_env`
+      sim    — `agent` (owns its Facility), `anim_time`, `original_env`
       ui     — `renderer`, `picker`, `facility_picker`, `mode`, `paused`,
                `speed`, `zoom`, `dragging_fullness`, `active_policy_label`
       runtime— `surface`, `driver`, `toasts`, `running`, `pending_generate`,
                `wall_now_fn`
+
+    Convention: read `state.agent.facility` for the live Facility — we
+    don't mirror it on _RunState (the agent is its source of truth).
     """
 
-    # Long-lived (set at boot, mostly never reassigned)
+    # Long-lived (set at boot)
     surface: pygame.Surface
-    player: Player
+    agent: Agent
     driver: SimDriver
     toasts: ToastManager
     picker: PolicyPickerWidget
     facility_picker: FacilityPickerWidget
     wall_now_fn: callable  # type: ignore[type-arg]
 
-    # Sim (mutated by reset / env swap)
-    facility: Facility
+    # Sim
     anim_time: float
     original_env: OOSEnv
 
@@ -100,6 +102,13 @@ class _RunState:
 
     # Queues
     pending_generate: list = field(default_factory=list)
+
+    @property
+    def facility(self) -> Facility:
+        """Shortcut for `self.agent.facility` — the live user-facing
+        Facility. Kept as a property (not a mirror field) so env swaps
+        on Agent automatically propagate."""
+        return self.agent.facility
 
 
 @dataclass
@@ -147,10 +156,12 @@ class VizApp:
             (self.window_w, self.window_h), pygame.RESIZABLE,
         )
 
-        player = Player(env=self.env, policy=self.policy, seed=self.seed)
-        player.reset()
+        # Wrap the gym env in a user-facing Facility, then build an Agent
+        # over it. The Agent owns the policy + step loop; viz drives it.
+        facility = Facility(self.env)
+        agent = Agent(facility=facility, policy=self.policy, seed=self.seed)
+        agent.reset()
 
-        facility = player.env._ctx.facility  # type: ignore[attr-defined]
         # Boot manual — customer arrivals are off until the user presses 'm'.
         facility.set_auto_arrivals(False)
         topo = facility.topology
@@ -173,7 +184,7 @@ class VizApp:
         def wall_now() -> float:
             return time.monotonic() - wall_start
         toasts = ToastManager(wall_now)
-        driver = SimDriver(player, toasts)
+        driver = SimDriver(agent, toasts)
 
         toasts.info(
             f"FACILITY ONLINE  {len(topo.carriers)}C/{len(topo.shelves)}S/{len(topo.rooms)}R",
@@ -189,7 +200,7 @@ class VizApp:
             )
             if match is not None:
                 label = load_policy(
-                    match, player, topo, picker.deterministic, toasts,
+                    match, agent, topo, picker.deterministic, toasts,
                     mcts_enabled=picker.mcts_enabled,
                     mcts_n_sims=picker.mcts_n_sims,
                 )
@@ -199,15 +210,14 @@ class VizApp:
 
         state = _RunState(
             surface=surface,
-            player=player,
+            agent=agent,
             driver=driver,
             toasts=toasts,
             picker=picker,
             facility_picker=facility_picker,
             wall_now_fn=wall_now,
-            facility=facility,
-            anim_time=facility.state.time,
-            original_env=player.env,
+            anim_time=facility.sim_time,
+            original_env=facility.env,
             renderer=renderer,
             zoom=zoom,
             window_w=self.window_w,
@@ -229,32 +239,32 @@ class VizApp:
 
     def _apply_pending_generate(self, s: _RunState) -> None:
         """Apply any queued Generate before processing events. Done here
-        (not inside the event handler) because the env swap needs to
-        reseat `state.facility` / `state.anim_time`."""
+        (not inside the event handler) because the env swap inside
+        generate_single_task re-wires the agent's Facility and we need to
+        resync anim_time."""
         while s.pending_generate:
             params = s.pending_generate.pop(0)
             ok = generate_single_task(
-                params, s.player, s.facility, self.facility_name, s.toasts,
+                params, s.agent, self.facility_name, s.toasts,
             )
             if ok:
-                s.facility = s.player.env._ctx.facility  # type: ignore[attr-defined]
-                s.anim_time = s.facility.state.time
+                s.anim_time = s.agent.facility.sim_time
 
     def _tick_sim(self, s: _RunState, dt_wall: float) -> None:
-        if s.mode == "anim" and not s.paused and not s.player.done:
+        if s.mode == "anim" and not s.paused and not s.agent.done:
             s.anim_time += dt_wall * s.speed
             s.driver.drive_anim(s.anim_time)
         if s.mode == "step":
-            s.anim_time = s.facility.state.time
+            s.anim_time = s.agent.facility.sim_time
         s.toasts.tick()
 
     def _render(self, s: _RunState) -> None:
         rs = self._build_render_state(s)
         s.renderer.draw(
-            s.surface, s.facility, s.facility.queue, rs,
-            manual_mode=not s.facility.auto_arrivals_enabled,
+            s.surface, s.agent.facility, s.agent.facility.queue, rs,
+            manual_mode=not s.agent.facility.auto_arrivals_enabled,
         )
-        if s.player.done:
+        if s.agent.done:
             _draw_done_banner(
                 s.surface, "EPISODE TERMINATED — R: reset · Q: quit",
             )
@@ -368,7 +378,7 @@ class VizApp:
         if self._handle_panel_collapse(s.renderer, pos):
             return
         # The rest is manual-mode only.
-        if s.facility.auto_arrivals_enabled:
+        if s.agent.facility.auto_arrivals_enabled:
             return
         # Slider drag start.
         if s.renderer.queue_content.hit_slider(pos):
@@ -379,16 +389,16 @@ class VizApp:
         btn = s.renderer.queue_content.hit_button(pos)
         if btn is not None:
             handle_queue_button(
-                btn, s.facility, s.player,
+                btn, s.agent.facility, s.agent,
                 s.renderer.queue_content.fullness, s.toasts,
             )
             if btn == "randomize":
-                s.anim_time = s.facility.state.time
+                s.anim_time = s.agent.facility.state.time
             return
         # Pallet click → toggle Retrieve.
         for rect, pallet_id in s.renderer.pallet_hit_areas:
             if rect.collidepoint(pos):
-                handle_pallet_click(pallet_id, s.facility, s.player, s.toasts)
+                handle_pallet_click(pallet_id, s.agent.facility, s.agent, s.toasts)
                 break
 
     def _on_keydown(self, s: _RunState, event: pygame.event.Event) -> None:
@@ -421,11 +431,11 @@ class VizApp:
         elif event.key == pygame.K_n:
             s.mode = "step" if s.mode == "anim" else "anim"
             if s.mode == "anim":
-                s.anim_time = s.facility.state.time
+                s.anim_time = s.agent.facility.state.time
             s.toasts.warn(f"MODE → {s.mode.upper()}", lifetime=2.0)
         elif event.key == pygame.K_m:
-            s.facility.set_auto_arrivals(not s.facility.auto_arrivals_enabled)
-            if s.facility.auto_arrivals_enabled:
+            s.agent.facility.set_auto_arrivals(not s.agent.facility.auto_arrivals_enabled)
+            if s.agent.facility.auto_arrivals_enabled:
                 s.toasts.success(
                     "MANUAL MODE OFF (auto arrivals resumed)", lifetime=3.0,
                 )
@@ -434,9 +444,9 @@ class VizApp:
                     "MANUAL MODE ON (auto arrivals paused)", lifetime=3.0,
                 )
         elif event.key in (pygame.K_RIGHT, pygame.K_PERIOD):
-            if not s.player.done:
+            if not s.agent.done:
                 s.driver.step_one_decision()
-                s.anim_time = s.facility.state.time
+                s.anim_time = s.agent.facility.state.time
         elif event.key in (pygame.K_PLUS, pygame.K_EQUALS):
             s.speed = min(s.speed * 1.5, 1000.0)
             save_viz_state(self.runs_dir, speed=s.speed)
@@ -450,14 +460,14 @@ class VizApp:
                       pygame.K_3: "big"}[event.key]
             pid = self._hovered_pallet_id(s.renderer)
             if pid is not None:
-                set_pallet_contents(pid, target, s.facility, s.player, s.toasts)
+                set_pallet_contents(pid, target, s.agent.facility, s.agent, s.toasts)
         elif event.key in (pygame.K_4, pygame.K_5):
             sid = self._hovered_shelf_id(s.renderer)
             if sid is not None:
                 if event.key == pygame.K_4:
-                    pop_shelf_top(sid, s.facility, s.player, s.toasts)
+                    pop_shelf_top(sid, s.agent.facility, s.agent, s.toasts)
                 else:
-                    push_empty_pallet(sid, s.facility, s.player, s.toasts)
+                    push_empty_pallet(sid, s.agent.facility, s.agent, s.toasts)
 
     def _on_keydown_facility_picker(
         self, s: _RunState, event: pygame.event.Event,
@@ -467,7 +477,7 @@ class VizApp:
             name = s.facility_picker.selected()
             if name is not None and name != s.facility_picker.active:
                 new_renderer = swap_facility(
-                    name, s.player, s.facility, self.runs_dir,
+                    name, s.agent, self.runs_dir,
                     s.window_w, s.window_h, s.toasts,
                 )
                 s.renderer = self._wire_renderer(
@@ -475,9 +485,8 @@ class VizApp:
                     toasts=s.toasts,
                 )
                 # New facility → new R-revert baseline.
-                s.original_env = s.player.env
-                s.facility = s.player.env._ctx.facility  # type: ignore[attr-defined]
-                s.anim_time = s.facility.state.time
+                s.original_env = s.agent.facility.env
+                s.anim_time = s.agent.facility.sim_time
                 s.facility_picker.active = name
                 self.facility_name = name
                 s.active_policy_label = "(random policy)"
@@ -489,13 +498,13 @@ class VizApp:
         action = s.picker.handle_key(event)
         if action == "mcts_toggle":
             rewrap_with_mcts(
-                s.player, s.picker.mcts_enabled, s.picker.mcts_n_sims, s.toasts,
+                s.agent, s.picker.mcts_enabled, s.picker.mcts_n_sims, s.toasts,
             )
         elif action == "submit":
             entry = s.picker.selected()
             if entry is not None:
                 label = load_policy(
-                    entry, s.player, s.facility.topology, s.picker.deterministic,
+                    entry, s.agent, s.agent.facility.topology, s.picker.deterministic,
                     s.toasts,
                     mcts_enabled=s.picker.mcts_enabled,
                     mcts_n_sims=s.picker.mcts_n_sims,
@@ -510,16 +519,17 @@ class VizApp:
         revert to the original OOSEnv on this facility instead of
         re-rolling another single-task state."""
         from oos.learn.single_task_env import SingleTaskEnv
-        preserve_auto = s.facility.auto_arrivals_enabled
+        preserve_auto = s.agent.facility.auto_arrivals_enabled
         reverted = False
-        if isinstance(s.player.env, SingleTaskEnv):
-            s.player.env = s.original_env
-            s.player.seed = self.seed
+        if isinstance(s.agent.facility.env, SingleTaskEnv):
+            # Replace the agent's Facility with one wrapping the original
+            # OOSEnv (the user-facing wrapper, not the inner sim engine).
+            s.agent.facility = Facility(s.original_env)
+            s.agent.seed = self.seed
             reverted = True
-        s.player.reset()
-        s.facility = s.player.env._ctx.facility  # type: ignore[attr-defined]
-        s.facility.set_auto_arrivals(preserve_auto)
-        s.anim_time = s.facility.state.time
+        s.agent.reset()
+        s.agent.facility.set_auto_arrivals(preserve_auto)
+        s.anim_time = s.agent.facility.sim_time
         if reverted:
             s.toasts.accent("ENV RESET (reverted from generated)", lifetime=3.0)
         else:
@@ -531,11 +541,11 @@ class VizApp:
 
     def _relayout(self, s: _RunState) -> Renderer:
         new_layout = compute_layout(
-            s.facility.topology,
+            s.agent.facility.topology,
             LayoutConfig(window_w=s.window_w, window_h=s.window_h, zoom=s.zoom),
         )
         return self._wire_renderer(
-            Renderer(new_layout, s.facility.topology),
+            Renderer(new_layout, s.agent.facility.topology),
             pending_generate=s.pending_generate, toasts=s.toasts,
         )
 
@@ -561,7 +571,7 @@ class VizApp:
     # ─────────────────────────────────────────────────────────────────────
 
     def _build_render_state(self, s: _RunState) -> RenderState:
-        p = s.player
+        p = s.agent
         policy_logits = getattr(p.policy, "last_logits", None)
         policy_action_mask = getattr(p.policy, "last_action_mask", None)
         policy_chosen = getattr(p.policy, "last_chosen", None)
@@ -569,10 +579,10 @@ class VizApp:
         return RenderState(
             mode=s.mode + (" (paused)" if s.paused else ""),
             wall_speed=s.speed,
-            last_reward=(p.last_record.reward if p.last_record else 0.0),
+            last_reward=(p.last_step.reward if p.last_step else 0.0),
             n_completed=p.total_completions,
-            last_action=(p.last_record.action_label if p.last_record else "—"),
-            querying=(p.last_record.querying if p.last_record else "—"),
+            last_action=(p.last_step.action_label if p.last_step else "—"),
+            querying=(p.last_step.querying if p.last_step else "—"),
             anim_now=s.anim_time,
             toasts=s.toasts.toasts,
             wall_now=s.wall_now_fn(),

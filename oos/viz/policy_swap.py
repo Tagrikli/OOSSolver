@@ -1,41 +1,51 @@
-"""Policy & facility hot-swap helpers.
+"""Hot-swap helpers: policy load, MCTS rewrap, facility swap, single-task
+generate.
 
-These are the "user pressed enter on the policy picker / facility picker /
-'g' for random" operations. Split out of `app.py` so the main loop reads
-as event dispatch + state mutation, not implementation of every command.
+These are the "user pressed enter on the picker / 'g' for generate"
+operations. Split out of `app.py` so the main loop reads as dispatch.
+
+All helpers mutate the Agent in place (`agent.policy = ...`, or replace
+the underlying env via a new Facility) and emit toasts. The viz-side
+swap functions also rebuild the Renderer when the facility changes.
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
+from oos.agent import Agent, random_policy
 from oos.env.env import OOSEnv
+from oos.facility import Facility
 from oos.viz.components import ToastManager
 from oos.viz.layout import LayoutConfig, compute_layout
-from oos.viz.player import Player, random_policy
 from oos.viz.renderer import Renderer
 from oos.viz.state_store import save_viz_state
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Policy load / rewrap
+# ─────────────────────────────────────────────────────────────────────────
+
+
 def load_policy(
     entry,
-    player: Player,
+    agent: Agent,
     topo,
     deterministic: bool,
     toasts: ToastManager,
     mcts_enabled: bool = False,
     mcts_n_sims: int = 32,
 ) -> Optional[str]:
-    """Swap player.policy to the entry's policy. Returns the display label
-    on success, or None if loading failed (a toast is emitted either way).
-    """
+    """Swap `agent.policy` to the entry's policy. Returns the display
+    label on success, or None if loading failed (a toast is emitted either
+    way)."""
     if entry.path == "":
-        player.policy = random_policy
+        agent.policy = random_policy
         toasts.info("POLICY → random", lifetime=3.0)
         return entry.display_name
     try:
-        # Lazy import so the viz still runs without torch when no checkpoint
-        # is being loaded.
+        # Lazy import so the viz still runs without torch when no
+        # checkpoint is being loaded.
         from oos.learn.policy import LearnedPolicy, MCTSPolicy
         policy = LearnedPolicy(
             checkpoint_path=entry.path,
@@ -44,11 +54,11 @@ def load_policy(
             deterministic=deterministic,
         )
         if mcts_enabled:
-            player.policy = MCTSPolicy(
-                learned=policy, env=player.env, n_sims=mcts_n_sims,
+            agent.policy = MCTSPolicy(
+                learned=policy, env=agent.facility.env, n_sims=mcts_n_sims,
             )
         else:
-            player.policy = policy
+            agent.policy = policy
         mode_label = "argmax" if deterministic else "sample"
         mcts_label = f"+mcts:{mcts_n_sims}" if mcts_enabled else ""
         toasts.success(
@@ -65,15 +75,15 @@ def load_policy(
 
 
 def rewrap_with_mcts(
-    player: Player,
+    agent: Agent,
     mcts_enabled: bool,
     mcts_n_sims: int,
     toasts: ToastManager,
 ) -> None:
-    """Toggle MCTS on/off for the currently-loaded policy WITHOUT re-reading
-    the checkpoint from disk. Random policy is left untouched."""
+    """Toggle MCTS on/off for the currently-loaded policy WITHOUT
+    re-reading the checkpoint from disk. Random policy is left untouched."""
     from oos.learn.policy import LearnedPolicy, MCTSPolicy
-    current = player.policy
+    current = agent.policy
     if isinstance(current, MCTSPolicy):
         inner = current.learned
     elif isinstance(current, LearnedPolicy):
@@ -82,28 +92,31 @@ def rewrap_with_mcts(
         toasts.error("MCTS: no learned policy loaded", lifetime=3.0)
         return
     if mcts_enabled:
-        player.policy = MCTSPolicy(
-            learned=inner, env=player.env, n_sims=mcts_n_sims,
+        agent.policy = MCTSPolicy(
+            learned=inner, env=agent.facility.env, n_sims=mcts_n_sims,
         )
         toasts.info(f"MCTS ON  (n_sims={mcts_n_sims})", lifetime=3.0)
     else:
-        player.policy = inner
+        agent.policy = inner
         toasts.warn("MCTS OFF  (reactive policy only)", lifetime=3.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Facility / env swap
+# ─────────────────────────────────────────────────────────────────────────
 
 
 def generate_single_task(
     params: dict,
-    player: Player,
-    facility,
+    agent: Agent,
     facility_name: str,
     toasts: ToastManager,
 ) -> bool:
-    """Replace `player.env` with a fresh SingleTaskEnv wired to the
-    configured knobs, then reset. Returns True on success, False if
-    params failed validation. The caller is responsible for syncing
-    any cached `facility` reference after reset (the SingleTaskEnv
-    builds its own facility from the same factory).
-    """
+    """Replace the agent's underlying env with a fresh SingleTaskEnv
+    wired to the configured knobs, then reset. Returns True on success,
+    False if params failed validation. The caller should refresh any
+    cached references to `agent.facility.sim` after this returns
+    (the SingleTaskEnv builds its own sim Facility)."""
     from oos.facilities import get_facility
     from oos.learn.single_task_env import (
         SingleTaskConfig,
@@ -139,59 +152,53 @@ def generate_single_task(
     except (KeyError, ValueError, TypeError) as e:
         toasts.error(f"GEN FAILED: {type(e).__name__}: {e}"[:80])
         return False
-    old_env = player.env
-    preserve_auto = facility.auto_arrivals_enabled
+    old_env = agent.facility.env
+    preserve_auto = agent.facility.auto_arrivals_enabled
     new_env = SingleTaskEnv(
         facility_factory=get_facility(facility_name),
         task_config=task_cfg,
         reward_config=SingleTaskRewardConfig(),
         experiment_config=old_env._experiment_cfg,  # type: ignore[attr-defined]
     )
-    player.env = new_env
-    player.policy = random_policy
-    # Fresh seed per Generate — Player.reset() reuses player.seed, so
-    # without this every press would produce the same RNG stream and
-    # the same layout.
+    agent.facility = Facility(new_env)
+    agent.policy = random_policy
+    # Fresh seed per Generate — without this every press would produce the
+    # same RNG stream and the same layout.
     import secrets
-    player.seed = secrets.randbits(31)
-    player.reset()
-    new_facility = player.env._ctx.facility  # type: ignore[attr-defined]
-    new_facility.set_auto_arrivals(preserve_auto)
+    agent.seed = secrets.randbits(31)
+    agent.reset()
+    agent.facility.set_auto_arrivals(preserve_auto)
     toasts.success("GENERATED single-task initial state", lifetime=3.0)
     return True
 
 
 def swap_facility(
     name: str,
-    player: Player,
-    facility,
+    agent: Agent,
     runs_dir: str,
     window_w: int,
     window_h: int,
     toasts: ToastManager,
 ) -> Renderer:
-    """Rebuild the env with a different facility factory. Resets the player,
-    builds a fresh layout + renderer, persists the choice. Returns the new
-    renderer."""
+    """Rebuild the agent's facility with a different topology. Resets the
+    agent, builds a fresh layout + renderer, persists the choice. Returns
+    the new renderer."""
     from oos.facilities import get_facility
-    old_env = player.env
-    preserve_auto = facility.auto_arrivals_enabled
+    old_env = agent.facility.env
+    preserve_auto = agent.facility.auto_arrivals_enabled
     new_env = OOSEnv(
         facility_factory=get_facility(name),
         experiment_config=old_env._experiment_cfg,  # type: ignore[attr-defined]
         reward_config=old_env._reward_cfg,          # type: ignore[attr-defined]
     )
-    player.env = new_env
-    player.policy = random_policy
-    player.reset()
-    new_facility = player.env._ctx.facility  # type: ignore[attr-defined]
-    new_facility.set_auto_arrivals(preserve_auto)
-    new_topo = new_facility.topology
+    agent.facility = Facility(new_env)
+    agent.policy = random_policy
+    agent.reset()
+    agent.facility.set_auto_arrivals(preserve_auto)
+    new_topo = agent.facility.topology
     new_layout = compute_layout(
         new_topo, LayoutConfig(window_w=window_w, window_h=window_h),
     )
     save_viz_state(runs_dir, facility_name=name)
     toasts.success(f"FACILITY → {name}", lifetime=4.0)
     return Renderer(new_layout, new_topo)
-
-

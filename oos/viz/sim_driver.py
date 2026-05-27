@@ -1,108 +1,73 @@
-"""Drive the env: step the simulation, submit policy actions, emit toasts.
+"""SimDriver — viz-side wrapper around an Agent + ToastManager.
 
-Split out of `app.py` so the main loop stays focused on event dispatch +
-state mutation. `SimDriver` is a thin object that holds a `Player` and a
-`ToastManager` and knows how to:
-- advance the env up to a wall-clock-bounded anim time (`drive_anim`)
-- submit one decision at the current instant (`submit_one`)
-- advance until the next decision in step mode (`step_one_decision`)
-- emit toasts for arrivals / completions (`emit_toasts`)
+The driver knows how to:
+  * `drive_anim(anim_time)`     — advance the sim up to an animation-time
+                                  bound; submit any pending decisions at
+                                  the same instant before letting time
+                                  flow forward.
+  * `step_one_decision()`       — single-step mode: submit one decision
+                                  and let time run until the next one.
+  * `emit_toasts(info)`          — fan info-events out as toasts (arrivals,
+                                  completions, stage/unstage, wrong-item).
 
-The driver never touches pygame; it's pure sim plumbing with toast side
-effects.
+No pygame imports — pure Agent + Facility + toast plumbing.
 """
 
 from __future__ import annotations
 
-from typing import Optional
-
+from oos.agent import Agent, AgentStep
+from oos.facility import Facility
+from oos.sim.actions import short_action_label
 from oos.sim.tasks import Retrieve, Store
-from oos.viz.components import ToastManager, short_action_label
-from oos.viz.player import Player, StepRecord
+from oos.viz.components import ToastManager
 
 
 class SimDriver:
-    def __init__(self, player: Player, toasts: ToastManager):
-        self.player = player
+    """Drives an Agent's facility forward in viz/animation time."""
+
+    MAX_ITERS_PER_FRAME = 200
+
+    def __init__(self, agent: Agent, toasts: ToastManager):
+        self.agent = agent
         self.toasts = toasts
 
-    # ---- public API -------------------------------------------------------
+    @property
+    def facility(self) -> Facility:
+        return self.agent.facility
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Public API
+    # ─────────────────────────────────────────────────────────────────────
 
     def drive_anim(self, anim_time: float) -> None:
-        """Loop: submit-pending-decisions and advance until anim_time bounds us
-        or the next decision arrives. Bounded iteration count to keep the
-        frame from livelocking if the policy keeps producing instant-time
-        decisions."""
-        env = self.player.env
-        max_iters = 200
-        i = 0
-        while not self.player.done and i < max_iters:
-            i += 1
-            facility = env._ctx.facility  # type: ignore[attr-defined]
-            if env.needs_decision() and facility.state.time <= anim_time:
-                self.submit_one()
-                continue
-            obs, reward, term, trunc, info = env.advance(time_limit=anim_time)
-            self._record_advance(obs, reward, term, trunc, info)
-            if term or trunc:
-                self.player.done = True
-                break
-            if not env.needs_decision():
-                break
+        """Advance sim until `anim_time` or until no more "free" work remains.
 
-    def submit_one(self) -> None:
-        env = self.player.env
-        # Snapshot the querying carrier BEFORE policy() / env.submit_action
-        # mutate env state — we need it to log the query under the right
-        # carrier id.
-        carrier_at_query = str(env._ctx.querying_carrier)  # type: ignore[attr-defined]
-        action_idx = self.player.policy(self.player.obs, self.player.info)
-        # Capture the policy's last-query outputs against THIS carrier
-        # immediately. drive_anim can loop submit_one many times per
-        # frame; if we wait until render time, only the last carrier
-        # queried in the frame would be visible.
-        self._log_policy_query(carrier_at_query)
-        # Belt-and-suspenders: clamp out-of-range actions to WAIT (always
-        # the last legal entry per enumerate_actions).
-        live_n_legal = len(env._ctx.decoder.entries)  # type: ignore[attr-defined]
-        if not (0 <= action_idx < live_n_legal):
-            action_idx = live_n_legal - 1
-        entries = self.player.info.get("action_entries", [])
-        if 0 <= action_idx < len(entries):
-            cmd = entries[action_idx].to_command(env._ctx.querying_carrier)  # type: ignore[attr-defined]
-            label = short_action_label(cmd)
-        else:
-            label = f"#{action_idx}"
-        querying = str(env._ctx.querying_carrier)  # type: ignore[attr-defined]
-        sim_t_before = env._ctx.facility.state.time  # type: ignore[attr-defined]
-        env.submit_action(action_idx)
-        # 0-time advance to refresh obs/info for the next decision.
-        obs, reward, term, trunc, info = env.advance(
-            time_limit=env._ctx.facility.state.time,  # type: ignore[attr-defined]
-        )
-        self.player.obs = obs
-        self.player.info = info
-        self.player.total_reward += reward
-        self.player.last_record = StepRecord(
-            sim_time_before=sim_t_before,
-            sim_time_after=env._ctx.facility.state.time,  # type: ignore[attr-defined]
-            action_label=label,
-            querying=querying,
-            reward=reward,
-            n_completions=len(info.get("completions", [])),
-        )
-        self.emit_toasts(info)
+        Per-iter: if there's a pending decision AT or BEFORE anim_time,
+        submit it; else advance time bounded by anim_time. Iteration is
+        capped to avoid livelock on policies that produce many instant-time
+        decisions in a row.
+        """
+        fac = self.facility
+        for _ in range(self.MAX_ITERS_PER_FRAME):
+            if self.agent.done:
+                return
+            if fac.needs_decision() and fac.sim_time <= anim_time:
+                self._submit_one_at_current_time()
+                continue
+            obs, reward, info = fac.advance_until(sim_time=anim_time)
+            self._record_advance(obs, reward, info)
+            if self.agent.done:
+                return
+            if not fac.needs_decision():
+                return
 
     def step_one_decision(self) -> None:
-        """Manual step mode: submit any pending action, then advance fully to
-        the next decision instant."""
-        env = self.player.env
-        if env.needs_decision():
-            self.submit_one()
-        obs, reward, term, trunc, info = env.advance(time_limit=None)
-        self._record_advance(obs, reward, term, trunc, info)
-        if term or trunc:
-            self.player.done = True
+        """Manual single-step: submit any pending action, then run until
+        the next decision (no anim-time bound)."""
+        if self.facility.needs_decision():
+            self._submit_one_at_current_time()
+        obs, reward, info = self.facility.advance_until(sim_time=None)
+        self._record_advance(obs, reward, info)
 
     def emit_toasts(self, info: dict) -> None:
         for arr in info.get("arrivals", []):
@@ -119,48 +84,87 @@ class SimDriver:
             else:
                 label = "task done"
             self.toasts.success(f"✓ {label}  cost={comp.cost:.1f}", lifetime=3.5)
-        # Reward-event toasts so a stage/unstage is visibly attributed even
-        # when the per-step `last R` display is overwritten before render.
-        n_stage = int(info.get("n_stage_events", 0))
-        n_unstage = int(info.get("n_unstage_events", 0))
-        n_wrong = int(info.get("n_wrong_item_events", 0))
-        for _ in range(n_stage):
+        # Event toasts so a stage/unstage is visibly attributed even when
+        # the per-step "last R" display is overwritten before render.
+        for _ in range(int(info.get("n_stage_events", 0))):
             self.toasts.success("+STAGE", lifetime=3.5)
-        for _ in range(n_unstage):
+        for _ in range(int(info.get("n_unstage_events", 0))):
             self.toasts.error("−UNSTAGE", lifetime=3.5)
-        for _ in range(n_wrong):
+        for _ in range(int(info.get("n_wrong_item_events", 0))):
             self.toasts.error("−WRONG ITEM", lifetime=3.5)
         if info.get("idle_with_retrieve", False):
             self.toasts.error("−IDLE", lifetime=1.5)
 
-    # ---- internal ---------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────────────
+    # Internal
+    # ─────────────────────────────────────────────────────────────────────
 
-    def _log_policy_query(self, carrier_id: str) -> None:
-        """Snapshot `policy.last_*` into the player's per-carrier log."""
-        policy = self.player.policy
-        logits = getattr(policy, "last_logits", None)
-        mask = getattr(policy, "last_action_mask", None)
-        chosen = getattr(policy, "last_chosen", None)
-        if logits is None or mask is None:
-            return  # random policy / nothing to record
-        # Shallow copy of logits/mask so the next query doesn't mutate
-        # the stored snapshot in place (LearnedPolicy reassigns the field
-        # but defensive against in-place updates from custom policies).
-        self.player.policy_query_log[carrier_id] = {
-            "logits": logits.copy() if hasattr(logits, "copy") else logits,
-            "mask": mask.copy() if hasattr(mask, "copy") else mask,
-            "chosen": chosen,
-            "entries": list(self.player.info.get("action_entries", [])),
-        }
+    def _submit_one_at_current_time(self) -> None:
+        """Submit a single decision via the agent, then zero-time-advance
+        to refresh obs/info for the next decision (which may fire at the
+        same sim instant if multiple carriers are idle)."""
+        agent = self.agent
+        fac = self.facility
+        querying = fac.querying_carrier
+        sim_t_before = fac.sim_time
 
-    def _record_advance(self, obs, reward, term, trunc, info) -> None:
-        self.player.obs = obs
-        self.player.info = info
-        self.player.total_reward += reward
+        action_idx = agent.act()
+        agent._log_query(querying)   # surface the policy outputs to viz
+
+        # Belt-and-suspenders: out-of-range action_idx → fall back to WAIT
+        # (always the last legal entry per enumerate_actions).
+        live_n_legal = len(fac.env._ctx.decoder.entries)  # type: ignore[attr-defined]
+        if not (0 <= action_idx < live_n_legal):
+            action_idx = live_n_legal - 1
+
+        entries = agent.info.get("action_entries", [])
+        if 0 <= action_idx < len(entries):
+            cmd = entries[action_idx].to_command(querying)
+            label = short_action_label(cmd)
+        else:
+            label = f"#{action_idx}"
+
+        # Submit only — don't advance past current sim_time. Other carriers
+        # may want to decide at the SAME instant.
+        fac.submit_action(action_idx)
+
+        # Zero-time advance to refresh obs/info.
+        obs, reward, info = fac.advance_until(sim_time=fac.sim_time)
+
+        agent.obs = obs
+        agent.info = info
+        agent.total_reward += reward
+        n_comp = len(info.get("completions", []))
+        agent.total_completions += n_comp
+        terminated = bool(info.get("terminated", False))
+        truncated = bool(info.get("truncated", False))
+        if terminated or truncated:
+            agent.done = True
+
+        agent.last_step = AgentStep(
+            sim_time_before=sim_t_before,
+            sim_time_after=fac.sim_time,
+            action_idx=action_idx,
+            action_label=label,
+            querying=querying,
+            reward=reward,
+            n_completions=n_comp,
+            obs=obs, info=info,
+            terminated=terminated, truncated=truncated,
+        )
+        self.emit_toasts(info)
+
+    def _record_advance(self, obs: dict, reward: float, info: dict) -> None:
+        agent = self.agent
+        agent.obs = obs
+        agent.info = info
+        agent.total_reward += reward
         # Roll this reward into the per-action display so the sidebar's
         # "last R" reflects the actual time-advancing reward (movement +
         # stage/unstage events + completions), not just the 0-duration
         # submit advance which always shows ~0.
-        if self.player.last_record is not None:
-            self.player.last_record.reward += reward
+        if agent.last_step is not None:
+            agent.last_step.reward += reward
+        if info.get("terminated") or info.get("truncated"):
+            agent.done = True
         self.emit_toasts(info)

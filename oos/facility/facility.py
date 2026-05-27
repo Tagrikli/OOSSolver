@@ -113,6 +113,19 @@ class Facility:
         """True iff a carrier is currently querying for an action."""
         return self._env.needs_decision()
 
+    def submit_action(self, action_idx: int) -> bool:
+        """Lower-level than `apply_action`: submit the action and advance
+        the querying-carrier pointer to the next idle carrier at the same
+        sim instant if one exists. Does NOT advance sim time.
+
+        Returns True iff another carrier needs a decision at the same
+        instant (caller should submit again before advancing time).
+
+        This is the granularity the viz uses for chains of simultaneous
+        decisions; embedding code should prefer `apply_action`.
+        """
+        return self._env.submit_action(int(action_idx))
+
     # ─────────────────────────────────────────────────────────────────────
     # Live state read-throughs (for rendering / inspection)
     # ─────────────────────────────────────────────────────────────────────

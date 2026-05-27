@@ -1,8 +1,14 @@
-"""Small shared helpers for widgets."""
+"""Small shared helpers for widgets.
+
+`short_action_label` was here historically; it lives in `oos.sim.actions`
+now so non-viz code (Agent in particular) can import it without pulling
+pygame transitively. We re-export it for back-compat with existing
+viz call sites.
+"""
 
 from __future__ import annotations
 
-from oos.sim.actions import MultiRelocate, Relocate, Wait
+from oos.sim.actions import short_action_label
 from oos.sim.state import Pallet
 from oos.viz.components.palette import PALLET_BIG, PALLET_EMPTY, PALLET_SMALL
 
@@ -15,13 +21,4 @@ def pallet_color(p: Pallet) -> tuple[int, int, int]:
     return PALLET_BIG
 
 
-def short_action_label(cmd) -> str:
-    if cmd is None:
-        return "idle"
-    if isinstance(cmd, Relocate):
-        return f"reloc {cmd.src}→{cmd.dst}"
-    if isinstance(cmd, MultiRelocate):
-        return f"multi {cmd.src}→[{cmd.partner_id}]→{cmd.dst}"
-    if isinstance(cmd, Wait):
-        return "wait"
-    return type(cmd).__name__.lower()
+__all__ = ["pallet_color", "short_action_label"]

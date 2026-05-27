@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 import pygame
 
-from oos.sim.facility import Facility
+from oos.facility import Facility
 from oos.sim.tasks import TaskQueue
 from oos.sim.topology import Topology
 from oos.viz.components import (

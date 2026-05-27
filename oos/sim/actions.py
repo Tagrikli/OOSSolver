@@ -511,3 +511,22 @@ class Wait(Command):
 
     def complete(self, state: FacilityState, topo: Topology) -> None:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Short label helper — used by both viz and Agent. Lives here so neither
+# layer has to import from the other.
+# ---------------------------------------------------------------------------
+
+
+def short_action_label(cmd: "Command | None") -> str:
+    """Compact human-readable label for a Command (or "idle" if None)."""
+    if cmd is None:
+        return "idle"
+    if isinstance(cmd, Relocate):
+        return f"reloc {cmd.src}→{cmd.dst}"
+    if isinstance(cmd, MultiRelocate):
+        return f"multi {cmd.src}→[{cmd.partner_id}]→{cmd.dst}"
+    if isinstance(cmd, Wait):
+        return "wait"
+    return type(cmd).__name__.lower()
