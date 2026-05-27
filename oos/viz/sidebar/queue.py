@@ -1,7 +1,7 @@
 """QueueContent — pending-tasks list + manual-mode slider/buttons.
 
 Buttons are composed from the reusable `Button` widget and laid out via
-the `HRow` layout primitive — no more inline pygame.draw for the row.
+the `Row` layout primitive — no more inline pygame.draw for the row.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import pygame
 
 from oos.sim.tasks import Retrieve, Store
 from oos.viz.components.button import Button
-from oos.viz.components.layout import HRow
+from oos.viz.components.layout import Row
 from oos.viz.components.palette import (
     BASE_GUTTER,
     BASE_MUTED,
@@ -53,7 +53,7 @@ class QueueContent:
             Button("queue clear", variant="warn"),
             Button("randomize",   variant="accent"),
         ]
-        self._row = HRow(self._buttons, gap=self.BUTTON_GAP, item_h=self.BUTTON_H)
+        self._row = Row(self._buttons, gap=self.BUTTON_GAP, item_h=self.BUTTON_H)
 
     # ---- per-frame state setters ------------------------------------------
 
@@ -164,7 +164,7 @@ class QueueContent:
                   (self.slider_rect.right + 6, slider_y + 1),
                   fonts.small, MAGENTA_BRIGHT)
 
-        # Button row — laid out with HRow then drawn.
+        # Button row — laid out with Row then drawn.
         row_rect = pygame.Rect(
             body.left + 2, btn_row_y, body.width - 4, self.BUTTON_H,
         )

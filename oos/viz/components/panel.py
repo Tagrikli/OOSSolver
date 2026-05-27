@@ -72,6 +72,11 @@ class Panel:
     def rect(self, r: pygame.Rect) -> None:
         self.chrome.rect = r
 
+    def set_rect(self, r: pygame.Rect) -> None:
+        """Method form of the rect setter — satisfies the `Rectable` protocol
+        so a Panel can be a child of `Row` / `Column`."""
+        self.chrome.rect = r
+
     @property
     def collapsed(self) -> bool:
         return self.chrome.collapsed

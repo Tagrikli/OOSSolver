@@ -33,6 +33,7 @@ from oos.viz.components import (
     VIOLET_BRIGHT,
     YELLOW_BRIGHT,
     CarrierPanel,
+    Column,
     CustomerQueueWidget,
     Fonts,
     Panel,
@@ -78,6 +79,43 @@ class RenderState:
     policy_action_entries: list = field(default_factory=list)
     policy_query_log: dict = field(default_factory=dict)
     mouse_pos: tuple[int, int] = (0, 0)
+
+
+def _resolve_panel_heights(
+    panels: list[Panel], total_h: int, gap: int, min_expanded: int = 60,
+) -> list[int]:
+    """Distribute `total_h` across `panels` for vertical stacking.
+
+    Collapsed panels get a fixed `HEADER_H + COLLAPSED_LIP`. The remaining
+    space is split among expanded panels using their `preferred_h` as
+    weights, with each expanded panel clamped to ≥ `min_expanded`.
+
+    Returned list is parallel to `panels` and consumable as `Column.heights`.
+    """
+    collapsed_h = PanelChrome.HEADER_H + PanelChrome.COLLAPSED_LIP
+    n = len(panels)
+    if n == 0:
+        return []
+    gap_total = gap * (n - 1) if n > 1 else 0
+    collapsed_total = sum(collapsed_h for p in panels if p.chrome.collapsed)
+    expanded_panels = [p for p in panels if not p.chrome.collapsed]
+    remaining = total_h - gap_total - collapsed_total
+
+    weight_sum = sum(p.preferred_h for p in expanded_panels) or 1
+    expanded_h: dict[int, int] = {}
+    if expanded_panels:
+        allotted = 0
+        for p in expanded_panels[:-1]:
+            h = max(min_expanded, int(remaining * p.preferred_h / weight_sum))
+            expanded_h[id(p)] = h
+            allotted += h
+        expanded_h[id(expanded_panels[-1])] = max(
+            min_expanded, remaining - allotted,
+        )
+    return [
+        collapsed_h if p.chrome.collapsed else expanded_h[id(p)]
+        for p in panels
+    ]
 
 
 class Renderer:
@@ -309,49 +347,31 @@ class Renderer:
     def _layout_panels(self) -> None:
         """Re-flow side panels each frame based on collapsed state and the
         active tab. The tab strip claims the top slot of the sidebar; the
-        active tab's panels fill the remainder."""
+        active tab's panels fill the remainder, distributed by
+        `preferred_h` weight among the expanded panels."""
         sb = self._sidebar_rect
         pad = self._sb_pad
         col_x = self._col_x
         panel_w = self._panel_w
 
-        # Tab strip at the top of the sidebar.
+        # Tab strip at the top of the sidebar (always fixed height).
         tab_top = sb.top + pad
         self._tab_strip.set_rect(pygame.Rect(
             col_x, tab_top, panel_w, TabStrip.H,
         ))
-        panels_top = tab_top + TabStrip.H + pad
 
         panels = self.active_panels()
         if not panels:
             return
-        collapsed_h = PanelChrome.HEADER_H + PanelChrome.COLLAPSED_LIP
 
-        total_h = sb.bottom - pad - panels_top
-        gap_total = pad * (len(panels) - 1) if len(panels) > 1 else 0
-        collapsed_total = sum(collapsed_h for p in panels if p.chrome.collapsed)
-        expanded_panels = [p for p in panels if not p.chrome.collapsed]
-        remaining = total_h - gap_total - collapsed_total
+        panels_top = tab_top + TabStrip.H + pad
+        panels_h = sb.bottom - pad - panels_top
+        panels_rect = pygame.Rect(col_x, panels_top, panel_w, panels_h)
 
-        weight_sum = sum(p.preferred_h for p in expanded_panels) or 1
-        min_expanded = 60
-        expanded_heights: dict[int, int] = {}
-        if expanded_panels:
-            allotted = 0
-            for p in expanded_panels[:-1]:
-                h = max(min_expanded, int(remaining * p.preferred_h / weight_sum))
-                expanded_heights[id(p)] = h
-                allotted += h
-            expanded_heights[id(expanded_panels[-1])] = max(
-                min_expanded, remaining - allotted,
-            )
-
-        y = panels_top
-        for p in panels:
-            h = collapsed_h if p.chrome.collapsed else expanded_heights[id(p)]
-            new_rect = pygame.Rect(col_x, y, panel_w, h)
-            p.rect = new_rect
-            y += h + pad
+        heights = _resolve_panel_heights(
+            panels, total_h=panels_h, gap=pad, min_expanded=60,
+        )
+        Column(panels, gap=pad, heights=heights).lay_out(panels_rect)
 
     def draw(
         self,

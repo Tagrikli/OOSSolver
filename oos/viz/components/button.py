@@ -1,7 +1,7 @@
 """Button — reusable beveled button widget with named color variants.
 
 Construction takes a label + a variant ("primary" | "accent" | "warn" |
-"danger"); the rect is set later by a layout primitive (HRow / Grid). The
+"danger"); the rect is set later by a layout primitive (Row / Grid). The
 button is stateful only for its rect — drawing reads label, variant, rect.
 
 Hit-testing returns the label so the caller can switch on it cheaply.
