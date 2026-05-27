@@ -11,6 +11,7 @@ from oos.viz.components.palette import (
     ERROR,
     LIME_BRIGHT,
     MAGENTA_BRIGHT,
+    SOFT_WHITE,
     VIOLET_BRIGHT,
     YELLOW_BRIGHT,
     Fonts,
@@ -32,6 +33,7 @@ class StatsContent:
         n_completed: int,
         last_action: str,
         querying: str,
+        total_actions: int = 0,
         policy_label: str = "(random policy)",
         facility_name: str = "",
     ) -> None:
@@ -47,6 +49,7 @@ class StatsContent:
             ("querying",  querying,              MAGENTA_BRIGHT),
             ("last act",  last_action,           CYAN_MID),
             ("last R",    f"{last_reward:+.3f}", LIME_BRIGHT if last_reward >= 0 else ERROR),
+            ("actions",   str(total_actions),    SOFT_WHITE),
             ("completed", str(n_completed),      LIME_BRIGHT),
         ]
 

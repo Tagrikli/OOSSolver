@@ -112,6 +112,7 @@ class SimDriver:
         sim_t_before = fac.sim_time
 
         action_idx = agent.act()
+        agent.total_actions += 1
         agent.record_policy_query(querying)   # surface to viz dist panel
 
         # Belt-and-suspenders: out-of-range action_idx → fall back to WAIT

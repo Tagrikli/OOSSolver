@@ -207,6 +207,12 @@ class OOSEnv(gym.Env):
         False (caller should call advance()).
         """
         assert self._ctx is not None, "must call reset() before submit_action()"
+        # Count each submitted action as one "step" — regardless of
+        # whether it arrived via gym `.step()` (training) or via the
+        # viz's split-API path (`submit_action` + `advance_until`). This
+        # keeps `max_episode_steps` bounding the number of agent
+        # *decisions*, not the number of internal `advance` calls.
+        self._step_count += 1
         ctx = self._ctx
         facility = ctx.facility
         entry: ActionEntry = ctx.decoder.decode(int(action))
@@ -387,7 +393,11 @@ class OOSEnv(gym.Env):
             idle_with_retrieve=idle_with_retrieve,
         )
 
-        self._step_count += 1
+        # `_step_count` counts gym-shaped decisions (incremented in
+        # `step()` above), NOT raw advance calls. The viz drives the env
+        # via submit_action + advance_until directly, so the truncation
+        # check here only fires from sim-time exhaustion — matching what
+        # max_episode_steps was meant to bound.
         terminated = False
         truncated = (
             facility.state.time >= self._experiment_cfg.episode.max_sim_time

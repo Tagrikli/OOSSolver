@@ -86,6 +86,7 @@ class Agent:
         self.last_step: Optional[AgentStep] = None
         self.total_reward: float = 0.0
         self.total_completions: int = 0
+        self.total_actions: int = 0
         self.done: bool = False
 
         # Per-carrier snapshot of the most recent policy call for that
@@ -137,6 +138,7 @@ class Agent:
         self.last_step = None
         self.total_reward = 0.0
         self.total_completions = 0
+        self.total_actions = 0
         self.done = False
         return self.obs, self.info
 
@@ -161,6 +163,7 @@ class Agent:
         sim_t_before = self.facility.sim_time
 
         action_idx = self.act()
+        self.total_actions += 1
         self.record_policy_query(querying)
 
         # Build the human-readable label from the entry list, if available.

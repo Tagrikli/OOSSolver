@@ -730,6 +730,7 @@ class VizApp:
             wall_speed=s.speed,
             last_reward=(p.last_step.reward if p.last_step else 0.0),
             n_completed=p.total_completions,
+            total_actions=p.total_actions,
             last_action=(p.last_step.action_label if p.last_step else "—"),
             querying=(p.last_step.querying if p.last_step else "—"),
             anim_now=s.anim_time,
@@ -747,8 +748,9 @@ class VizApp:
 
     @staticmethod
     def _handle_panel_collapse(renderer: Renderer, pos) -> bool:
+        # `stats_panel` is persistent (not collapsable) — skipped here.
         for panel in (
-            renderer.stats_panel, renderer.queue_panel, renderer.dist_panel,
+            renderer.queue_panel, renderer.dist_panel,
             renderer.controls_panel, renderer.legend_panel,
         ):
             if panel.hit_header(pos):

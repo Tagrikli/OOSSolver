@@ -55,6 +55,7 @@ class RenderState:
     wall_speed: float
     last_reward: float
     n_completed: int
+    total_actions: int
     last_action: str
     querying: str
     anim_now: float
@@ -154,18 +155,19 @@ class Renderer:
         return self._tab_strip.active
 
     def active_panels(self) -> list[Panel]:
-        """The panels currently visible in the sidebar for the active tab."""
+        """The panels currently visible BELOW the tab strip for the
+        active tab. The Status panel itself is persistent at the top of
+        the sidebar (above the tab strip), so it's NOT included here —
+        it's drawn separately by `_layout_panels` / `draw`."""
         if self._tab_strip.active == 0:        # status
             return [
-                self._stats_panel, self._queue_panel, self._dist_panel,
+                self._queue_panel, self._dist_panel,
                 self._controls_panel, self._legend_panel,
             ]
         if self._tab_strip.active == 1:        # randomize
             return [self._randomize_panel]
-        # tab 2 — replay (replay panel on top, then status/dist for context)
-        return [
-            self._replay_panel, self._stats_panel, self._dist_panel,
-        ]
+        # tab 2 — replay
+        return [self._replay_panel, self._dist_panel]
 
     def __init__(
         self,
@@ -196,10 +198,12 @@ class Renderer:
 
         # Each side panel = generic Panel wrapping a content class. The
         # content owns per-frame state + paint logic; Panel handles chrome.
+        # Status panel is a persistent header above the tab strip; not
+        # collapsable (the user expects always-visible at-a-glance data).
         self._stats_panel = Panel(
             pygame.Rect(self._col_x, sb.top + self._sb_pad, self._panel_w, 180),
             title="STATUS", content=StatsContent(),
-            accent=MAGENTA_BRIGHT, preferred_h=180,
+            accent=MAGENTA_BRIGHT, preferred_h=180, collapsable=False,
         )
         self._queue_panel = Panel(
             pygame.Rect(self._col_x, 0, self._panel_w, 240),
@@ -259,28 +263,39 @@ class Renderer:
 
     def _layout_panels(self) -> None:
         """Re-flow side panels each frame based on collapsed state and the
-        active tab. The tab strip claims the top slot of the sidebar; the
-        active tab's panels fill the remainder, distributed by
-        `preferred_h` weight among the expanded panels."""
+        active tab.
+
+        Sidebar vertical stack (top → bottom):
+          1. Status panel (persistent — same content across all tabs)
+          2. Tab strip
+          3. Active tab's panels (distributed by `preferred_h` weight)
+        """
         sb = self._sidebar_rect
         pad = self._sb_pad
         col_x = self._col_x
         panel_w = self._panel_w
 
-        # Tab strip at the top of the sidebar (always fixed height).
-        tab_top = sb.top + pad
+        # 1. Status panel pinned at the top — same height regardless of
+        #    tab so it doesn't jump around when the user switches.
+        stats_top = sb.top + pad
+        stats_h = self._stats_panel.preferred_h
+        self._stats_panel.rect = pygame.Rect(
+            col_x, stats_top, panel_w, stats_h,
+        )
+
+        # 2. Tab strip just below the status panel.
+        tab_top = stats_top + stats_h + pad
         self._tab_strip.set_rect(pygame.Rect(
             col_x, tab_top, panel_w, TabStrip.H,
         ))
 
+        # 3. Active tab's panels fill the rest.
         panels = self.active_panels()
         if not panels:
             return
-
         panels_top = tab_top + TabStrip.H + pad
         panels_h = sb.bottom - pad - panels_top
         panels_rect = pygame.Rect(col_x, panels_top, panel_w, panels_h)
-
         heights = _resolve_panel_heights(
             panels, total_h=panels_h, gap=pad, min_expanded=60,
         )
@@ -314,6 +329,7 @@ class Renderer:
             mode=rs.mode,
             last_reward=rs.last_reward,
             n_completed=rs.n_completed,
+            total_actions=rs.total_actions,
             last_action=rs.last_action,
             querying=rs.querying,
             policy_label=rs.policy_label,
@@ -329,6 +345,8 @@ class Renderer:
         )
         self._randomize_panel.content.update(wall_now=rs.wall_now)  # type: ignore[attr-defined]
 
+        # Persistent Status panel at the top (visible on every tab).
+        self._stats_panel.draw(surface, self.fonts)
         self._tab_strip.draw(surface, self.fonts)
         for panel in self.active_panels():
             panel.draw(surface, self.fonts)
