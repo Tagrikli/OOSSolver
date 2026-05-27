@@ -175,7 +175,9 @@ class VizApp:
                 window_w=self.window_w, window_h=self.window_h, zoom=zoom,
             ),
         )
-        renderer = self._wire_renderer(Renderer(layout, topo), pending_generate=[])
+        renderer = self._wire_renderer(
+            Renderer(layout, topo, zoom=zoom), pending_generate=[],
+        )
 
         picker = PolicyPickerWidget(runs_dir=self.runs_dir)
         facility_picker = FacilityPickerWidget(active=self.facility_name)
@@ -545,7 +547,7 @@ class VizApp:
             LayoutConfig(window_w=s.window_w, window_h=s.window_h, zoom=s.zoom),
         )
         return self._wire_renderer(
-            Renderer(new_layout, s.agent.facility.topology),
+            Renderer(new_layout, s.agent.facility.topology, zoom=s.zoom),
             pending_generate=s.pending_generate, toasts=s.toasts,
         )
 

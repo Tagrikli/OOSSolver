@@ -153,17 +153,24 @@ class Renderer:
             ]
         return [self._randomize_panel]
 
-    def __init__(self, layout: Layout, topology: Topology, fonts: Fonts | None = None):
+    def __init__(
+        self,
+        layout: Layout,
+        topology: Topology,
+        fonts: Fonts | None = None,
+        zoom: float = 1.0,
+    ):
         self.layout = layout
         self.topology = topology
         self.fonts = fonts or Fonts.default()
 
         # Canvas side: FacilityCanvas owns the carrier strips, queue strip,
-        # solvability overlay, and carrier-area scroll state. We just hand
-        # it the rect derived from the Layout.
+        # solvability overlay, and carrier-area scroll state. We hand it
+        # the rect derived from the Layout AND the current zoom so its
+        # internal layout matches the outer Layout's mm→px scale.
         from oos.viz.facility_canvas import FacilityCanvas
         self._canvas = FacilityCanvas(topology, fonts=self.fonts)
-        self._canvas.relayout(pygame.Rect(*layout.canvas_rect))
+        self._canvas.relayout(pygame.Rect(*layout.canvas_rect), zoom=zoom)
 
         # Sidebar side: panel construction stays here. The sidebar is
         # UI/policy state, not sim state.
