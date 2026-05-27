@@ -165,6 +165,15 @@ class SimDriver:
         # submit advance which always shows ~0.
         if agent.last_step is not None:
             agent.last_step.reward += reward
+        # Completions that finish DURING this time-driven advance also
+        # need to count toward the running total. Without this the
+        # sidebar's "completed" counter only ever sees the (~always 0)
+        # completions from the post-submit zero-time advance and shows 0
+        # forever.
+        n_comp = len(info.get("completions", []))
+        agent.total_completions += n_comp
+        if agent.last_step is not None:
+            agent.last_step.n_completions += n_comp
         if info.get("terminated") or info.get("truncated"):
             agent.done = True
         self.emit_toasts(info)
