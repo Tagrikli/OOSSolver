@@ -11,7 +11,6 @@ from oos.sim.actions import (
     Command,
     MultiRelocate,
     Relocate,
-    Wait,
 )
 from oos.sim.durations import DurationModel
 from oos.sim.scheduler import Event, Scheduler
@@ -128,27 +127,8 @@ class Facility:
     # Public API
     # ------------------------------------------------------------------
 
-    # Re-query a WAIT-ing carrier this many sim-seconds after it picked
-    # Wait, even if no external event fires in the meantime. Without this
-    # a Wait-then-nothing-happens scenario would freeze the carrier until
-    # the next Store/Retrieve, which can be forever in manual mode.
-    WAIT_REQUERY_INTERVAL: float = 1.0
-
     def submit(self, cmd: Command) -> None:
         cmd.check_preconditions(self.state, self.topology)
-        # WAIT is event-driven: we don't lock the carrier with a busy_until.
-        # The carrier stays idle (current_command is None) but is flagged so
-        # the env's pending-idle selection skips it at this instant. The flag
-        # clears either when any external event fires (see
-        # _clear_voluntary_idle) OR after WAIT_REQUERY_INTERVAL via a
-        # dedicated wait_wakeup event scheduled here.
-        if isinstance(cmd, Wait):
-            self.state.carriers[cmd.carrier].voluntarily_idle = True
-            self.scheduler.push(
-                self.state.time + self.WAIT_REQUERY_INTERVAL,
-                "wait_wakeup", cmd.carrier,
-            )
-            return
         busy_until = cmd.start(self.state, self.topology, self.durations, self.state.time)
         giver_cs = self.state.carriers[cmd.carrier]
         giver_cs.current_command = cmd
@@ -167,16 +147,13 @@ class Facility:
         self.scheduler.push(busy_until, "command_done", cmd.carrier)
 
     def idle_carriers(self) -> list[CarrierId]:
-        """Carriers that need a decision right now.
-
-        Excludes carriers that explicitly chose WAIT (`voluntarily_idle`) —
-        those are structurally idle but should be skipped at this decision
-        instant. Their flag is cleared on the next scheduler event, after
-        which they re-enter this list.
-        """
+        """Carriers that need a decision right now — those without a
+        current_command. A carrier that just picked WAIT is "busy" with
+        its Wait command until busy_until elapses (same uniform path as
+        Relocate/MultiRelocate), so no special filtering is needed."""
         return [
             cid for cid, cs in self.state.carriers.items()
-            if cs.current_command is None and not cs.voluntarily_idle
+            if cs.current_command is None
         ]
 
     # ------------------------------------------------------------------
@@ -185,11 +162,8 @@ class Facility:
     # ------------------------------------------------------------------
 
     def enqueue_store(self, size: SizeClass) -> None:
-        """Add a Store of the given size to the queue right now and dispatch
-        immediately if any idle carrier is ready. Wakes WAIT-ing carriers so
-        they're re-queried at the next env advance."""
+        """Add a Store of the given size to the queue right now."""
         self.queue.add(Store(arrived_at=self.state.time, size=size))
-        self._wake_waiting_carriers()
         self._scan_all_for_auto_serve_rooms(self._pending_completions)
 
     def clear_queue(self) -> None:
@@ -197,32 +171,17 @@ class Facility:
         self.queue.pending.clear()
 
     def toggle_retrieve_for_pallet(self, pallet_id: PalletId) -> bool:
-        """If a pending Retrieve for this pallet exists, remove it; else add one.
-        Returns True if a Retrieve is now pending for this pallet, False otherwise.
-
-        Wakes WAIT-ing carriers in either direction — the optimal next action
-        can change whether the Retrieve was just added (now there's work) or
-        just removed (the carrier may have been heading to fetch this pallet).
-        """
+        """If a pending Retrieve for this pallet exists, remove it; else add
+        one. Returns True if a Retrieve is now pending for this pallet."""
         for t in self.queue.pending:
             if isinstance(t, Retrieve) and t.pallet == pallet_id:
                 self.queue.remove(t)
-                self._wake_waiting_carriers()
                 return False
         if not _pallet_exists(self, pallet_id):
             return False
         self.queue.add(Retrieve(arrived_at=self.state.time, pallet=pallet_id))
-        self._wake_waiting_carriers()
         self._scan_all_for_auto_serve_rooms(self._pending_completions)
         return True
-
-    def _wake_waiting_carriers(self) -> None:
-        """Clear `voluntarily_idle` on all carriers so they re-enter the
-        query rotation at the next env advance. Used by manual UI actions
-        that change the queue and want the carriers to react immediately
-        instead of waiting for a scheduler event."""
-        for cs in self.state.carriers.values():
-            cs.voluntarily_idle = False
 
     def set_auto_arrivals(self, enabled: bool) -> None:
         """Toggle the Poisson auto-arrival stream.
@@ -312,10 +271,6 @@ class Facility:
             ev = self.scheduler.pop()
             self.state.time = ev.when
             self._handle_event(ev, completions, arrivals, dropped)
-            # Any event might change a previously-waiting carrier's options.
-            # Wake them all up so the env re-queries them.
-            for cs in self.state.carriers.values():
-                cs.voluntarily_idle = False
 
             if self.idle_carriers():
                 return AdvanceResult(
@@ -352,14 +307,6 @@ class Facility:
             self._scan_all_for_auto_serve_rooms(completions)
         elif kind == "retrieve_arrival":
             self._on_retrieve_arrival(ev.payload, arrivals, completions)
-        elif kind == "wait_wakeup":
-            # Timer-driven re-query for a single WAIT-ing carrier. Clears
-            # only that carrier's voluntary-idle flag — other carriers
-            # that picked WAIT keep their own timers.
-            cid = ev.payload
-            cs = self.state.carriers.get(cid)
-            if cs is not None:
-                cs.voluntarily_idle = False
         else:
             raise RuntimeError(f"unknown event kind {kind}")
         # After every event, sweep big Stores from the queue if the facility
@@ -531,8 +478,6 @@ class Facility:
             # Instant mutation: contents → empty; id preserved.
             rs.load = Pallet(id=pallet.id, contents="empty")
             pallet = rs.load
-            for cs in self.state.carriers.values():
-                cs.voluntarily_idle = False
             # Fall through to Store check — the post-Retrieve empty pallet
             # is exactly the condition that should trigger a pending Store
             # at this room. Without falling through, a Retrieve completion
@@ -550,8 +495,6 @@ class Facility:
             completions.append(TaskCompletion(task=store, cost=cost))
             # Instant mutation: contents → store.size; id preserved.
             rs.load = Pallet(id=pallet.id, contents=store.size)
-            for cs in self.state.carriers.values():
-                cs.voluntarily_idle = False
             # Schedule the eventual retrieve for this newly-filled pallet so
             # the produced item gets requested back later (only matters when
             # auto-arrivals are enabled).

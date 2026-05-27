@@ -129,7 +129,6 @@ def _place_pallets(
         cs.busy_until = None
         cs.command_started_at = None
         cs.command_start_position = None
-        cs.voluntarily_idle = False
         cs.last_take_shelf = None
         cs.last_give_shelf = None
         cs.must_relocate_from = None

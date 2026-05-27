@@ -221,7 +221,6 @@ class OOSEnv(gym.Env):
         ctx.pending_idle = [
             c for c in ctx.pending_idle
             if facility.state.carriers[c].is_idle
-            and not facility.state.carriers[c].voluntarily_idle
         ]
         if ctx.pending_idle:
             ctx.querying_carrier = ctx.pending_idle.pop(0)
@@ -411,7 +410,7 @@ class OOSEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _fresh_pending_idle(self, facility: Facility) -> list[CarrierId]:
-        # facility.idle_carriers() already filters out voluntarily_idle (WAIT).
+        # facility.idle_carriers() returns only carriers with no current_command.
         return sorted(facility.idle_carriers())
 
     def _fresh_decoder(self, facility: Facility) -> ActionDecoder:

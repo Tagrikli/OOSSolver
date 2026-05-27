@@ -490,10 +490,17 @@ class MultiRelocate(Command):
 
 @dataclass(frozen=True)
 class Wait(Command):
-    """Voluntary idle. Carrier is marked `voluntarily_idle=True` and skipped
-    until any scheduler event fires; then re-queried."""
+    """Voluntary idle for `duration` sim-seconds.
+
+    Treated by the engine exactly like Relocate/MultiRelocate: occupies
+    `current_command` + `busy_until` for the duration, fires a normal
+    `command_done` event when finished. The carrier becomes idle and
+    is re-queried by the env. No special-case flags — uniform with
+    every other Command.
+    """
 
     carrier_id: CarrierId
+    duration: float = 1.0   # sim-seconds before the carrier is re-queried
 
     @property
     def carrier(self) -> CarrierId:
@@ -507,7 +514,8 @@ class Wait(Command):
     def start(
         self, state: FacilityState, topo: Topology, durations, now: SimTime
     ) -> SimTime:
-        return now  # placeholder; Facility.submit handles Wait specially.
+        # Same contract as other commands: return busy_until.
+        return now + float(self.duration)
 
     def complete(self, state: FacilityState, topo: Topology) -> None:
         pass

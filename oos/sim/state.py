@@ -51,11 +51,6 @@ class CarrierState:
     command_started_at: Optional[SimTime] = None
     command_start_position: Optional[Position] = None
     current_command: Optional["object"] = None  # Command; avoid import cycle
-    # The policy explicitly chose WAIT — the carrier is structurally idle
-    # (current_command is None) but should be skipped when the env asks
-    # "who needs a decision at this instant?". Cleared whenever any
-    # scheduler event fires, so the carrier is re-queried on world change.
-    voluntarily_idle: bool = False
     # Last shelf this carrier took from / gave to, used to mask out
     # immediate-undo cycles in `enumerate_actions`:
     #   - GIVE back to last_take_shelf  → blocked (undoes the take)
