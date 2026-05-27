@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from oos.sim.actions import MultiRelocate, Relocate
+from oos.sim.actions import MultiRelocate, Relocate, Wait
 from oos.sim.facility import Facility
 from oos.sim.state import Pallet
 from oos.sim.tasks import Retrieve, TaskQueue
@@ -272,8 +272,19 @@ def build_observation(
             carrier_features[i, 3] = 1.0
         else:
             carrier_features[i, 4] = 1.0
-        carrier_features[i, 5] = 0.0 if cs.is_idle else 1.0
-        if cs.busy_until is not None:
+        # Wait is observationally treated as idle. It's a no-op the
+        # carrier opted into; it wakes early on external state changes
+        # (`Facility.wake_waiting_carriers`) and after at most
+        # `Wait.duration`. Surfacing it as "busy with ETA" makes the
+        # policy's output depend on whether another carrier happened to
+        # pick WAIT — bad for a deterministic policy. Equivalent to
+        # pre-unification semantics where WAIT carriers looked idle.
+        is_busy_cmd = (
+            cs.current_command is not None
+            and not isinstance(cs.current_command, Wait)
+        )
+        carrier_features[i, 5] = 1.0 if is_busy_cmd else 0.0
+        if is_busy_cmd and cs.busy_until is not None:
             eta = max(0.0, cs.busy_until - state.time)
             carrier_features[i, 6] = min(1.0, eta / cfg.horizon_seconds)
         carrier_features[i, 7] = 1.0 if cid == querying_carrier else 0.0
