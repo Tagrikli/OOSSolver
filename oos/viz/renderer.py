@@ -42,6 +42,7 @@ from oos.viz.sidebar import (
     LegendContent,
     QueueContent,
     RandomizeContent,
+    ReplayContent,
     StatsContent,
 )
 
@@ -137,6 +138,14 @@ class Renderer:
         return self._randomize_panel.content  # type: ignore[return-value]
 
     @property
+    def replay_panel(self) -> Panel:
+        return self._replay_panel
+
+    @property
+    def replay_content(self) -> ReplayContent:
+        return self._replay_panel.content  # type: ignore[return-value]
+
+    @property
     def tab_strip(self) -> TabStrip:
         return self._tab_strip
 
@@ -146,12 +155,17 @@ class Renderer:
 
     def active_panels(self) -> list[Panel]:
         """The panels currently visible in the sidebar for the active tab."""
-        if self._tab_strip.active == 0:
+        if self._tab_strip.active == 0:        # status
             return [
                 self._stats_panel, self._queue_panel, self._dist_panel,
                 self._controls_panel, self._legend_panel,
             ]
-        return [self._randomize_panel]
+        if self._tab_strip.active == 1:        # randomize
+            return [self._randomize_panel]
+        # tab 2 — replay (replay panel on top, then status/dist for context)
+        return [
+            self._replay_panel, self._stats_panel, self._dist_panel,
+        ]
 
     def __init__(
         self,
@@ -212,8 +226,14 @@ class Renderer:
             title="Random initial state", content=RandomizeContent(),
             accent=MAGENTA_BRIGHT, preferred_h=400, collapsable=False,
         )
+        self._replay_panel = Panel(
+            pygame.Rect(self._col_x, 0, self._panel_w, 220),
+            title="Training Replay", content=ReplayContent(),
+            accent=YELLOW_BRIGHT, preferred_h=220, collapsable=False,
+        )
         self._tab_strip = TabStrip(
-            labels=["status", "randomize"], active=0, accent=MAGENTA_BRIGHT,
+            labels=["status", "randomize", "replay"],
+            active=0, accent=MAGENTA_BRIGHT,
         )
 
     # ---- canvas forwarders -----------------------------------------------

@@ -172,6 +172,127 @@ def generate_single_task(
     return True
 
 
+def load_run_config(
+    cfg: dict,
+    agent: Agent,
+    toasts: ToastManager,
+    facility_override: Optional[str] = None,
+) -> bool:
+    """Replace `agent.facility` with one built from a saved
+    `runs/<name>/config.json`. Returns True on success.
+
+    The config dict's `facility` field decides the topology unless
+    `facility_override` is passed (e.g. for "run this config's sampling
+    distribution but on a different topology"). Currently supports
+    SingleTaskEnv configs (those with `bring_empty_prob` +
+    `target_depths`); plain `OOSEnv` / `EpisodeEnv` configs are accepted
+    too but fall back to a default plain env.
+    """
+    from oos.config.schema import EpisodeConfig as ExpEpisodeConfig
+    from oos.config.schema import ExperimentConfig, TaskStreamConfig
+    from oos.env.env import OOSEnv
+    from oos.facilities import get_facility
+    from oos.learn.single_task_env import (
+        SingleTaskConfig,
+        SingleTaskEnv,
+        SingleTaskRewardConfig,
+    )
+
+    facility_name = facility_override or cfg.get("facility")
+    if facility_name is None:
+        toasts.error("config has no 'facility' field")
+        return False
+    try:
+        factory = get_facility(facility_name)
+    except ValueError as e:
+        toasts.error(f"unknown facility: {e}"[:80])
+        return False
+
+    preserve_auto = agent.facility.auto_arrivals_enabled
+
+    is_single_task = (
+        "bring_empty_prob" in cfg and "target_depths" in cfg
+    )
+    if is_single_task:
+        try:
+            depths = tuple(int(d) for d in cfg["target_depths"])
+            if not depths:
+                raise ValueError("target_depths is empty")
+            raw_probs = cfg.get(
+                "room_state_probs", (1.0 / 3, 1.0 / 3, 1.0 / 3),
+            )
+            if len(raw_probs) != 3:
+                raise ValueError(
+                    f"room_state_probs must have 3 entries, got {len(raw_probs)}"
+                )
+            room_probs: tuple[float, float, float] = (
+                float(raw_probs[0]), float(raw_probs[1]), float(raw_probs[2]),
+            )
+            task_cfg = SingleTaskConfig(
+                bring_empty_prob=float(cfg.get("bring_empty_prob", 0.0)),
+                big_ratio_range=(
+                    float(cfg.get("big_ratio_low", 0.0)),
+                    float(cfg.get("big_ratio_high", 0.0)),
+                ),
+                small_ratio_range=(
+                    float(cfg.get("small_ratio_low", 0.0)),
+                    float(cfg.get("small_ratio_high", 0.0)),
+                ),
+                target_depth_choices=depths,
+                room_state_probs=room_probs,
+            )
+            reward_cfg = SingleTaskRewardConfig(
+                reward_success=float(cfg.get("reward_success", 4.0)),
+                penalty_wrong_item_to_room=float(
+                    cfg.get("penalty_wrong_item_to_room", 0.5),
+                ),
+                penalty_idle_with_retrieve=float(
+                    cfg.get("penalty_idle_with_retrieve", 0.0),
+                ),
+                movement_weight=float(cfg.get("movement_weight", 0.0)),
+                time_weight=float(cfg.get("time_weight", 0.0)),
+            )
+            experiment_cfg = ExperimentConfig(
+                task_stream=TaskStreamConfig(store_rate=0.0),
+                episode=ExpEpisodeConfig(
+                    max_sim_time=float(cfg.get("max_sim_time", 1200.0)),
+                    max_steps=int(cfg.get("max_episode_steps", 200)),
+                ),
+            )
+        except (KeyError, ValueError, TypeError) as e:
+            toasts.error(f"CONFIG ERROR: {type(e).__name__}: {e}"[:80])
+            return False
+        new_env = SingleTaskEnv(
+            facility_factory=factory,
+            task_config=task_cfg,
+            reward_config=reward_cfg,
+            experiment_config=experiment_cfg,
+        )
+        kind = "SingleTask"
+    else:
+        # Fallback: plain OOSEnv with defaults — useful if a non-
+        # single-task config is picked.
+        new_env = OOSEnv(facility_factory=factory)
+        kind = "OOSEnv"
+
+    agent.facility = Facility(new_env)
+    # Reset the policy: an existing LearnedPolicy's collator is bound to
+    # the *old* topology, so re-running it after a facility swap raises
+    # KeyError on shelves it's never seen. Drop to random; the user
+    # re-loads via the 'p' picker if they want a learned policy on the
+    # new topology.
+    agent.policy = random_policy
+    # Fresh seed so each episode samples differently.
+    import secrets
+    agent.seed = secrets.randbits(31)
+    agent.reset()
+    agent.facility.set_auto_arrivals(preserve_auto)
+    toasts.success(
+        f"CONFIG → {kind} on {facility_name}", lifetime=3.5,
+    )
+    return True
+
+
 def swap_facility(
     name: str,
     agent: Agent,

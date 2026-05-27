@@ -39,10 +39,15 @@ from oos.viz.manual_controls import (
     push_empty_pallet,
     set_pallet_contents,
 )
-from oos.viz.pickers import FacilityPickerWidget, PolicyPickerWidget
+from oos.viz.pickers import (
+    FacilityPickerWidget,
+    PolicyPickerWidget,
+    RunConfigPickerWidget,
+)
 from oos.viz.policy_swap import (
     generate_single_task,
     load_policy,
+    load_run_config,
     rewrap_with_mcts,
     swap_facility,
 )
@@ -80,6 +85,7 @@ class _RunState:
     toasts: ToastManager
     picker: PolicyPickerWidget
     facility_picker: FacilityPickerWidget
+    run_config_picker: RunConfigPickerWidget
     wall_now_fn: callable  # type: ignore[type-arg]
 
     # Sim
@@ -102,6 +108,18 @@ class _RunState:
 
     # Queues
     pending_generate: list = field(default_factory=list)
+
+    # Training Replay tab state. `replay_cfg_*` fields are populated when
+    # the user picks a config from the RunConfigPicker; episode counters
+    # tick over as the agent terminates and auto-advances.
+    replay_active: bool = False
+    replay_cfg_name: str = "(none)"
+    replay_cfg_facility: str = "?"
+    replay_cfg_kind: str = "?"
+    replay_n_episodes: int = 0
+    replay_n_success: int = 0
+    replay_last_task: str = "—"
+    replay_last_return: float = 0.0
 
     @property
     def facility(self) -> Facility:
@@ -181,6 +199,7 @@ class VizApp:
 
         picker = PolicyPickerWidget(runs_dir=self.runs_dir)
         facility_picker = FacilityPickerWidget(active=self.facility_name)
+        run_config_picker = RunConfigPickerWidget(runs_dir=self.runs_dir)
 
         wall_start = time.monotonic()
         def wall_now() -> float:
@@ -217,6 +236,7 @@ class VizApp:
             toasts=toasts,
             picker=picker,
             facility_picker=facility_picker,
+            run_config_picker=run_config_picker,
             wall_now_fn=wall_now,
             anim_time=facility.sim_time,
             original_env=facility.env,
@@ -231,9 +251,19 @@ class VizApp:
         )
         # Now that state exists, re-wire the renderer's Generate callback
         # to point at state.pending_generate (vs the throwaway list above).
+        # Also wire the Replay panel's buttons.
         self._wire_renderer(renderer, pending_generate=state.pending_generate,
                             toasts=toasts)
+        self._wire_replay_panel(renderer, state)
         return state
+
+    def _wire_replay_panel(self, renderer: Renderer, state: _RunState) -> None:
+        """Hook ReplayContent's buttons. LOAD opens the run-config picker;
+        NEW EPISODE force-resets the current replay env to sample a fresh
+        scenario."""
+        rc = renderer.replay_content
+        rc.on_open_picker = lambda: state.run_config_picker.toggle()
+        rc.on_new_episode = lambda: self._next_replay_episode(state)
 
     # ─────────────────────────────────────────────────────────────────────
     # Per-frame work
@@ -259,8 +289,30 @@ class VizApp:
         if s.mode == "step":
             s.anim_time = s.agent.facility.sim_time
         s.toasts.tick()
+        # Replay mode: when an episode finishes, optionally roll into the
+        # next one immediately. The agent's `done` flag is set by the
+        # underlying env's terminated/truncated.
+        if (
+            s.replay_active
+            and s.agent.done
+            and s.renderer.replay_content.auto_advance
+        ):
+            self._next_replay_episode(s)
+        s.toasts.tick()  # tick once more so any toasts from the auto-advance
+                         # show up on the same frame
 
     def _render(self, s: _RunState) -> None:
+        # Push replay-tab state into the panel before the renderer draws.
+        s.renderer.replay_content.update(
+            cfg_name=s.replay_cfg_name,
+            cfg_facility=s.replay_cfg_facility,
+            cfg_kind=s.replay_cfg_kind,
+            n_episodes=s.replay_n_episodes,
+            n_success=s.replay_n_success,
+            last_task=s.replay_last_task,
+            last_return=s.replay_last_return,
+            agent_done=s.agent.done,
+        )
         rs = self._build_render_state(s)
         s.renderer.draw(
             s.surface, s.agent.facility, s.agent.facility.queue, rs,
@@ -272,6 +324,74 @@ class VizApp:
             )
         s.picker.draw(s.surface, s.renderer.fonts, s.active_policy_label)
         s.facility_picker.draw(s.surface, s.renderer.fonts)
+        s.run_config_picker.draw(s.surface, s.renderer.fonts)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Replay-mode helpers
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _next_replay_episode(self, s: _RunState) -> None:
+        """Roll the replay env forward into the next episode.
+
+        Bumps the episode counter, attributes the previous episode's
+        success/return, gives the agent a fresh seed, and resets. Only
+        meaningful when `replay_active` is True (a config has been
+        loaded); otherwise emits a toast and bails."""
+        if not s.replay_active:
+            s.toasts.warn(
+                "No replay config loaded — open with 'c' / LOAD CONFIG…",
+                lifetime=3.0,
+            )
+            return
+        # Attribute the finished episode (if any).
+        if s.agent.last_step is not None:
+            s.replay_n_episodes += 1
+            if s.agent.last_step.terminated:
+                s.replay_n_success += 1
+            # SingleTaskEnv populates info["task"] only via its
+            # gym-shaped .step(); the viz uses submit+advance directly
+            # and bypasses that. Read the live attribute as the source
+            # of truth.
+            env = s.agent.facility.env
+            task = getattr(env, "_task", None) or s.agent.info.get("task")
+            if task:
+                s.replay_last_task = str(task)
+            s.replay_last_return = float(s.agent.total_reward)
+        # Fresh sampling → fresh seed.
+        import secrets
+        s.agent.seed = secrets.randbits(31)
+        s.agent.reset()
+        s.anim_time = s.agent.facility.sim_time
+        s.toasts.accent(
+            f"episode {s.replay_n_episodes + 1} · task={s.agent.info.get('task', '?')}",
+            lifetime=2.5,
+        )
+
+    def _load_replay_config(self, s: _RunState) -> None:
+        """Pull the selected config from the run-config picker, build a
+        fresh env from it via load_run_config, reset all replay counters,
+        and mark the replay mode active."""
+        entry = s.run_config_picker.selected_entry()
+        cfg = s.run_config_picker.selected_config()
+        if entry is None or cfg is None:
+            s.toasts.error("could not load selected config")
+            return
+        ok = load_run_config(cfg, s.agent, s.toasts)
+        if not ok:
+            return
+        s.replay_active = True
+        s.replay_cfg_name = entry.name
+        s.replay_cfg_facility = entry.facility
+        s.replay_cfg_kind = entry.env_kind
+        s.replay_n_episodes = 0
+        s.replay_n_success = 0
+        s.replay_last_task = "—"
+        s.replay_last_return = 0.0
+        s.anim_time = s.agent.facility.sim_time
+        s.run_config_picker.active_path = entry.path
+        # Auto-pause so the user sees the initial state before any
+        # actions fire.
+        s.paused = True
 
     # ─────────────────────────────────────────────────────────────────────
     # Event dispatch — one method per pygame event type
@@ -309,6 +429,9 @@ class VizApp:
             return
         if s.facility_picker.open:
             s.facility_picker.handle_wheel(event.y)
+            return
+        if s.run_config_picker.open:
+            s.run_config_picker.handle_wheel(event.y)
             return
 
         mouse_pos = pygame.mouse.get_pos()
@@ -376,6 +499,14 @@ class VizApp:
         ):
             s.renderer.randomize_content.handle_mouse_down(pos)
             return
+        # Replay tab: LOAD CONFIG… + NEW EPISODE buttons + auto-advance
+        # checkbox.
+        if (
+            s.renderer.active_tab == 2
+            and s.renderer.replay_panel.hit_test(pos)
+            and s.renderer.replay_content.handle_mouse_down(pos)
+        ):
+            return
         # Panel header clicks toggle collapse.
         if self._handle_panel_collapse(s.renderer, pos):
             return
@@ -420,6 +551,9 @@ class VizApp:
         if s.picker.open:
             self._on_keydown_policy_picker(s, event)
             return
+        if s.run_config_picker.open:
+            self._on_keydown_run_config_picker(s, event)
+            return
 
         # Top-level sim controls.
         if event.key in (pygame.K_q, pygame.K_ESCAPE):
@@ -430,6 +564,8 @@ class VizApp:
             s.picker.toggle()
         elif event.key == pygame.K_f:
             s.facility_picker.toggle()
+        elif event.key == pygame.K_c:
+            s.run_config_picker.toggle()
         elif event.key == pygame.K_n:
             s.mode = "step" if s.mode == "anim" else "anim"
             if s.mode == "anim":
@@ -515,6 +651,17 @@ class VizApp:
                     s.active_policy_label = label
                     save_viz_state(self.runs_dir, policy_path=entry.path)
             s.picker.close()
+
+    def _on_keydown_run_config_picker(
+        self, s: _RunState, event: pygame.event.Event,
+    ) -> None:
+        action = s.run_config_picker.handle_key(event)
+        if action == "submit":
+            self._load_replay_config(s)
+            s.run_config_picker.close()
+            # Switch to the Replay tab so the user lands on the panel
+            # that shows the loaded config's stats.
+            s.renderer.tab_strip.active = 2
 
     def _reset_env(self, s: _RunState) -> None:
         """R-key handler. If we're on a Generate-spawned SingleTaskEnv,
