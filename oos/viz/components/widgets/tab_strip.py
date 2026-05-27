@@ -1,11 +1,9 @@
-"""TabStrip — horizontal row of beveled tabs with one active.
+"""TabStrip — minimal text-only tabs with an underline indicator.
 
-Visual: each tab is a beveled polygon (top-right cut, indigoshell signature)
-sitting on a faint base strip. Active tab is filled with the magenta-dim
-fill used by panel headers + outlined in the accent color with a soft
-glow; inactive tabs are muted with a cyan-dim outline. Active tab's label
-is rendered in yellow-bright (matches panel titles); inactive labels in
-the muted text color.
+Not a row of buttons — the active tab is just text in the accent color
+with a thick accent underline (3 px). Inactive tabs are muted text with
+no underline. A faint baseline runs the full width below all tabs so the
+group reads as a tabset, not a set of buttons.
 
 State: list of labels + an `active` index. `set_rect()` lays out the row
 inside an outer rect. `hit_test(pos)` returns the clicked tab index
@@ -19,25 +17,20 @@ from typing import Optional
 import pygame
 
 from oos.viz.components.palette import (
-    BASE_GUTTER,
     BASE_MUTED,
     CYAN_DIM,
     MAGENTA_BRIGHT,
-    MAGENTA_DIM,
     YELLOW_BRIGHT,
     Fonts,
     blit_text,
 )
-from oos.viz.components.primitives import (
-    draw_beveled_frame,
-    draw_beveled_rect,
-)
 
 
 class TabStrip:
-    H = 28
-    GAP = 4
-    BEVEL = 8
+    H = 26
+    GAP = 18           # space between tabs (no boxes, so we need real gap)
+    UNDERLINE_H = 3    # active-tab underline thickness
+    BASELINE_OFFSET = 1  # gap between underline and the faint baseline
 
     def __init__(self, labels: list[str], active: int = 0,
                  accent: tuple[int, int, int] = MAGENTA_BRIGHT):
@@ -55,14 +48,17 @@ class TabStrip:
         if n == 0:
             self._tab_rects = []
             return
-        avail = rect.width - self.GAP * (n - 1)
-        w = max(1, avail // n)
+        # Each tab's hit-rect is left-aligned in a fair share of the row.
+        # We use the full share for hit-testing (generous click target) but
+        # draw the label + underline left-anchored inside it.
+        avail = rect.width
+        share = max(1, avail // n)
         x = rect.left
         self._tab_rects = []
         for i in range(n):
-            this_w = (rect.right - x) if i == n - 1 else w
+            this_w = (rect.right - x) if i == n - 1 else share
             self._tab_rects.append(pygame.Rect(x, rect.top, this_w, rect.height))
-            x += this_w + self.GAP
+            x += this_w
 
     @property
     def rect(self) -> pygame.Rect:
@@ -77,28 +73,35 @@ class TabStrip:
     # ---- drawing -----------------------------------------------------------
 
     def draw(self, surface: pygame.Surface, fonts: Fonts) -> None:
+        if not self._tab_rects:
+            return
+        font = fonts.head
+        # Faint baseline under the whole strip.
+        baseline_y = self._rect.bottom - 1
+        pygame.draw.line(
+            surface, CYAN_DIM,
+            (self._rect.left, baseline_y),
+            (self._rect.right, baseline_y), 1,
+        )
+
         for i, r in enumerate(self._tab_rects):
             is_active = (i == self.active)
+            label = self.labels[i].upper()
+            label_color = YELLOW_BRIGHT if is_active else BASE_MUTED
+            # Anchor the label slightly above the underline so they don't
+            # collide.
+            text_h = font.get_height()
+            text_y = r.top + (r.height - self.UNDERLINE_H - text_h) // 2
+            # Left-anchored — text starts at a small pad inside the share.
+            text_x = r.left + 6
+            blit_text(surface, label, (text_x, text_y), font, label_color)
+
             if is_active:
-                # Active: magenta-dim fill (matches panel header polygon)
-                # + accent outline with soft glow + yellow bracketed label.
-                draw_beveled_rect(
-                    surface, r, MAGENTA_DIM, bevel=self.BEVEL, alpha=235,
+                # Accent underline aligned to the text width, breaking the
+                # baseline beneath it.
+                text_w, _ = font.size(label)
+                underline_y = r.bottom - self.UNDERLINE_H
+                pygame.draw.rect(
+                    surface, self.accent,
+                    pygame.Rect(text_x, underline_y, text_w, self.UNDERLINE_H),
                 )
-                draw_beveled_frame(
-                    surface, r, self.accent,
-                    bevel=self.BEVEL, width=1, glow=True,
-                )
-                label_color = YELLOW_BRIGHT
-                bracket = "▸"
-            else:
-                draw_beveled_rect(
-                    surface, r, BASE_GUTTER, bevel=self.BEVEL, alpha=200,
-                )
-                draw_beveled_frame(
-                    surface, r, CYAN_DIM, bevel=self.BEVEL, width=1,
-                )
-                label_color = BASE_MUTED
-                bracket = " "
-            text = f"{bracket} {self.labels[i].upper()}"
-            blit_text(surface, text, r.center, fonts.head, label_color, center=True)

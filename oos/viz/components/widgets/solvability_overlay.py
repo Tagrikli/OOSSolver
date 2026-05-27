@@ -1,14 +1,7 @@
-"""SolvabilityOverlay — small canvas-anchored status panel.
+"""SolvabilityOverlay — minimal canvas-anchored status text.
 
-Visual: a beveled mini-panel (signature 45° cuts) showing the layout's
-current retrievability state as a bright pass/fail token.
-
-Layout:
-    [ RETRIEVABLE  ●  YES ]      ← lime dot + lime label when solvable
-    [ RETRIEVABLE  ●  NO  ]      ← red dot + red label when not
-
-Positioning is up to the caller (`set_rect`). Renderer pins it to the
-bottom-right of the canvas, just outside the carrier-strip clip region.
+Just a small "retr ● yes/no" line — no background, no bevels, no glow.
+Sits in the bottom-right of the canvas, deliberately subtle.
 """
 
 from __future__ import annotations
@@ -17,27 +10,16 @@ import pygame
 
 from oos.viz.components.palette import (
     BASE_MUTED,
-    BASE_SHADOW,
-    CYAN_DIM,
     ERROR,
     LIME_BRIGHT,
     Fonts,
-    YELLOW_BRIGHT,
-    blit_text,
-)
-from oos.viz.components.primitives import (
-    draw_beveled_frame,
-    draw_beveled_rect,
-    draw_bracketed_title,
-    draw_glow_circle,
 )
 
 
 class SolvabilityOverlay:
-    W = 196
-    H = 46
-    BEVEL = 8
-    PAD = 8
+    W = 110          # tight footprint — just text + dot
+    H = 16
+    DOT_R = 3
 
     def __init__(self):
         self._rect = pygame.Rect(0, 0, self.W, self.H)
@@ -54,39 +36,21 @@ class SolvabilityOverlay:
         self._solvable = bool(solvable)
 
     def draw(self, surface: pygame.Surface, fonts: Fonts) -> None:
-        # Beveled background with state-tinted outline + glow.
-        draw_beveled_rect(
-            surface, self._rect, BASE_SHADOW, bevel=self.BEVEL, alpha=235,
-        )
         accent = LIME_BRIGHT if self._solvable else ERROR
-        draw_beveled_frame(
-            surface, self._rect, accent,
-            bevel=self.BEVEL, width=1, glow=True,
-        )
+        token = "yes" if self._solvable else "no"
+        right = self._rect.right
+        y_mid = self._rect.centery
 
-        # Bracketed title on the left ("[ RETRIEVABLE ]" style — matches
-        # panel headers).
-        title_y = self._rect.centery - fonts.head.get_height() // 2
-        draw_bracketed_title(
-            surface, "RETR", (self._rect.left + self.PAD, title_y),
-            fonts.head, title_color=YELLOW_BRIGHT, bracket_color=CYAN_DIM,
-        )
+        # Right-most: yes/no in accent.
+        token_surf = fonts.tiny.render(token, True, accent)
+        token_x = right - token_surf.get_width()
+        surface.blit(token_surf, (token_x, y_mid - token_surf.get_height() // 2))
 
-        # Status token: glowing dot + Y/N label, right-anchored.
-        token_text = "YES" if self._solvable else "NO"
-        dot_cx = self._rect.right - self.PAD - 36
-        draw_glow_circle(
-            surface, (dot_cx, self._rect.centery), 4, accent,
-            layers=6, spread=4, base_alpha=110,
-        )
-        pygame.draw.circle(
-            surface, accent, (dot_cx, self._rect.centery), 4,
-        )
-        blit_text(
-            surface, token_text,
-            (self._rect.right - self.PAD, self._rect.centery),
-            fonts.head, accent, anchor="midright",
-        )
+        # Then a small accent dot.
+        dot_x = token_x - 8
+        pygame.draw.circle(surface, accent, (dot_x, y_mid), self.DOT_R)
 
-        # Subtle muted "?" wouldn't read here — leave as-is for clarity.
-        _ = BASE_MUTED
+        # Left-most: "retr" label, muted.
+        label_surf = fonts.tiny.render("retr", True, BASE_MUTED)
+        label_x = dot_x - self.DOT_R - 6 - label_surf.get_width()
+        surface.blit(label_surf, (label_x, y_mid - label_surf.get_height() // 2))

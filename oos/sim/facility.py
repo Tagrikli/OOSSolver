@@ -128,14 +128,26 @@ class Facility:
     # Public API
     # ------------------------------------------------------------------
 
+    # Re-query a WAIT-ing carrier this many sim-seconds after it picked
+    # Wait, even if no external event fires in the meantime. Without this
+    # a Wait-then-nothing-happens scenario would freeze the carrier until
+    # the next Store/Retrieve, which can be forever in manual mode.
+    WAIT_REQUERY_INTERVAL: float = 1.0
+
     def submit(self, cmd: Command) -> None:
         cmd.check_preconditions(self.state, self.topology)
-        # WAIT is event-driven: we don't lock the carrier or schedule a wakeup.
+        # WAIT is event-driven: we don't lock the carrier with a busy_until.
         # The carrier stays idle (current_command is None) but is flagged so
         # the env's pending-idle selection skips it at this instant. The flag
-        # clears when any scheduler event fires (see _clear_voluntary_idle).
+        # clears either when any external event fires (see
+        # _clear_voluntary_idle) OR after WAIT_REQUERY_INTERVAL via a
+        # dedicated wait_wakeup event scheduled here.
         if isinstance(cmd, Wait):
             self.state.carriers[cmd.carrier].voluntarily_idle = True
+            self.scheduler.push(
+                self.state.time + self.WAIT_REQUERY_INTERVAL,
+                "wait_wakeup", cmd.carrier,
+            )
             return
         busy_until = cmd.start(self.state, self.topology, self.durations, self.state.time)
         giver_cs = self.state.carriers[cmd.carrier]
@@ -340,6 +352,14 @@ class Facility:
             self._scan_all_for_auto_serve_rooms(completions)
         elif kind == "retrieve_arrival":
             self._on_retrieve_arrival(ev.payload, arrivals, completions)
+        elif kind == "wait_wakeup":
+            # Timer-driven re-query for a single WAIT-ing carrier. Clears
+            # only that carrier's voluntary-idle flag — other carriers
+            # that picked WAIT keep their own timers.
+            cid = ev.payload
+            cs = self.state.carriers.get(cid)
+            if cs is not None:
+                cs.voluntarily_idle = False
         else:
             raise RuntimeError(f"unknown event kind {kind}")
         # After every event, sweep big Stores from the queue if the facility

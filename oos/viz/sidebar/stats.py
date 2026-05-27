@@ -42,7 +42,7 @@ class StatsContent:
             ("facility",  facility_name or "—",  CYAN_BRIGHT),
             ("policy",    policy_short,          VIOLET_BRIGHT),
             ("mode",      mode,                  CYAN_BRIGHT),
-            ("sim time",  f"{sim_time:8.2f}",    YELLOW_BRIGHT),
+            ("sim time",  f"{sim_time:.2f}",     YELLOW_BRIGHT),
             ("speed",     f"{wall_speed:.1f}x",  VIOLET_BRIGHT),
             ("querying",  querying,              MAGENTA_BRIGHT),
             ("last act",  last_action,           CYAN_MID),

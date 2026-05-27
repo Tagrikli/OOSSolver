@@ -299,24 +299,39 @@ class SingleTaskEnv(OOSEnv):
                 success = True
 
         # Reward from scratch — base class's compute_reward produced 0
-        # because we passed it an all-zero RewardConfig.
+        # because we passed it an all-zero RewardConfig. We replace its
+        # info["reward_events"] with our own (label, amount) list so the
+        # viz toasts the actual signed contributions.
+        from oos.env.reward import RewardEvent
         rcfg = self._task_reward_cfg
-        r = -rcfg.movement_weight * info.get("movement_distance", 0.0)
+        events: list[RewardEvent] = []
+
+        move_dist = float(info.get("movement_distance", 0.0))
+        if move_dist > 0 and rcfg.movement_weight > 0:
+            events.append(RewardEvent(
+                "MOVE", -rcfg.movement_weight * move_dist,
+            ))
         n_wrong = int(info.get("n_wrong_item_events", 0))
         if n_wrong > 0:
-            r -= rcfg.penalty_wrong_item_to_room * n_wrong
+            events.append(RewardEvent(
+                "WRONG", -rcfg.penalty_wrong_item_to_room * n_wrong,
+            ))
         if info.get("idle_with_retrieve", False):
-            r -= rcfg.penalty_idle_with_retrieve
+            events.append(RewardEvent("IDLE", -rcfg.penalty_idle_with_retrieve))
         if success:
-            r += rcfg.reward_success
+            events.append(RewardEvent("SUCCESS", rcfg.reward_success))
             terminated = True
             self._success = True
         else:
-            # Time penalty only on non-success steps. A success step's
-            # dt can be huge (a WAIT that skips ahead until end of horizon)
+            # Time penalty only on non-success steps. A success step's dt
+            # can be huge (a WAIT that skips ahead until end of horizon)
             # and would otherwise swamp `reward_success`.
-            if rcfg.time_weight > 0:
-                r -= rcfg.time_weight * float(info.get("dt", 0.0))
+            dt = float(info.get("dt", 0.0))
+            if rcfg.time_weight > 0 and dt > 0:
+                events.append(RewardEvent("TIME", -rcfg.time_weight * dt))
+
+        r = float(sum(e.amount for e in events))
+        info["reward_events"] = events
 
         self._populate_task_info(info)
         return obs, float(r), terminated, truncated, info

@@ -378,7 +378,7 @@ class OOSEnv(gym.Env):
         )
         idle_with_retrieve = retrieve_pending and no_carrier_working
 
-        reward = compute_reward(
+        reward, reward_events = compute_reward(
             cfg=self._reward_cfg,
             completions=completions,
             movement_distance=movement_distance,
@@ -402,6 +402,7 @@ class OOSEnv(gym.Env):
         info["n_unstage_events"] = n_unstage_events
         info["n_wrong_item_events"] = n_wrong_item_events
         info["idle_with_retrieve"] = idle_with_retrieve
+        info["reward_events"] = reward_events
         info["movement_distance"] = float(movement_distance)
         return obs, float(reward), terminated, truncated, info
 

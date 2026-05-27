@@ -20,10 +20,10 @@ uv run python -m oos.learn.train_single_task \
     --total-iterations 500 \
     --steps-per-iter 1024 \
     --max-episode-steps 200 \
-    --bring-empty-prob 0.2 \
+    --bring-empty-prob 0.0 \
     --big-ratio-low 0.0 --big-ratio-high 1.0 \
     --small-ratio-low 0.0 --small-ratio-high 1.0 \
-    --target-depths 0,1,2 \
+    --target-depths 2 \
     --room-state-probs 0.5 0.5 0.5 \
     --reward-success 10.0 \
     --penalty-wrong-item-to-room 2.0 \

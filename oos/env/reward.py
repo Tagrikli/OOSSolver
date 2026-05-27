@@ -1,6 +1,12 @@
 """Reward computation for the OOS env.
 
-Five terms, all event-driven:
+Single source of truth for reward attribution. `compute_reward` returns
+both the scalar total and a list of `RewardEvent`s — `(label, amount)`
+tuples — that name each contributing term. The env stuffs the list into
+`info["reward_events"]` so the viz toasts the *actual* signed amounts
+instead of hardcoded "+STAGE" strings.
+
+Six terms, all event-driven:
 
   reward_retrieve         paid per Retrieve TaskCompletion (target pallet
                           delivered to a room).
@@ -13,19 +19,10 @@ Five terms, all event-driven:
                           (anti-farming).
   penalty_wrong_item_to_room  charged per "agent placed a filled pallet at
                           a free room that was not a Store-fill and not a
-                          target retrieve" event. Ungated — fires in both
-                          phases. In phase 2 this catches the agent
-                          delivering the wrong pallet; in phase 1 it
-                          catches pointless filled-pallet shuffling.
+                          target retrieve" event.
   penalty_idle_with_retrieve  charged once per env step in which a Retrieve
-                          is pending AND no carrier has a command in
-                          flight. Catches stalls — WAIT-spam in phase 2 or
-                          all carriers idle while work is pending. Per-step
-                          time pressure during retrieval phase.
+                          is pending AND no carrier has a command in flight.
   movement_weight         per-millimetre carrier travel penalty.
-
-See env.py for the room-transition rules that drive (un)stage / wrong-item
-detection.
 """
 
 from __future__ import annotations
@@ -46,6 +43,19 @@ class RewardConfig:
     movement_weight: float = 0.01
 
 
+@dataclass(frozen=True)
+class RewardEvent:
+    """One contributing term to a step's reward.
+
+    `label` is a short uppercase tag (RETRIEVE / STAGE / UNSTAGE / WRONG /
+    IDLE / MOVE / SUCCESS / TIME). `amount` is signed: positive = reward,
+    negative = penalty. The sum of all events for a step equals the
+    scalar reward returned by `compute_reward`.
+    """
+    label: str
+    amount: float
+
+
 def compute_reward(
     cfg: RewardConfig,
     completions: list[TaskCompletion],
@@ -54,14 +64,32 @@ def compute_reward(
     n_unstage_events: int = 0,
     n_wrong_item_events: int = 0,
     idle_with_retrieve: bool = False,
-) -> float:
-    r = -cfg.movement_weight * float(movement_distance)
-    for comp in completions:
-        if isinstance(comp.task, Retrieve):
-            r += cfg.reward_retrieve
-    r += cfg.reward_stage_room * float(n_stage_events)
-    r -= cfg.penalty_unstage_room * float(n_unstage_events)
-    r -= cfg.penalty_wrong_item_to_room * float(n_wrong_item_events)
-    if idle_with_retrieve:
-        r -= cfg.penalty_idle_with_retrieve
-    return float(r)
+) -> tuple[float, list[RewardEvent]]:
+    events: list[RewardEvent] = []
+    if movement_distance > 0 and cfg.movement_weight > 0:
+        events.append(RewardEvent(
+            "MOVE", -cfg.movement_weight * float(movement_distance),
+        ))
+    n_retrieves = sum(1 for c in completions if isinstance(c.task, Retrieve))
+    if n_retrieves > 0:
+        events.append(RewardEvent(
+            "RETRIEVE", cfg.reward_retrieve * float(n_retrieves),
+        ))
+    if n_stage_events > 0:
+        events.append(RewardEvent(
+            "STAGE", cfg.reward_stage_room * float(n_stage_events),
+        ))
+    if n_unstage_events > 0:
+        events.append(RewardEvent(
+            "UNSTAGE", -cfg.penalty_unstage_room * float(n_unstage_events),
+        ))
+    if n_wrong_item_events > 0:
+        events.append(RewardEvent(
+            "WRONG", -cfg.penalty_wrong_item_to_room * float(n_wrong_item_events),
+        ))
+    if idle_with_retrieve and cfg.penalty_idle_with_retrieve > 0:
+        events.append(RewardEvent(
+            "IDLE", -cfg.penalty_idle_with_retrieve,
+        ))
+    total = float(sum(e.amount for e in events))
+    return total, events

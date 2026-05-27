@@ -83,13 +83,21 @@ class QueueContent:
 
     # ---- drawing -----------------------------------------------------------
 
+    # Column x-offsets, shared between header and rows so they line up.
+    COL_TYPE_X = 0
+    COL_TARGET_X = 50
+    COL_WAIT_X = 170
+
     def paint(self, surface: pygame.Surface, fonts: Fonts,
               body: pygame.Rect, panel) -> None:
         x = body.left + 4
         y = body.top + 2
-        blit_text(surface, "TYPE  TARGET           WAIT",
-                  (x, y), fonts.tiny, CYAN_MID)
-        y += 14
+        # Header — rendered with the SAME font and x-offsets as the rows
+        # below so columns align vertically.
+        blit_text(surface, "TYPE",   (x + self.COL_TYPE_X,   y), fonts.small, CYAN_MID)
+        blit_text(surface, "TARGET", (x + self.COL_TARGET_X, y), fonts.small, CYAN_MID)
+        blit_text(surface, "WAIT",   (x + self.COL_WAIT_X,   y), fonts.small, CYAN_MID)
+        y += 16
         list_top = y
         bottom_reserve = (
             self.SLIDER_H + self.SLIDER_GAP + self.BUTTON_H + self.BUTTON_ROW_PAD
@@ -120,10 +128,11 @@ class QueueContent:
                 target = f"pallet={t.pallet:<6}"
             else:
                 kind, color, target = "?", TEXT_DIM, "?"
-            blit_text(surface, kind, (x, y), fonts.small, color)
-            blit_text(surface, target, (x + 50, y), fonts.small, TEXT)
+            blit_text(surface, kind,   (x + self.COL_TYPE_X,   y), fonts.small, color)
+            blit_text(surface, target, (x + self.COL_TARGET_X, y), fonts.small, TEXT)
             wait_color = YELLOW_BRIGHT if wait > 30 else TEXT
-            blit_text(surface, f"{wait:7.1f}", (x + 170, y), fonts.small, wait_color)
+            blit_text(surface, f"{wait:.1f}",
+                      (x + self.COL_WAIT_X, y), fonts.small, wait_color)
             y += self.LINE_H
 
         self._paint_manual(surface, fonts, body)

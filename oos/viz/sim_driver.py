@@ -70,6 +70,7 @@ class SimDriver:
         self._record_advance(obs, reward, info)
 
     def emit_toasts(self, info: dict) -> None:
+        # Task arrival / completion toasts — sim-event narrative.
         for arr in info.get("arrivals", []):
             if isinstance(arr, Store):
                 self.toasts.accent(f"⇩ STORE {arr.size}", lifetime=3.5)
@@ -84,16 +85,18 @@ class SimDriver:
             else:
                 label = "task done"
             self.toasts.success(f"✓ {label}  cost={comp.cost:.1f}", lifetime=3.5)
-        # Event toasts so a stage/unstage is visibly attributed even when
-        # the per-step "last R" display is overwritten before render.
-        for _ in range(int(info.get("n_stage_events", 0))):
-            self.toasts.success("+STAGE", lifetime=3.5)
-        for _ in range(int(info.get("n_unstage_events", 0))):
-            self.toasts.error("−UNSTAGE", lifetime=3.5)
-        for _ in range(int(info.get("n_wrong_item_events", 0))):
-            self.toasts.error("−WRONG ITEM", lifetime=3.5)
-        if info.get("idle_with_retrieve", False):
-            self.toasts.error("−IDLE", lifetime=1.5)
+
+        # Reward toasts — read DIRECTLY from `info["reward_events"]` so
+        # they show the actual signed amounts the env attributed (single
+        # source of truth in oos.env.reward.compute_reward). Positive →
+        # success toast (green); negative → error toast (red).
+        for ev in info.get("reward_events", []):
+            sign = "+" if ev.amount >= 0 else "−"
+            text = f"{sign}{abs(ev.amount):.2f} {ev.label}"
+            if ev.amount >= 0:
+                self.toasts.success(text, lifetime=3.0)
+            else:
+                self.toasts.error(text, lifetime=2.5)
 
     # ─────────────────────────────────────────────────────────────────────
     # Internal
