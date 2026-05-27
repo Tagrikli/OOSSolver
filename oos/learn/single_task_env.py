@@ -57,6 +57,7 @@ from typing import Optional
 import numpy as np
 
 from oos.config.schema import ExperimentConfig
+from oos.env.action import ActionType
 from oos.env.env import FacilityFactory, OOSEnv
 from oos.env.observation import ObservationConfig
 from oos.env.reward import RewardConfig
@@ -289,7 +290,6 @@ class SingleTaskEnv(OOSEnv):
             # AND THEN choose to idle — rewarding it for moving anything
             # to the room (the old condition) doesn't penalise wasteful
             # follow-up actions, but rewarding only the wait does.
-            from oos.env.action import ActionType
             if (
                 pre_entry is not None
                 and pre_entry.type == ActionType.WAIT

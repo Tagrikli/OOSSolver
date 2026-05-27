@@ -109,7 +109,7 @@ class SimDriver:
         sim_t_before = fac.sim_time
 
         action_idx = agent.act()
-        agent._log_query(querying)   # surface the policy outputs to viz
+        agent.record_policy_query(querying)   # surface to viz dist panel
 
         # Belt-and-suspenders: out-of-range action_idx → fall back to WAIT
         # (always the last legal entry per enumerate_actions).

@@ -161,7 +161,7 @@ class Agent:
         sim_t_before = self.facility.sim_time
 
         action_idx = self.act()
-        self._log_query(querying)
+        self.record_policy_query(querying)
 
         # Build the human-readable label from the entry list, if available.
         entries = self.info.get("action_entries", [])
@@ -201,10 +201,15 @@ class Agent:
     # Internal
     # ─────────────────────────────────────────────────────────────────────
 
-    def _log_query(self, carrier_id: str) -> None:
+    def record_policy_query(self, carrier_id: str) -> None:
         """Snapshot `policy.last_*` into the per-carrier log so the viz
         can render one chart per carrier without losing data when
-        multiple carriers are queried within a single render frame."""
+        multiple carriers are queried within a single render frame.
+
+        Called automatically from `step()`; viz drivers that bypass step()
+        (e.g. `SimDriver._submit_one_at_current_time`) call it directly
+        after each `act()` invocation.
+        """
         policy = self.policy
         logits = getattr(policy, "last_logits", None)
         mask = getattr(policy, "last_action_mask", None)

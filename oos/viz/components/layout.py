@@ -9,8 +9,7 @@ Primitives are *passive* — they don't draw anything themselves. Iterate
 the children to draw afterwards.
 
 Naming: `Row` (horizontal) and `Column` (vertical) — same convention as
-Flutter/SwiftUI/etc. The old names `HRow`/`VStack` are kept as deprecated
-aliases until callers migrate.
+Flutter/SwiftUI/etc.
 """
 
 from __future__ import annotations
@@ -120,9 +119,3 @@ class Column:
             y += h + self.gap
 
 
-# ── Deprecated aliases ────────────────────────────────────────────────────
-# Kept until all in-tree callers migrate to Row/Column. Emits a one-time
-# warning per import — the new names are strictly better and the migration
-# is mechanical.
-HRow = Row
-VStack = Column

@@ -7,7 +7,6 @@ Layout:
 - panel      : Panel — single reusable widget = chrome + pluggable content
 - button     : Button widget with named color variants
 - layout     : Row / Column tiling primitives for child widgets
-               (HRow / VStack aliases kept temporarily for legacy callers)
 - widgets/   : stateful canvas widgets (ShelfWidget, RoomWidget, CarrierPanel, ...)
 - toasts     : Toast dataclass + ToastManager + draw_toasts
 
@@ -20,7 +19,7 @@ in `oos.viz.sidebar`, not here — Panel is generic; content is per-feature.
 
 from oos.viz.components.button import Button
 from oos.viz.components.chrome import PanelChrome
-from oos.viz.components.layout import Column, HRow, Row, VStack
+from oos.viz.components.layout import Column, Row
 from oos.viz.components.palette import (
     ACCENT,
     BASE_BLACK,
@@ -137,7 +136,7 @@ __all__ = [
     "draw_request_pulse", "draw_scanlines", "pulsed_color",
     # chrome / panel / button / layout
     "PanelChrome", "Panel", "PanelContent",
-    "Button", "Column", "HRow", "Row", "VStack",
+    "Button", "Column", "Row",
     # widgets
     "CarrierIconWidget", "CarrierPanel", "CarrierStripBackground",
     "Checkbox", "CheckboxGroup", "CustomerQueueWidget", "NumericField",

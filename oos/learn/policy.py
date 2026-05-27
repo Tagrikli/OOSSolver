@@ -1,6 +1,6 @@
 """Load a trained checkpoint and expose it as a viz-compatible policy callable.
 
-Compatible with `oos.viz.player.PolicyFn` shape: `(obs, info) -> action_idx`.
+Compatible with `oos.agent.PolicyFn` shape: `(obs, info) -> action_idx`.
 """
 
 from __future__ import annotations
