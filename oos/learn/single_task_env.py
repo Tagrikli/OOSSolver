@@ -61,8 +61,11 @@ from oos.env.action import ActionType
 from oos.env.env import FacilityFactory, OOSEnv
 from oos.env.observation import ObservationConfig
 from oos.env.reward import RewardConfig
-from oos.sim.shuffle import shuffle_state
-from oos.sim.state import Pallet
+from oos.sim.state_sampler import (
+    InitialStateSampler,
+    InitialStateSamplerConfig,
+    has_empty_pallet_anywhere,
+)
 from oos.sim.tasks import Retrieve
 
 
@@ -166,6 +169,17 @@ class SingleTaskEnv(OOSEnv):
         )
         self._task_cfg = task_config or SingleTaskConfig()
         self._task_reward_cfg = reward_config or SingleTaskRewardConfig()
+        # Standalone initial-state sampler. SingleTaskEnv only owns the
+        # task layer (task selection + retrieve target picking + reward
+        # shape); the world's random initial state is built by the
+        # generic sampler so other envs can reuse it.
+        self._sampler = InitialStateSampler(InitialStateSamplerConfig(
+            big_ratio_range=self._task_cfg.big_ratio_range,
+            small_ratio_range=self._task_cfg.small_ratio_range,
+            room_state_probs=self._task_cfg.room_state_probs,
+            require_solvable=self._task_cfg.require_solvable,
+            max_solvable_retries=self._task_cfg.max_solvable_retries,
+        ))
         self._task: str = "retrieve"           # set in reset()
         self._target_id: Optional[int] = None  # set in reset() for retrieve
         self._success: bool = False
@@ -188,22 +202,20 @@ class SingleTaskEnv(OOSEnv):
         facility = self._ctx.facility  # type: ignore[union-attr]
         facility.set_auto_arrivals(False)
 
-        # Sample per-episode scenario values from the configured ranges /
-        # choice set. With degenerate ranges (low==high) or single-element
-        # choices, this reduces to the deterministic case.
-        br_lo, br_hi = self._task_cfg.big_ratio_range
-        sr_lo, sr_hi = self._task_cfg.small_ratio_range
-        self._big_ratio = float(self._rng.uniform(br_lo, br_hi))
-        self._small_ratio = float(self._rng.uniform(sr_lo, sr_hi))
+        # Mutate the facility into a fresh random initial state via the
+        # standalone sampler. Returns the per-episode big_ratio,
+        # small_ratio, room_state so we can surface them via info[].
+        result = self._sampler.sample(facility, self._rng)
+        self._big_ratio = result.big_ratio
+        self._small_ratio = result.small_ratio
+        self._room_state = result.room_state
+
+        # Task layer: pick the target depth + decide retrieve vs
+        # bring_empty.
         choices = self._task_cfg.target_depth_choices
         if not choices:
             raise ValueError("target_depth_choices must be non-empty")
         self._target_depth = int(self._rng.choice(np.asarray(choices)))
-
-        # Random fill + carrier positions + room initial state.
-        self._place_pallets(facility)
-        self._sample_room_state(facility)
-        self._randomize_carriers(facility)
 
         # Sample task. If bring_empty was drawn but the state has no
         # empties at all, switch to retrieve (skip-rather-than-block).
@@ -211,7 +223,7 @@ class SingleTaskEnv(OOSEnv):
             self._task = "bring_empty"
         else:
             self._task = "retrieve"
-        if self._task == "bring_empty" and not self._has_empty_pallet_anywhere(facility):
+        if self._task == "bring_empty" and not has_empty_pallet_anywhere(facility):
             self._task = "retrieve"
 
         self._target_id = None
@@ -222,7 +234,7 @@ class SingleTaskEnv(OOSEnv):
             if target is None:
                 # No items at all in the facility → can't form a retrieve.
                 # Only viable if at least one empty exists.
-                if self._has_empty_pallet_anywhere(facility):
+                if has_empty_pallet_anywhere(facility):
                     self._task = "bring_empty"
                 else:
                     # Pathological: ratios + topology yielded a facility with
@@ -337,192 +349,10 @@ class SingleTaskEnv(OOSEnv):
         return obs, float(r), terminated, truncated, info
 
     # ------------------------------------------------------------------
-    # Episode setup helpers
+    # Task-layer helpers (initial-state sampling lives in
+    # oos.sim.state_sampler.InitialStateSampler; we only own task
+    # selection + target picking here)
     # ------------------------------------------------------------------
-
-    def _place_pallets(self, facility) -> None:
-        """Random shelf positions + contents derived from big/small ratios.
-
-        Steps:
-          1. shuffle_state(fullness=0) — wipes carriers/rooms/scheduler and
-             distributes all pallets to shelves with random within-shelf
-             order, all empty.
-          2. Compute deterministic big_count / small_count from the ratios.
-             The effective big-capacity is `A - B` where `A` is the total
-             big-shelf slot count and `B` is the deepest single big shelf's
-             capacity — i.e. one big shelf's worth of headroom is reserved
-             so the agent always has somewhere to unstack big items during
-             retrieval. `big_ratio = 1.0` therefore places exactly `A - B`
-             big items, not `A`.
-          3. Pick `big_count` slot positions from big-shelf positions → big.
-          4. Pick `small_count` from the remaining pool (leftover big-shelf
-             positions + all small-shelf positions) → small.
-          5. Everything else stays empty.
-
-        If `require_solvable` is set, the whole placement is re-rolled
-        when the resulting layout fails `_layout_is_solvable` (the same
-        retrievability check used by the live Store-gate flow). Up to
-        `max_solvable_retries` attempts; the last attempt is accepted
-        even if unsolvable so we don't spin forever.
-
-        Within-shelf stack order is purely a function of step 1's random
-        shuffle — content assignment doesn't reorder; it just overwrites
-        the contents field at chosen (shelf, stack_index) positions.
-        """
-        # Import here to avoid leaking the underscore-prefixed solvability
-        # helper into the module's import-time surface.
-        from oos.sim.shuffle import _layout_is_solvable
-
-        cfg = self._task_cfg
-        max_retries = max(1, cfg.max_solvable_retries) if cfg.require_solvable else 1
-        for _attempt in range(max_retries):
-            self._place_pallets_once(facility)
-            if not cfg.require_solvable:
-                return
-            if _layout_is_solvable(facility):
-                return
-        # Loop exhausted — last layout stays as the accepted one. Training
-        # continues; this single episode might just be unsolvable.
-
-    def _place_pallets_once(self, facility) -> None:
-        """One attempt at the random placement — see `_place_pallets`."""
-        rng = self._rng
-        shuffle_state(facility, fullness=0.0, rng=rng)
-
-        topo = facility.topology
-        state = facility.state
-
-        big_positions: list[tuple[str, int]] = []
-        small_positions: list[tuple[str, int]] = []
-        for sid, s in topo.shelves.items():
-            stk = state.shelves[sid].stack
-            for i in range(len(stk)):
-                if s.size_class == "big":
-                    big_positions.append((sid, i))
-                else:
-                    small_positions.append((sid, i))
-
-        # Effective big-capacity: A - B where A,B are derived from the
-        # TOPOLOGY (capacities), not from the current stack lengths which
-        # vary with shuffle_state's random pallet distribution. Reserves
-        # one full big shelf's worth of empty slots as retrieval headroom
-        # so a deep retrieve always has somewhere to unstack to.
-        big_topo_caps = [
-            s.capacity for s in topo.shelves.values() if s.size_class == "big"
-        ]
-        A = sum(big_topo_caps)
-        B = max(big_topo_caps) if big_topo_caps else 0
-        max_big_cap = max(0, A - B)
-        total = len(big_positions) + len(small_positions)
-        if total == 0:
-            return
-
-        # Clamp twice: by ratio of A-B, then by the number of big slots
-        # that actually exist in the current state (shuffle_state's pallet
-        # distribution can leave a big shelf with fewer pallets than its
-        # capacity).
-        big_count = min(
-            int(round(max_big_cap * self._big_ratio)),
-            max_big_cap,
-            len(big_positions),
-        )
-        remaining = total - big_count
-        small_count = min(
-            int(round(remaining * self._small_ratio)), remaining
-        )
-
-        # Big positions: shuffle, take first `big_count` for bigs, rest go
-        # into the small/empty pool.
-        rng.shuffle(big_positions)
-        big_chosen = big_positions[:big_count]
-        big_leftover = big_positions[big_count:]
-
-        small_pool = big_leftover + small_positions
-        rng.shuffle(small_pool)
-        small_chosen = small_pool[:small_count]
-
-        for sid, idx in big_chosen:
-            old = state.shelves[sid].stack[idx]
-            state.shelves[sid].stack[idx] = Pallet(id=old.id, contents="big")
-        for sid, idx in small_chosen:
-            old = state.shelves[sid].stack[idx]
-            state.shelves[sid].stack[idx] = Pallet(id=old.id, contents="small")
-        # Everything else stays empty from shuffle_state(fullness=0).
-
-    def _sample_room_state(self, facility) -> None:
-        """Sample the room's initial load per `room_state_probs`.
-
-        Categorical over {empty, small_item, big_item}. When an item is
-        drawn, conservation is preserved by taking *any* empty pallet
-        from the shelves (at any depth) and reissuing it (same id, new
-        contents) as the room's load.
-
-        LIFO semantics on removal: conceptually we pop every pallet
-        above the chosen empty into a buffer, pop the empty itself,
-        then push the buffer back in the same order. End state has the
-        empty gone and everything above shifted down one slot —
-        relative order intact, no gap. `list.pop(idx)` performs this
-        atomically.
-
-        Falls back silently to room=empty if no empty exists anywhere
-        on the shelves (e.g. both ratios collapsed to 1.0). The
-        trainer can detect this via `info["episode_room_state"]`.
-        """
-        rng = self._rng
-        probs = np.asarray(self._task_cfg.room_state_probs, dtype=float)
-        if probs.shape != (3,):
-            raise ValueError("room_state_probs must have exactly 3 values")
-        s = probs.sum()
-        if s <= 0:
-            raise ValueError("room_state_probs must sum to > 0")
-        probs = probs / s  # normalize; lets users pass unnormalized weights
-        choice = int(rng.choice(3, p=probs))
-
-        if choice == 0:
-            self._room_state = "empty"
-            return
-
-        contents = "small" if choice == 1 else "big"
-
-        # Catalogue every empty pallet on every shelf and pick uniformly.
-        empty_locations: list[tuple[str, int]] = []
-        for sid, ss in facility.state.shelves.items():
-            for i, p in enumerate(ss.stack):
-                if p.is_empty:
-                    empty_locations.append((sid, i))
-        if not empty_locations:
-            self._room_state = "empty"
-            return
-
-        sid, idx = empty_locations[rng.integers(len(empty_locations))]
-        # list.pop(idx) ≡ pop everything above idx into a temp, pop the
-        # element at idx, then push the temp back in order. End state
-        # has the empty removed and everything above shifted down one;
-        # no gap.
-        old_pallet = facility.state.shelves[sid].stack.pop(idx)
-
-        # Place the converted pallet in the (single) room. Topology might
-        # in principle define multiple rooms; for OOSKiller it's always
-        # one, but pick the first deterministically if there are more.
-        room_ids = list(facility.state.rooms.keys())
-        if not room_ids:
-            # Pathological; nothing to do. Reinsert the popped pallet at
-            # its original index so the stack is unchanged.
-            facility.state.shelves[sid].stack.insert(idx, old_pallet)
-            self._room_state = "empty"
-            return
-        facility.state.rooms[room_ids[0]].load = Pallet(
-            id=old_pallet.id, contents=contents,
-        )
-        self._room_state = "small_item" if choice == 1 else "big_item"
-
-    def _randomize_carriers(self, facility) -> None:
-        """Sample each carrier's start position uniformly on its track."""
-        rng = self._rng
-        topo = facility.topology
-        for cid, cs in facility.state.carriers.items():
-            c = topo.carriers[cid]
-            cs.position = float(rng.uniform(c.min_pos, c.max_pos))
 
     def _pick_retrieve_target(self, facility) -> Optional[int]:
         """50/50 stratified pick between big-shelf and small-shelf
@@ -584,20 +414,6 @@ class SingleTaskEnv(OOSEnv):
         return not any(
             isinstance(t, Retrieve) for t in facility.queue.pending
         )
-
-    @staticmethod
-    def _has_empty_pallet_anywhere(facility) -> bool:
-        for ss in facility.state.shelves.values():
-            for p in ss.stack:
-                if p.is_empty:
-                    return True
-        for cs in facility.state.carriers.values():
-            if cs.load is not None and cs.load.is_empty:
-                return True
-        for rs in facility.state.rooms.values():
-            if rs.load is not None and rs.load.is_empty:
-                return True
-        return False
 
     # ------------------------------------------------------------------
     # Info

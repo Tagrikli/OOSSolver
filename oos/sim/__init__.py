@@ -19,6 +19,12 @@ from oos.sim.state import (
     ShelfState,
     SimTime,
 )
+from oos.sim.state_sampler import (
+    InitialStateSampler,
+    InitialStateSamplerConfig,
+    SampleResult,
+    has_empty_pallet_anywhere,
+)
 from oos.sim.tasks import Retrieve, Store, Task, TaskQueue, TaskStream
 from oos.sim.topology import (
     Carrier,
@@ -44,6 +50,8 @@ __all__ = [
     "Facility",
     "FacilityState",
     "HandoffEdge",
+    "InitialStateSampler",
+    "InitialStateSamplerConfig",
     "LinearDurations",
     "LocationId",
     "Move",
@@ -55,8 +63,10 @@ __all__ = [
     "Room",
     "RoomId",
     "RoomState",
+    "SampleResult",
     "Scheduler",
     "SeedingConfig",
+    "has_empty_pallet_anywhere",
     "Shelf",
     "ShelfId",
     "ShelfState",
