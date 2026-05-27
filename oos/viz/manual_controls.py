@@ -5,12 +5,12 @@ on the hovered shelf) and the queue-button clicks (queue small/big/clear,
 randomize) all live here so app.py's event loop reads as dispatch instead
 of inline edit code.
 
-Each handler takes the already-resolved targets (a pallet id, a shelf id,
-a button label) plus the agent/facility/toasts and applies the mutation.
-**They do not force a re-query of the agent.** The agent will be queried
-at its next natural decision instant; until then, the cached `agent.obs`
-is stale but harmless (the env rebuilds a fresh observation at the next
-decision anyway).
+Each handler applies its mutation and then calls
+`facility.wake_waiting_carriers()` so any carrier currently in a long
+Wait gets re-queried at the next env advance — the agent reacts to user
+edits immediately instead of waiting out the remainder of its Wait
+duration. The cached `agent.obs` is NOT rebuilt eagerly; the env builds
+a fresh observation at the next decision instant.
 """
 
 from __future__ import annotations
@@ -40,14 +40,17 @@ def handle_queue_button(
     sim = facility.sim
     if btn == "queue small":
         sim.enqueue_store("small")
+        facility.wake_waiting_carriers()
         toasts.accent("+ STORE small", lifetime=2.0)
         return True
     if btn == "queue big":
         sim.enqueue_store("big")
+        facility.wake_waiting_carriers()
         toasts.accent("+ STORE big", lifetime=2.0)
         return True
     if btn == "queue clear":
         sim.clear_queue()
+        facility.wake_waiting_carriers()
         toasts.warn("QUEUE CLEARED", lifetime=2.0)
         return True
     if btn == "randomize":
@@ -59,6 +62,7 @@ def handle_queue_button(
             require_solvable=True,
         )
         sim.clear_queue()
+        facility.wake_waiting_carriers()
         toasts.accent("STATE RANDOMIZED", lifetime=2.5)
         return True
     return False
@@ -72,6 +76,7 @@ def handle_pallet_click(
 ) -> None:
     """Left-click on a pallet toggles a Retrieve for it."""
     now_pending = facility.sim.toggle_retrieve_for_pallet(pallet_id)
+    facility.wake_waiting_carriers()
     if now_pending:
         toasts.info(f"+ RETRIEVE pallet={pallet_id}", lifetime=2.5)
     else:
@@ -113,6 +118,7 @@ def set_pallet_contents(
     sim.state.shelves[owner_sid].stack[owner_idx] = (
         Pallet(id=old.id, contents=target_contents)  # type: ignore[arg-type]
     )
+    facility.wake_waiting_carriers()
     toasts.accent(f"pallet {pallet_id} → {target_contents}", lifetime=2.0)
 
 
@@ -132,6 +138,7 @@ def pop_shelf_top(
         toasts.warn(f"shelf {shelf_id} already empty", lifetime=2.0)
         return
     popped = ss.stack.pop()
+    facility.wake_waiting_carriers()
     toasts.accent(f"removed pallet {popped.id} from {shelf_id}", lifetime=2.0)
 
 
@@ -153,4 +160,5 @@ def push_empty_pallet(
     new_pid = sim._next_pallet_id  # type: ignore[attr-defined]
     sim._next_pallet_id += 1       # type: ignore[attr-defined]
     ss.stack.append(Pallet(id=new_pid, contents="empty"))
+    facility.wake_waiting_carriers()
     toasts.accent(f"pushed empty pallet {new_pid} → {shelf_id}", lifetime=2.0)

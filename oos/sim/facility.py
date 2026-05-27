@@ -11,6 +11,7 @@ from oos.sim.actions import (
     Command,
     MultiRelocate,
     Relocate,
+    Wait,
 )
 from oos.sim.durations import DurationModel
 from oos.sim.scheduler import Event, Scheduler
@@ -170,6 +171,24 @@ class Facility:
         """Drop every pending task. In-flight customer interactions continue."""
         self.queue.pending.clear()
 
+    def wake_waiting_carriers(self) -> None:
+        """Force-complete any in-progress Wait commands so the carrier is
+        re-queried immediately on the next env advance. Used by manual
+        state mutations (button clicks, hot-keys) that want the agent to
+        react now instead of waiting out the remainder of its Wait
+        duration.
+
+        The originally-scheduled `command_done` event stays in the
+        scheduler; `_on_command_done` is idempotent against a cleared
+        `current_command` so it fires harmlessly when the timer hits.
+        """
+        for cs in self.state.carriers.values():
+            if isinstance(cs.current_command, Wait):
+                cs.current_command = None
+                cs.busy_until = None
+                cs.command_started_at = None
+                cs.command_start_position = None
+
     def toggle_retrieve_for_pallet(self, pallet_id: PalletId) -> bool:
         """If a pending Retrieve for this pallet exists, remove it; else add
         one. Returns True if a Retrieve is now pending for this pallet."""
@@ -319,7 +338,11 @@ class Facility:
     ) -> None:
         cs = self.state.carriers[carrier_id]
         cmd = cs.current_command
-        assert cmd is not None
+        # Idempotent — if `wake_waiting_carriers` cleared this carrier's
+        # Wait early, the scheduled "command_done" timer still fires; we
+        # just have nothing to complete.
+        if cmd is None:
+            return
         cmd.complete(self.state, self.topology)
         # Clear initiator state (and partner, if multi-carrier).
         cs.current_command = None

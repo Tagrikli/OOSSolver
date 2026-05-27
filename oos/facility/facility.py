@@ -189,3 +189,12 @@ class Facility:
 
     def set_auto_arrivals(self, enabled: bool) -> None:
         self._sim.set_auto_arrivals(enabled)
+
+    def wake_waiting_carriers(self) -> None:
+        """Cut short any in-progress Wait commands so the corresponding
+        carriers are re-queried at the next env advance. Use after manual
+        state mutations that change what the agent ought to do — e.g.
+        toggling a Retrieve, randomizing the shelves, pushing/popping a
+        pallet — so the agent reacts immediately instead of waiting out
+        the remainder of its 5-minute Wait."""
+        self._sim.wake_waiting_carriers()

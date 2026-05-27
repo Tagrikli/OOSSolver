@@ -500,7 +500,9 @@ class Wait(Command):
     """
 
     carrier_id: CarrierId
-    duration: float = 1.0   # sim-seconds before the carrier is re-queried
+    duration: float = 300.0   # sim-seconds before the carrier is re-queried
+                              # (5 sim-minutes). External state changes
+                              # bypass this via Facility.wake_waiting_carriers.
 
     @property
     def carrier(self) -> CarrierId:
