@@ -65,31 +65,23 @@ def compute_reward(
     n_wrong_item_events: int = 0,
     idle_with_retrieve: bool = False,
 ) -> tuple[float, list[RewardEvent]]:
+    """Returns (total, list_of_nonzero_events). Zero-magnitude events
+    are deliberately dropped — they're not "things that contributed",
+    they're noise, and they used to cause `+0.00 WRONG` style toasts in
+    the viz when a config had penalty=0."""
     events: list[RewardEvent] = []
-    if movement_distance > 0 and cfg.movement_weight > 0:
-        events.append(RewardEvent(
-            "MOVE", -cfg.movement_weight * float(movement_distance),
-        ))
+
+    def add(label: str, amount: float) -> None:
+        if amount != 0.0:
+            events.append(RewardEvent(label, amount))
+
+    add("MOVE", -cfg.movement_weight * float(movement_distance))
     n_retrieves = sum(1 for c in completions if isinstance(c.task, Retrieve))
-    if n_retrieves > 0:
-        events.append(RewardEvent(
-            "RETRIEVE", cfg.reward_retrieve * float(n_retrieves),
-        ))
-    if n_stage_events > 0:
-        events.append(RewardEvent(
-            "STAGE", cfg.reward_stage_room * float(n_stage_events),
-        ))
-    if n_unstage_events > 0:
-        events.append(RewardEvent(
-            "UNSTAGE", -cfg.penalty_unstage_room * float(n_unstage_events),
-        ))
-    if n_wrong_item_events > 0:
-        events.append(RewardEvent(
-            "WRONG", -cfg.penalty_wrong_item_to_room * float(n_wrong_item_events),
-        ))
-    if idle_with_retrieve and cfg.penalty_idle_with_retrieve > 0:
-        events.append(RewardEvent(
-            "IDLE", -cfg.penalty_idle_with_retrieve,
-        ))
+    add("RETRIEVE", cfg.reward_retrieve * float(n_retrieves))
+    add("STAGE", cfg.reward_stage_room * float(n_stage_events))
+    add("UNSTAGE", -cfg.penalty_unstage_room * float(n_unstage_events))
+    add("WRONG", -cfg.penalty_wrong_item_to_room * float(n_wrong_item_events))
+    if idle_with_retrieve:
+        add("IDLE", -cfg.penalty_idle_with_retrieve)
     total = float(sum(e.amount for e in events))
     return total, events

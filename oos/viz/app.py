@@ -41,6 +41,7 @@ from oos.viz.manual_controls import (
 )
 from oos.viz.pickers import (
     FacilityPickerWidget,
+    HelpModalWidget,
     PolicyPickerWidget,
     RunConfigPickerWidget,
 )
@@ -86,6 +87,7 @@ class _RunState:
     picker: PolicyPickerWidget
     facility_picker: FacilityPickerWidget
     run_config_picker: RunConfigPickerWidget
+    help_modal: HelpModalWidget
     wall_now_fn: callable  # type: ignore[type-arg]
 
     # Sim
@@ -200,6 +202,7 @@ class VizApp:
         picker = PolicyPickerWidget(runs_dir=self.runs_dir)
         facility_picker = FacilityPickerWidget(active=self.facility_name)
         run_config_picker = RunConfigPickerWidget(runs_dir=self.runs_dir)
+        help_modal = HelpModalWidget()
 
         wall_start = time.monotonic()
         def wall_now() -> float:
@@ -237,6 +240,7 @@ class VizApp:
             picker=picker,
             facility_picker=facility_picker,
             run_config_picker=run_config_picker,
+            help_modal=help_modal,
             wall_now_fn=wall_now,
             anim_time=facility.sim_time,
             original_env=facility.env,
@@ -325,6 +329,7 @@ class VizApp:
         s.picker.draw(s.surface, s.renderer.fonts, s.active_policy_label)
         s.facility_picker.draw(s.surface, s.renderer.fonts)
         s.run_config_picker.draw(s.surface, s.renderer.fonts)
+        s.help_modal.draw(s.surface, s.renderer.fonts)
 
     # ─────────────────────────────────────────────────────────────────────
     # Replay-mode helpers
@@ -368,20 +373,26 @@ class VizApp:
         )
 
     def _load_replay_config(self, s: _RunState) -> None:
-        """Pull the selected config from the run-config picker, build a
-        fresh env from it via load_run_config, reset all replay counters,
-        and mark the replay mode active."""
+        """Pull the selected config from the run-config picker and apply
+        only its **sampler** knobs (target depths, ratios, room probs,
+        episode caps). Facility comes from `self.facility_name` (the F
+        picker); policy is preserved (the P picker controls it
+        independently)."""
         entry = s.run_config_picker.selected_entry()
         cfg = s.run_config_picker.selected_config()
         if entry is None or cfg is None:
             s.toasts.error("could not load selected config")
             return
-        ok = load_run_config(cfg, s.agent, s.toasts)
+        ok = load_run_config(
+            cfg, s.agent,
+            facility_name=self.facility_name,
+            toasts=s.toasts,
+        )
         if not ok:
             return
         s.replay_active = True
         s.replay_cfg_name = entry.name
-        s.replay_cfg_facility = entry.facility
+        s.replay_cfg_facility = self.facility_name  # what we actually ran on
         s.replay_cfg_kind = entry.env_kind
         s.replay_n_episodes = 0
         s.replay_n_success = 0
@@ -455,9 +466,6 @@ class VizApp:
             if s.renderer.active_tab == 1
             else [
                 (s.renderer.queue_panel,    3),
-                (s.renderer.controls_panel, 1),
-                (s.renderer.stats_panel,    1),
-                (s.renderer.legend_panel,   1),
                 (s.renderer.dist_panel,     24),
             ]
         )
@@ -554,6 +562,11 @@ class VizApp:
         if s.run_config_picker.open:
             self._on_keydown_run_config_picker(s, event)
             return
+        if s.help_modal.open:
+            # h or esc closes; everything else is swallowed so it doesn't
+            # accidentally hit a top-level shortcut.
+            s.help_modal.handle_key(event)
+            return
 
         # Top-level sim controls.
         if event.key in (pygame.K_q, pygame.K_ESCAPE):
@@ -566,6 +579,8 @@ class VizApp:
             s.facility_picker.toggle()
         elif event.key == pygame.K_c:
             s.run_config_picker.toggle()
+        elif event.key == pygame.K_h:
+            s.help_modal.toggle()
         elif event.key == pygame.K_n:
             s.mode = "step" if s.mode == "anim" else "anim"
             if s.mode == "anim":
@@ -749,10 +764,7 @@ class VizApp:
     @staticmethod
     def _handle_panel_collapse(renderer: Renderer, pos) -> bool:
         # `stats_panel` is persistent (not collapsable) — skipped here.
-        for panel in (
-            renderer.queue_panel, renderer.dist_panel,
-            renderer.controls_panel, renderer.legend_panel,
-        ):
+        for panel in (renderer.queue_panel, renderer.dist_panel):
             if panel.hit_header(pos):
                 panel.toggle_collapsed()
                 return True

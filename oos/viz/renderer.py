@@ -24,7 +24,6 @@ from oos.viz.components import (
     CYAN_BRIGHT,
     LIME_BRIGHT,
     MAGENTA_BRIGHT,
-    VIOLET_BRIGHT,
     YELLOW_BRIGHT,
     Column,
     Fonts,
@@ -37,9 +36,7 @@ from oos.viz.components import (
 )
 from oos.viz.layout import Layout
 from oos.viz.sidebar import (
-    ControlsContent,
     DistributionContent,
-    LegendContent,
     QueueContent,
     RandomizeContent,
     ReplayContent,
@@ -119,12 +116,6 @@ class Renderer:
     def dist_panel(self) -> Panel: return self._dist_panel
 
     @property
-    def legend_panel(self) -> Panel: return self._legend_panel
-
-    @property
-    def controls_panel(self) -> Panel: return self._controls_panel
-
-    @property
     def queue_content(self) -> QueueContent:
         """Typed accessor for queue panel's content — exposes hit_button /
         hit_slider / fullness / set_fullness_from_x for the app event loop."""
@@ -160,10 +151,7 @@ class Renderer:
         the sidebar (above the tab strip), so it's NOT included here —
         it's drawn separately by `_layout_panels` / `draw`."""
         if self._tab_strip.active == 0:        # status
-            return [
-                self._queue_panel, self._dist_panel,
-                self._controls_panel, self._legend_panel,
-            ]
+            return [self._queue_panel, self._dist_panel]
         if self._tab_strip.active == 1:        # randomize
             return [self._randomize_panel]
         # tab 2 — replay
@@ -214,16 +202,6 @@ class Renderer:
             pygame.Rect(self._col_x, 0, self._panel_w, 140),
             title="Action dist", content=DistributionContent(),
             accent=LIME_BRIGHT, preferred_h=140,
-        )
-        self._controls_panel = Panel(
-            pygame.Rect(self._col_x, 0, self._panel_w, 150),
-            title="Controls", content=ControlsContent(),
-            accent=VIOLET_BRIGHT, preferred_h=150, collapsed=True,
-        )
-        self._legend_panel = Panel(
-            pygame.Rect(self._col_x, 0, self._panel_w, 200),
-            title="Legend", content=LegendContent(),
-            accent=YELLOW_BRIGHT, preferred_h=200, collapsed=True,
         )
         self._randomize_panel = Panel(
             pygame.Rect(self._col_x, 0, self._panel_w, 400),

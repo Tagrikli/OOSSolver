@@ -161,14 +161,27 @@ class SingleTaskEnv(OOSEnv):
         experiment_config: Optional[ExperimentConfig] = None,
         observation_config: Optional[ObservationConfig] = None,
     ) -> None:
+        self._task_reward_cfg = reward_config or SingleTaskRewardConfig()
+        # Pass the *overlapping* weights through to the base RewardConfig
+        # so OOSEnv.advance produces real, labelled events even in viz
+        # mode (which bypasses SingleTaskEnv.step). The task-only weights
+        # (`reward_success`, `time_weight`) live on the subclass and are
+        # applied in step() for gym callers.
+        base_reward = RewardConfig(
+            reward_retrieve=0.0,           # SingleTask uses reward_success
+            reward_stage_room=0.0,         # not part of SingleTask shaping
+            penalty_unstage_room=0.0,
+            penalty_wrong_item_to_room=self._task_reward_cfg.penalty_wrong_item_to_room,
+            penalty_idle_with_retrieve=self._task_reward_cfg.penalty_idle_with_retrieve,
+            movement_weight=self._task_reward_cfg.movement_weight,
+        )
         super().__init__(
             facility_factory=facility_factory,
             experiment_config=experiment_config,
-            reward_config=_ZERO_REWARD_CFG,
+            reward_config=base_reward,
             observation_config=observation_config,
         )
         self._task_cfg = task_config or SingleTaskConfig()
-        self._task_reward_cfg = reward_config or SingleTaskRewardConfig()
         # Standalone initial-state sampler. SingleTaskEnv only owns the
         # task layer (task selection + retrieve target picking + reward
         # shape); the world's random initial state is built by the
@@ -435,15 +448,3 @@ class SingleTaskEnv(OOSEnv):
         info["retrieves_total"] = 1
         info["retrieves_completed"] = 1 if self._success else 0
         info["stores_completed"] = 0
-
-
-# All-zero base reward config — the subclass recomputes the real reward
-# in step(); this just ensures the base class's compute_reward is a no-op.
-_ZERO_REWARD_CFG = RewardConfig(
-    reward_retrieve=0.0,
-    reward_stage_room=0.0,
-    penalty_unstage_room=0.0,
-    penalty_wrong_item_to_room=0.0,
-    penalty_idle_with_retrieve=0.0,
-    movement_weight=0.0,
-)

@@ -175,18 +175,26 @@ def generate_single_task(
 def load_run_config(
     cfg: dict,
     agent: Agent,
+    facility_name: str,
     toasts: ToastManager,
-    facility_override: Optional[str] = None,
 ) -> bool:
-    """Replace `agent.facility` with one built from a saved
-    `runs/<name>/config.json`. Returns True on success.
+    """Apply a saved `runs/<name>/config.json`'s **sampler knobs** to the
+    agent's env, on the user-supplied `facility_name`. Returns True on
+    success.
 
-    The config dict's `facility` field decides the topology unless
-    `facility_override` is passed (e.g. for "run this config's sampling
-    distribution but on a different topology"). Currently supports
-    SingleTaskEnv configs (those with `bring_empty_prob` +
-    `target_depths`); plain `OOSEnv` / `EpisodeEnv` configs are accepted
-    too but fall back to a default plain env.
+    What the config contributes:
+      * sampler ranges      (big_ratio_low/high, small_ratio_low/high)
+      * target depth set    (target_depths)
+      * room initial probs  (room_state_probs)
+      * task probability    (bring_empty_prob)
+      * episode caps        (max_sim_time, max_episode_steps)
+
+    What the config does NOT touch — picked independently in the viz:
+      * facility — the `facility_name` arg wins (use the F picker).
+      * policy   — preserved across the call (use the P picker).
+      * reward   — SingleTaskRewardConfig defaults are used; reward
+                   weights are training-specific shaping, not
+                   inspection-relevant.
     """
     from oos.config.schema import EpisodeConfig as ExpEpisodeConfig
     from oos.config.schema import ExperimentConfig, TaskStreamConfig
@@ -198,10 +206,6 @@ def load_run_config(
         SingleTaskRewardConfig,
     )
 
-    facility_name = facility_override or cfg.get("facility")
-    if facility_name is None:
-        toasts.error("config has no 'facility' field")
-        return False
     try:
         factory = get_facility(facility_name)
     except ValueError as e:
@@ -241,17 +245,6 @@ def load_run_config(
                 target_depth_choices=depths,
                 room_state_probs=room_probs,
             )
-            reward_cfg = SingleTaskRewardConfig(
-                reward_success=float(cfg.get("reward_success", 4.0)),
-                penalty_wrong_item_to_room=float(
-                    cfg.get("penalty_wrong_item_to_room", 0.5),
-                ),
-                penalty_idle_with_retrieve=float(
-                    cfg.get("penalty_idle_with_retrieve", 0.0),
-                ),
-                movement_weight=float(cfg.get("movement_weight", 0.0)),
-                time_weight=float(cfg.get("time_weight", 0.0)),
-            )
             experiment_cfg = ExperimentConfig(
                 task_stream=TaskStreamConfig(store_rate=0.0),
                 episode=ExpEpisodeConfig(
@@ -265,7 +258,7 @@ def load_run_config(
         new_env = SingleTaskEnv(
             facility_factory=factory,
             task_config=task_cfg,
-            reward_config=reward_cfg,
+            reward_config=SingleTaskRewardConfig(),  # defaults
             experiment_config=experiment_cfg,
         )
         kind = "SingleTask"
@@ -275,20 +268,16 @@ def load_run_config(
         new_env = OOSEnv(facility_factory=factory)
         kind = "OOSEnv"
 
+    prev_policy = agent.policy   # preserved across the swap
     agent.facility = Facility(new_env)
-    # Reset the policy: an existing LearnedPolicy's collator is bound to
-    # the *old* topology, so re-running it after a facility swap raises
-    # KeyError on shelves it's never seen. Drop to random; the user
-    # re-loads via the 'p' picker if they want a learned policy on the
-    # new topology.
-    agent.policy = random_policy
+    agent.policy = prev_policy
     # Fresh seed so each episode samples differently.
     import secrets
     agent.seed = secrets.randbits(31)
     agent.reset()
     agent.facility.set_auto_arrivals(preserve_auto)
     toasts.success(
-        f"CONFIG → {kind} on {facility_name}", lifetime=3.5,
+        f"CONFIG → {kind} sampler on {facility_name}", lifetime=3.5,
     )
     return True
 

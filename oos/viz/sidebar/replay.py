@@ -45,7 +45,8 @@ from oos.viz.components.widgets import Checkbox
 
 
 class ReplayContent:
-    BTN_H = 26
+    BTN_H = 22       # match QueueContent.BUTTON_H so the strip reads
+                     # like one consistent button row across panels.
     BTN_GAP = 6
     ROW_H = 16
     SECTION_GAP = 8
