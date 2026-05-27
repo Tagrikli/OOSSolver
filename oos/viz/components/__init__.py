@@ -104,9 +104,14 @@ from oos.viz.components.widgets import (
     CarrierIconWidget,
     CarrierPanel,
     CarrierStripBackground,
+    Checkbox,
+    CheckboxGroup,
     CustomerQueueWidget,
+    NumericField,
     RoomWidget,
     ShelfWidget,
+    SolvabilityOverlay,
+    TabStrip,
     short_action_label,
 )
 
@@ -134,7 +139,9 @@ __all__ = [
     "Button", "HRow", "VStack",
     # widgets
     "CarrierIconWidget", "CarrierPanel", "CarrierStripBackground",
-    "CustomerQueueWidget", "RoomWidget", "ShelfWidget", "short_action_label",
+    "Checkbox", "CheckboxGroup", "CustomerQueueWidget", "NumericField",
+    "RoomWidget", "ShelfWidget", "SolvabilityOverlay", "TabStrip",
+    "short_action_label",
     # toasts
     "Toast", "ToastManager", "draw_toasts",
 ]

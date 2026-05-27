@@ -402,6 +402,7 @@ class OOSEnv(gym.Env):
         info["n_unstage_events"] = n_unstage_events
         info["n_wrong_item_events"] = n_wrong_item_events
         info["idle_with_retrieve"] = idle_with_retrieve
+        info["movement_distance"] = float(movement_distance)
         return obs, float(reward), terminated, truncated, info
 
     # ------------------------------------------------------------------

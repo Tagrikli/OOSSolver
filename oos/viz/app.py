@@ -31,6 +31,7 @@ from oos.viz.manual_controls import (
 from oos.viz.pickers import FacilityPickerWidget, PolicyPickerWidget
 from oos.viz.player import Player, PolicyFn, random_policy
 from oos.viz.policy_swap import (
+    generate_single_task,
     load_policy,
     rewrap_with_mcts,
     swap_facility,
@@ -125,6 +126,27 @@ class VizApp:
                     active_policy_label = _label
         save_viz_state(self.runs_dir, facility_name=self.facility_name)
 
+        # Generate-button trigger: stash params here, the main loop applies
+        # them (must run outside the event handler so the local `facility`
+        # / `anim_time` bindings can be reseated after the env swap).
+        pending_generate: list[dict] = []
+
+        # Snapshot the boot env so R can revert from a SingleTaskEnv back
+        # to the original OOSEnv on the current facility. Updated on
+        # facility swap so R always points at the most recent "real" env
+        # rather than a Generate-spawned SingleTaskEnv.
+        original_env_box: list = [player.env]
+
+        def fire_generate(params: dict) -> None:
+            if "_error" in params:
+                toasts.error(params["_error"])
+                return
+            pending_generate.append(params)
+
+        def wire_renderer(r: Renderer) -> Renderer:
+            r.randomize_content.on_generate = fire_generate
+            return r
+
         def relayout(new_w: int, new_h: int) -> Renderer:
             """Recompute layout for a new window size and build a fresh
             Renderer. Sidebar width stays fixed; canvas absorbs the rest.
@@ -135,12 +157,26 @@ class VizApp:
                 facility.topology,
                 LayoutConfig(window_w=new_w, window_h=new_h, zoom=zoom),
             )
-            return Renderer(new_layout, facility.topology)
+            return wire_renderer(Renderer(new_layout, facility.topology))
+
+        renderer = wire_renderer(renderer)
 
         running = True
         dragging_fullness = False
         while running:
             dt_wall = clock.tick(self.target_fps) / 1000.0
+
+            # Apply any pending Generate before processing events. Done
+            # here (not inside the event handler) because the env swap
+            # needs to reseat the local `facility`/`anim_time` bindings.
+            while pending_generate:
+                params = pending_generate.pop(0)
+                ok = generate_single_task(
+                    params, player, facility, self.facility_name, toasts,
+                )
+                if ok:
+                    facility = player.env._ctx.facility  # type: ignore[attr-defined]
+                    anim_time = facility.state.time
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -180,14 +216,24 @@ class VizApp:
                                 save_viz_state(self.runs_dir, zoom=zoom)
                                 toasts.info(f"ZOOM {zoom:.2f}×", lifetime=1.5)
                             continue
+                        # Pixel-granular scroll for the randomize panel,
+                        # row-granular for the rest.
+                        scroll_specs = (
+                            [(renderer.randomize_panel, 24)]
+                            if renderer.active_tab == 1
+                            else [
+                                # Row-granular panels first, then pixel-
+                                # granular (`dist_panel` needs a much
+                                # bigger wheel multiplier).
+                                (renderer.queue_panel,    3),
+                                (renderer.controls_panel, 1),
+                                (renderer.stats_panel,    1),
+                                (renderer.legend_panel,   1),
+                                (renderer.dist_panel,     24),
+                            ]
+                        )
                         handled_by_sidebar = False
-                        for panel, mult in (
-                            (renderer.queue_panel,    3),
-                            (renderer.controls_panel, 1),
-                            (renderer.stats_panel,    1),
-                            (renderer.legend_panel,   1),
-                            (renderer.dist_panel,     1),
-                        ):
+                        for panel, mult in scroll_specs:
                             if panel.hit_test(mouse_pos):
                                 panel.scroll(-event.y * mult)
                                 handled_by_sidebar = True
@@ -198,16 +244,36 @@ class VizApp:
                             renderer.scroll_carriers(-event.y * 40)
                     continue
 
-                if event.type == pygame.MOUSEMOTION and dragging_fullness:
-                    renderer.queue_content.set_fullness_from_x(event.pos[0])
+                if event.type == pygame.MOUSEMOTION:
+                    if dragging_fullness:
+                        renderer.queue_content.set_fullness_from_x(event.pos[0])
+                        continue
+                    if renderer.active_tab == 1:
+                        renderer.randomize_content.handle_mouse_motion(event.pos)
                     continue
 
                 if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                    dragging_fullness = False
+                    if dragging_fullness:
+                        dragging_fullness = False
+                        continue
+                    if renderer.active_tab == 1:
+                        renderer.randomize_content.handle_mouse_up(event.pos)
                     continue
 
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     pos = event.pos
+                    # Tab strip click switches the sidebar's active tab.
+                    new_tab = renderer.tab_strip.hit_test(pos)
+                    if new_tab is not None:
+                        if new_tab != renderer.tab_strip.active:
+                            renderer.tab_strip.active = new_tab
+                            renderer.randomize_content.blur()
+                        continue
+                    # Randomize tab: panel-internal clicks (numeric-field
+                    # drag start, checkbox toggle, Generate button).
+                    if renderer.active_tab == 1 and renderer.randomize_panel.hit_test(pos):
+                        renderer.randomize_content.handle_mouse_down(pos)
+                        continue
                     # Header clicks toggle panel collapse — UI-only.
                     if self._handle_panel_collapse(renderer, pos):
                         continue
@@ -237,16 +303,27 @@ class VizApp:
                     continue
 
                 if event.type == pygame.KEYDOWN:
+                    # Focused randomize-panel text field grabs keys before
+                    # app shortcuts so typing "q" doesn't quit the viz.
+                    if (
+                        renderer.active_tab == 1
+                        and renderer.randomize_content.focused()
+                    ):
+                        if renderer.randomize_content.handle_key(event):
+                            continue
                     # Pickers consume keys first while open.
                     if facility_picker.open:
                         action = facility_picker.handle_key(event)
                         if action == "submit":
                             name = facility_picker.selected()
                             if name is not None and name != facility_picker.active:
-                                renderer = swap_facility(
+                                renderer = wire_renderer(swap_facility(
                                     name, player, facility, self.runs_dir,
                                     self.window_w, self.window_h, toasts,
-                                )
+                                ))
+                                # New facility → new "original" env baseline
+                                # for the R-revert path.
+                                original_env_box[0] = player.env
                                 facility = player.env._ctx.facility  # type: ignore[attr-defined]
                                 topo = facility.topology
                                 anim_time = facility.state.time
@@ -313,11 +390,26 @@ class VizApp:
                         save_viz_state(self.runs_dir, speed=speed)
                     elif event.key == pygame.K_r:
                         preserve_auto = facility.auto_arrivals_enabled
+                        # If we're sitting on a Generate-spawned SingleTaskEnv,
+                        # R reverts to the original OOSEnv on this facility
+                        # rather than re-rolling another single-task state.
+                        from oos.learn.single_task_env import SingleTaskEnv
+                        reverted = False
+                        if isinstance(player.env, SingleTaskEnv):
+                            player.env = original_env_box[0]
+                            player.seed = self.seed
+                            reverted = True
                         player.reset()
                         facility = player.env._ctx.facility  # type: ignore[attr-defined]
                         facility.set_auto_arrivals(preserve_auto)
                         anim_time = facility.state.time
-                        toasts.accent("ENV RESET", lifetime=2.0)
+                        if reverted:
+                            toasts.accent(
+                                "ENV RESET (reverted from generated)",
+                                lifetime=3.0,
+                            )
+                        else:
+                            toasts.accent("ENV RESET", lifetime=2.0)
                     elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                         target = {pygame.K_1: "empty", pygame.K_2: "small",
                                   pygame.K_3: "big"}[event.key]
@@ -400,6 +492,7 @@ class VizApp:
         policy_action_entries = (
             player.info.get("action_entries", []) if player.info else []
         )
+        policy_query_log = dict(player.policy_query_log)
         return RenderState(
             mode=mode + (" (paused)" if paused else ""),
             wall_speed=speed,
@@ -416,6 +509,7 @@ class VizApp:
             policy_action_mask=policy_action_mask,
             policy_chosen=policy_chosen,
             policy_action_entries=policy_action_entries,
+            policy_query_log=policy_query_log,
             mouse_pos=pygame.mouse.get_pos(),
         )
 

@@ -37,6 +37,8 @@ from oos.viz.components import (
     Fonts,
     Panel,
     PanelChrome,
+    SolvabilityOverlay,
+    TabStrip,
     Toast,
     draw_corner_brackets,
     draw_grid_background,
@@ -50,6 +52,7 @@ from oos.viz.sidebar import (
     DistributionContent,
     LegendContent,
     QueueContent,
+    RandomizeContent,
     StatsContent,
 )
 
@@ -73,6 +76,7 @@ class RenderState:
     policy_action_mask: object = None
     policy_chosen: int | None = None
     policy_action_entries: list = field(default_factory=list)
+    policy_query_log: dict = field(default_factory=dict)
     mouse_pos: tuple[int, int] = (0, 0)
 
 
@@ -97,6 +101,31 @@ class Renderer:
         """Typed accessor for queue panel's content — exposes hit_button /
         hit_slider / fullness / set_fullness_from_x for the app event loop."""
         return self._queue_panel.content  # type: ignore[return-value]
+
+    @property
+    def randomize_panel(self) -> Panel:
+        return self._randomize_panel
+
+    @property
+    def randomize_content(self) -> RandomizeContent:
+        return self._randomize_panel.content  # type: ignore[return-value]
+
+    @property
+    def tab_strip(self) -> TabStrip:
+        return self._tab_strip
+
+    @property
+    def active_tab(self) -> int:
+        return self._tab_strip.active
+
+    def active_panels(self) -> list[Panel]:
+        """The panels currently visible in the sidebar for the active tab."""
+        if self._tab_strip.active == 0:
+            return [
+                self._stats_panel, self._queue_panel, self._dist_panel,
+                self._controls_panel, self._legend_panel,
+            ]
+        return [self._randomize_panel]
 
     def __init__(self, layout: Layout, topology: Topology, fonts: Fonts | None = None):
         self.layout = layout
@@ -164,9 +193,9 @@ class Renderer:
             accent=CYAN_BRIGHT, preferred_h=240,
         )
         self._dist_panel = Panel(
-            pygame.Rect(self._col_x, 0, self._panel_w, 180),
+            pygame.Rect(self._col_x, 0, self._panel_w, 140),
             title="Action dist", content=DistributionContent(),
-            accent=LIME_BRIGHT, preferred_h=180,
+            accent=LIME_BRIGHT, preferred_h=140,
         )
         self._controls_panel = Panel(
             pygame.Rect(self._col_x, 0, self._panel_w, 150),
@@ -178,6 +207,25 @@ class Renderer:
             title="Legend", content=LegendContent(),
             accent=YELLOW_BRIGHT, preferred_h=200, collapsed=True,
         )
+
+        # Tab 2 panel: randomize/preview controls. Single non-collapsable
+        # panel that fills the whole sidebar body below the tab strip.
+        self._randomize_panel = Panel(
+            pygame.Rect(self._col_x, 0, self._panel_w, 400),
+            title="Random initial state", content=RandomizeContent(),
+            accent=MAGENTA_BRIGHT, preferred_h=400, collapsable=False,
+        )
+
+        # Tab strip lives at the very top of the sidebar. Tab 0 = STATUS
+        # (the existing 5 panels), Tab 1 = RANDOMIZE (preview generator).
+        self._tab_strip = TabStrip(
+            labels=["status", "randomize"], active=0, accent=MAGENTA_BRIGHT,
+        )
+
+        # Bottom-right canvas overlay showing whether the current layout
+        # is retrievable. Position is re-pinned every frame in draw() so
+        # it survives window resizes.
+        self._solvability_overlay = SolvabilityOverlay()
 
         self._canvas_rect = pygame.Rect(*layout.canvas_rect)
         self._sidebar_rect = sb
@@ -259,23 +307,28 @@ class Renderer:
     # ------------------------------------------------------------------
 
     def _layout_panels(self) -> None:
-        """Re-flow side panels each frame based on collapsed state."""
+        """Re-flow side panels each frame based on collapsed state and the
+        active tab. The tab strip claims the top slot of the sidebar; the
+        active tab's panels fill the remainder."""
         sb = self._sidebar_rect
         pad = self._sb_pad
         col_x = self._col_x
         panel_w = self._panel_w
 
-        panels = [
-            self._stats_panel,
-            self._queue_panel,
-            self._dist_panel,
-            self._controls_panel,
-            self._legend_panel,
-        ]
+        # Tab strip at the top of the sidebar.
+        tab_top = sb.top + pad
+        self._tab_strip.set_rect(pygame.Rect(
+            col_x, tab_top, panel_w, TabStrip.H,
+        ))
+        panels_top = tab_top + TabStrip.H + pad
+
+        panels = self.active_panels()
+        if not panels:
+            return
         collapsed_h = PanelChrome.HEADER_H + PanelChrome.COLLAPSED_LIP
 
-        total_h = sb.h - 2 * pad
-        gap_total = pad * (len(panels) - 1)
+        total_h = sb.bottom - pad - panels_top
+        gap_total = pad * (len(panels) - 1) if len(panels) > 1 else 0
         collapsed_total = sum(collapsed_h for p in panels if p.chrome.collapsed)
         expanded_panels = [p for p in panels if not p.chrome.collapsed]
         remaining = total_h - gap_total - collapsed_total
@@ -289,9 +342,11 @@ class Renderer:
                 h = max(min_expanded, int(remaining * p.preferred_h / weight_sum))
                 expanded_heights[id(p)] = h
                 allotted += h
-            expanded_heights[id(expanded_panels[-1])] = max(min_expanded, remaining - allotted)
+            expanded_heights[id(expanded_panels[-1])] = max(
+                min_expanded, remaining - allotted,
+            )
 
-        y = sb.top + pad
+        y = panels_top
         for p in panels:
             h = collapsed_h if p.chrome.collapsed else expanded_heights[id(p)]
             new_rect = pygame.Rect(col_x, y, panel_w, h)
@@ -399,7 +454,23 @@ class Renderer:
             surface, self._canvas_rect.inflate(-8, -8), CYAN_BRIGHT, size=14, width=2,
         )
 
+        # Retrievability overlay — pinned to the canvas bottom-right.
+        # Underscore-prefixed helper, but the same one used by the live
+        # Store-gate flow + SingleTaskEnv require_solvable retry loop.
+        from oos.sim.shuffle import _layout_is_solvable
+        solvable = _layout_is_solvable(facility)
+        ov = self._solvability_overlay
+        pad = 16
+        ov.set_rect(pygame.Rect(
+            self._canvas_rect.right - ov.W - pad,
+            self._canvas_rect.bottom - ov.H - pad,
+            ov.W, ov.H,
+        ))
+        ov.update(solvable)
+        ov.draw(surface, self.fonts)
+
         # Sidebar — push per-frame state into each content, then draw panels.
+        # Always update both tab groups (cheap), but only draw the active one.
         self._stats_panel.content.update(
             sim_time=rs.anim_now,
             wall_speed=rs.wall_speed,
@@ -415,16 +486,15 @@ class Renderer:
             pending=queue.pending, now=rs.anim_now, manual_mode=manual_mode,
         )
         self._dist_panel.content.update(
-            logits=rs.policy_logits,
-            action_mask=rs.policy_action_mask,
-            chosen=rs.policy_chosen,
-            action_entries=rs.policy_action_entries,
+            query_log=rs.policy_query_log,
+            last_queried=rs.querying,
             mouse_pos=rs.mouse_pos,
         )
-        for panel in (
-            self._stats_panel, self._queue_panel, self._dist_panel,
-            self._controls_panel, self._legend_panel,
-        ):
+        self._randomize_panel.content.update(wall_now=rs.wall_now)  # type: ignore[attr-defined]
+
+        # Tab strip first, then the active tab's panels.
+        self._tab_strip.draw(surface, self.fonts)
+        for panel in self.active_panels():
             panel.draw(surface, self.fonts)
 
         draw_scanlines(

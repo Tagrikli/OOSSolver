@@ -52,7 +52,16 @@ class SimDriver:
 
     def submit_one(self) -> None:
         env = self.player.env
+        # Snapshot the querying carrier BEFORE policy() / env.submit_action
+        # mutate env state — we need it to log the query under the right
+        # carrier id.
+        carrier_at_query = str(env._ctx.querying_carrier)  # type: ignore[attr-defined]
         action_idx = self.player.policy(self.player.obs, self.player.info)
+        # Capture the policy's last-query outputs against THIS carrier
+        # immediately. drive_anim can loop submit_one many times per
+        # frame; if we wait until render time, only the last carrier
+        # queried in the frame would be visible.
+        self._log_policy_query(carrier_at_query)
         # Belt-and-suspenders: clamp out-of-range actions to WAIT (always
         # the last legal entry per enumerate_actions).
         live_n_legal = len(env._ctx.decoder.entries)  # type: ignore[attr-defined]
@@ -125,6 +134,24 @@ class SimDriver:
             self.toasts.error("−IDLE", lifetime=1.5)
 
     # ---- internal ---------------------------------------------------------
+
+    def _log_policy_query(self, carrier_id: str) -> None:
+        """Snapshot `policy.last_*` into the player's per-carrier log."""
+        policy = self.player.policy
+        logits = getattr(policy, "last_logits", None)
+        mask = getattr(policy, "last_action_mask", None)
+        chosen = getattr(policy, "last_chosen", None)
+        if logits is None or mask is None:
+            return  # random policy / nothing to record
+        # Shallow copy of logits/mask so the next query doesn't mutate
+        # the stored snapshot in place (LearnedPolicy reassigns the field
+        # but defensive against in-place updates from custom policies).
+        self.player.policy_query_log[carrier_id] = {
+            "logits": logits.copy() if hasattr(logits, "copy") else logits,
+            "mask": mask.copy() if hasattr(mask, "copy") else mask,
+            "chosen": chosen,
+            "entries": list(self.player.info.get("action_entries", [])),
+        }
 
     def _record_advance(self, obs, reward, term, trunc, info) -> None:
         self.player.obs = obs

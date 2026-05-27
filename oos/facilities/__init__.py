@@ -2,6 +2,7 @@
 
 from typing import Callable
 
+from oos.facilities.campus import make_facility as make_campus_facility
 from oos.facilities.dibaji import make_facility as make_dibaji_facility
 from oos.facilities.mini import make_facility as make_mini_facility
 from oos.facilities.stacker import make_facility as make_stacker_facility
@@ -24,6 +25,7 @@ FACILITIES: dict[str, FacilityFactory] = {
     "stacker_deep": make_stacker_deep_facility,
     "stacker_wide": make_stacker_wide_facility,
     "dibaji":       make_dibaji_facility,
+    "campus":       make_campus_facility,
 }
 
 

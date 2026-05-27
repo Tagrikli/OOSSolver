@@ -91,6 +91,76 @@ def rewrap_with_mcts(
         toasts.warn("MCTS OFF  (reactive policy only)", lifetime=3.0)
 
 
+def generate_single_task(
+    params: dict,
+    player: Player,
+    facility,
+    facility_name: str,
+    toasts: ToastManager,
+) -> bool:
+    """Replace `player.env` with a fresh SingleTaskEnv wired to the
+    configured knobs, then reset. Returns True on success, False if
+    params failed validation. The caller is responsible for syncing
+    any cached `facility` reference after reset (the SingleTaskEnv
+    builds its own facility from the same factory).
+    """
+    from oos.facilities import get_facility
+    from oos.learn.single_task_env import (
+        SingleTaskConfig,
+        SingleTaskEnv,
+        SingleTaskRewardConfig,
+    )
+    try:
+        br_lo = float(params["big_ratio_low"])
+        br_hi = float(params["big_ratio_high"])
+        sr_lo = float(params["small_ratio_low"])
+        sr_hi = float(params["small_ratio_high"])
+        # Auto-swap inverted ranges instead of crashing — friendlier than
+        # making the user reorder sliders by hand.
+        if br_lo > br_hi:
+            br_lo, br_hi = br_hi, br_lo
+            toasts.warn("big_ratio: low > high — swapped", lifetime=3.0)
+        if sr_lo > sr_hi:
+            sr_lo, sr_hi = sr_hi, sr_lo
+            toasts.warn("small_ratio: low > high — swapped", lifetime=3.0)
+        depths = tuple(int(d) for d in params["target_depths"])
+        if not depths:
+            toasts.error("select at least one target depth")
+            return False
+        task_cfg = SingleTaskConfig(
+            bring_empty_prob=float(params["bring_empty_prob"]),
+            big_ratio_range=(br_lo, br_hi),
+            small_ratio_range=(sr_lo, sr_hi),
+            target_depth_choices=depths,
+            room_state_probs=tuple(
+                float(p) for p in params["room_state_probs"]
+            ),
+        )
+    except (KeyError, ValueError, TypeError) as e:
+        toasts.error(f"GEN FAILED: {type(e).__name__}: {e}"[:80])
+        return False
+    old_env = player.env
+    preserve_auto = facility.auto_arrivals_enabled
+    new_env = SingleTaskEnv(
+        facility_factory=get_facility(facility_name),
+        task_config=task_cfg,
+        reward_config=SingleTaskRewardConfig(),
+        experiment_config=old_env._experiment_cfg,  # type: ignore[attr-defined]
+    )
+    player.env = new_env
+    player.policy = random_policy
+    # Fresh seed per Generate — Player.reset() reuses player.seed, so
+    # without this every press would produce the same RNG stream and
+    # the same layout.
+    import secrets
+    player.seed = secrets.randbits(31)
+    player.reset()
+    new_facility = player.env._ctx.facility  # type: ignore[attr-defined]
+    new_facility.set_auto_arrivals(preserve_auto)
+    toasts.success("GENERATED single-task initial state", lifetime=3.0)
+    return True
+
+
 def swap_facility(
     name: str,
     player: Player,

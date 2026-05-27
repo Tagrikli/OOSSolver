@@ -18,6 +18,7 @@ from oos.viz.sidebar.controls import ControlsContent
 from oos.viz.sidebar.distribution import DistributionContent
 from oos.viz.sidebar.legend import LegendContent
 from oos.viz.sidebar.queue import QueueContent
+from oos.viz.sidebar.randomize import RandomizeContent
 from oos.viz.sidebar.stats import StatsContent
 
 __all__ = [
@@ -25,5 +26,6 @@ __all__ = [
     "DistributionContent",
     "LegendContent",
     "QueueContent",
+    "RandomizeContent",
     "StatsContent",
 ]

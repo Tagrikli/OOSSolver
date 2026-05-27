@@ -45,6 +45,13 @@ class Player:
     total_completions: int = 0
     done: bool = False
 
+    # Per-carrier snapshot of the most recent policy query for that
+    # carrier. Updated by SimDriver after every submit_one call (NOT at
+    # render time) so that multiple decisions resolved within a single
+    # render frame don't clobber each other in the viz.
+    # Schema: { carrier_id: { "logits", "mask", "chosen", "entries" } }
+    policy_query_log: dict = field(default_factory=dict)
+
     def reset(self) -> None:
         self.obs, self.info = self.env.reset(seed=self.seed)
         self.last_record = None

@@ -17,17 +17,26 @@ from oos.viz.components.widgets._helpers import pallet_color, short_action_label
 from oos.viz.components.widgets.carrier_icon import CarrierIconWidget
 from oos.viz.components.widgets.carrier_panel import CarrierPanel
 from oos.viz.components.widgets.carrier_strip import CarrierStripBackground
+from oos.viz.components.widgets.checkbox import Checkbox, CheckboxGroup
 from oos.viz.components.widgets.customer_queue import CustomerQueueWidget
+from oos.viz.components.widgets.numeric_field import NumericField
 from oos.viz.components.widgets.room import RoomWidget
 from oos.viz.components.widgets.shelf import ShelfWidget
+from oos.viz.components.widgets.solvability_overlay import SolvabilityOverlay
+from oos.viz.components.widgets.tab_strip import TabStrip
 
 __all__ = [
     "CarrierIconWidget",
     "CarrierPanel",
     "CarrierStripBackground",
+    "Checkbox",
+    "CheckboxGroup",
     "CustomerQueueWidget",
+    "NumericField",
     "RoomWidget",
     "ShelfWidget",
+    "SolvabilityOverlay",
+    "TabStrip",
     "pallet_color",
     "short_action_label",
 ]
