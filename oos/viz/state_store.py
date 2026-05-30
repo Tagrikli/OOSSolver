@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 _STATE_FILENAME = ".viz_state.json"
@@ -27,6 +27,13 @@ class VizState:
     policy_path: Optional[str] = None  # absolute path to .pt, or None for random
     zoom: float = 1.0                  # canvas px-per-mm zoom multiplier
     speed: float = 1.0                 # animation speed multiplier (+/- keys)
+    # Explicit-sampler knob values from the RANDOMIZE tab (big_shelf_fullness,
+    # system_fullness, big_ratio, big_disorder, small_disorder, target_depth,
+    # task, retrieve_from, retrieve_route, room_state). Empty = use defaults.
+    randomize: dict = field(default_factory=dict)
+    # Auto-queue (task-stream) knob values from the AUTO-QUEUE tab:
+    # store_rate, big_prob, mean_dwell, std_dwell. Empty = use boot defaults.
+    auto_queue: dict = field(default_factory=dict)
 
 
 def _state_path(runs_dir: str) -> str:
@@ -66,11 +73,17 @@ def load_viz_state(runs_dir: str = "runs") -> VizState:
             speed = 1.0
     except (TypeError, ValueError):
         speed = 1.0
+    raw_randomize = data.get("randomize")
+    randomize = raw_randomize if isinstance(raw_randomize, dict) else {}
+    raw_auto_queue = data.get("auto_queue")
+    auto_queue = raw_auto_queue if isinstance(raw_auto_queue, dict) else {}
     return VizState(
         facility_name=facility if isinstance(facility, str) else None,
         policy_path=policy_path,
         zoom=zoom,
         speed=speed,
+        randomize=randomize,
+        auto_queue=auto_queue,
     )
 
 
@@ -80,6 +93,8 @@ def save_viz_state(
     policy_path: Optional[str] = None,
     zoom: Optional[float] = None,
     speed: Optional[float] = None,
+    randomize: Optional[dict] = None,
+    auto_queue: Optional[dict] = None,
 ) -> None:
     """Persist the current viz selection. Any arg can be None to leave that
     field unset. Silent on write failure (e.g., read-only fs)."""
@@ -97,11 +112,17 @@ def save_viz_state(
         state.zoom = float(zoom)
     if speed is not None and speed > 0.0:
         state.speed = float(speed)
+    if isinstance(randomize, dict):
+        state.randomize = randomize
+    if isinstance(auto_queue, dict):
+        state.auto_queue = auto_queue
     payload = {
         "facility_name": state.facility_name,
         "policy_path": state.policy_path,
         "zoom": state.zoom,
         "speed": state.speed,
+        "randomize": state.randomize,
+        "auto_queue": state.auto_queue,
     }
     try:
         with open(_state_path(runs_dir), "w") as f:

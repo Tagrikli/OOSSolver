@@ -1,12 +1,12 @@
-"""Embeddable RL agent — drives a Facility step-by-step.
+"""Embeddable RL agent — drives an Environment step-by-step.
 
 For embedding in other projects:
 
-    from oos.facility import Facility
+    from oos.env import Environment
     from oos.agent import Agent
 
-    facility = Facility.from_name("campus")
-    agent = Agent.from_checkpoint("runs/.../ckpt_best.pt", facility=facility)
+    env = Environment.from_name("campus")
+    agent = Agent.from_checkpoint("runs/.../ckpt_best.pt", facility=env)
     obs, info = agent.reset(seed=0)
     while not agent.done:
         step = agent.step()

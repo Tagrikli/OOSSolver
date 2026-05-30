@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 from oos.config.schema import EpisodeConfig, ExperimentConfig, TaskStreamConfig
-from oos.env import OOSEnv
+from oos.env import Environment
 from oos.facilities import get_facility
 
 make_facility = get_facility("tiny")
@@ -34,7 +34,7 @@ def test_env_reset_and_random_rollout():
         ),
         episode=EpisodeConfig(max_sim_time=200.0, max_steps=500),
     )
-    env = OOSEnv(facility_factory=make_facility, experiment_config=cfg)
+    env = Environment(facility_factory=make_facility, experiment_config=cfg)
     obs, info = env.reset(seed=42)
 
     # tiny: 2 carriers, 4 shelves, 1 room.
@@ -66,7 +66,7 @@ def test_pallet_count_conserved():
         ),
         episode=EpisodeConfig(max_sim_time=400.0, max_steps=2000),
     )
-    env = OOSEnv(facility_factory=make_facility, experiment_config=cfg)
+    env = Environment(facility_factory=make_facility, experiment_config=cfg)
     obs, _ = env.reset(seed=7)
     fac = env._ctx.facility
 
@@ -104,13 +104,13 @@ def test_big_stores_dropped_when_big_capacity_exhausted():
     arrivals) get silently dropped — not as a rejection, just as natural
     capacity behavior. Small Stores are unaffected.
     """
-    from oos.sim.facility import Facility, SeedingConfig
+    from oos.sim.facility import SimEngine, SeedingConfig
     from oos.sim.durations import LinearDurations
     from oos.sim.state import Pallet
     from oos.sim.tasks import Store
 
     topo, _ = make_facility()
-    fac = Facility(
+    fac = SimEngine(
         topology=topo,
         seeding=SeedingConfig(empties_on_shelf={}),
         durations=LinearDurations(),
@@ -163,7 +163,7 @@ def test_determinism_across_seeds():
     )
 
     def run(seed: int) -> tuple[float, float]:
-        env = OOSEnv(facility_factory=make_facility, experiment_config=cfg)
+        env = Environment(facility_factory=make_facility, experiment_config=cfg)
         obs, _ = env.reset(seed=seed)
         rng = np.random.default_rng(seed)
         total = 0.0

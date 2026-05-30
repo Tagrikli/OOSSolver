@@ -9,6 +9,7 @@ from oos.facilities.stacker import make_facility as make_stacker_facility
 from oos.facilities.stacker_deep import make_facility as make_stacker_deep_facility
 from oos.facilities.stacker_wide import make_facility as make_stacker_wide_facility
 from oos.facilities.tiny import make_facility as make_tiny_facility
+from oos.facilities.tiny_medipol import make_facility as make_tiny_medipol_facility
 from oos.facilities.tiny_tall import make_facility as make_tiny_tall_facility
 from oos.facilities.tiny_wide import make_facility as make_tiny_wide_facility
 from oos.sim.facility import SeedingConfig
@@ -21,6 +22,7 @@ FACILITIES: dict[str, FacilityFactory] = {
     "tiny":         make_tiny_facility,
     "tiny_tall":    make_tiny_tall_facility,
     "tiny_wide":    make_tiny_wide_facility,
+    "tiny_medipol": make_tiny_medipol_facility,
     "stacker":      make_stacker_facility,
     "stacker_deep": make_stacker_deep_facility,
     "stacker_wide": make_stacker_wide_facility,

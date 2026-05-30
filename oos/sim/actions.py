@@ -15,7 +15,8 @@ Auto-driven side-effects:
 Policy-visible Commands:
   - Relocate(carrier, src, dst)  — the one workhorse
   - MoveToPartner(carrier, partner)  — positions for an upcoming auto-handoff
-  - Wait(carrier)  — voluntary idle
+  - (WAIT is not a Command — a carrier choosing WAIT just holds in place;
+     see `Facility.wait` / `CarrierState.waiting`)
   - (Move is still used internally by the viz for free-form positioning)
   - (Handoff is constructed by facility, never by the policy)
 """
@@ -201,8 +202,8 @@ class Move(Command):
                 f"move target {self.target} out of range for {self.carrier_id}"
             )
         cs = state.carriers[self.carrier_id]
-        if not cs.is_idle:
-            raise PreconditionError(f"carrier {self.carrier_id} is not idle")
+        if cs.is_busy:
+            raise PreconditionError(f"carrier {self.carrier_id} is busy")
 
     def start(
         self, state: FacilityState, topo: Topology, durations, now: SimTime
@@ -250,8 +251,8 @@ class Relocate(Command):
             raise PreconditionError(
                 f"carrier {self.carrier_id} is loaded; only Relocate-empty supported"
             )
-        if not cs.is_idle:
-            raise PreconditionError(f"carrier {self.carrier_id} is not idle")
+        if cs.is_busy:
+            raise PreconditionError(f"carrier {self.carrier_id} is busy")
         if self.src == self.dst:
             raise PreconditionError("relocate src and dst must differ")
         # Endpoint existence.
@@ -317,11 +318,6 @@ class Relocate(Command):
         cs.position = dst_pos
         # No carrier load — pallet went directly from src to dst.
         cs.load = None
-        # Track for the immediate-undo mask in enumerate_actions: relocating
-        # back along the same edge in the next decision is a no-op cycle.
-        # The src half is the "take" we just did; the dst half is the "give".
-        cs.last_take_shelf = self.src if self.src in topo.shelves else None
-        cs.last_give_shelf = self.dst if self.dst in topo.shelves else None
 
 
 # ---------------------------------------------------------------------------
@@ -383,10 +379,10 @@ class MultiRelocate(Command):
         # Both carriers idle and empty.
         a_cs = state.carriers[self.carrier_id]
         b_cs = state.carriers[self.partner_id]
-        if not a_cs.is_idle:
-            raise PreconditionError(f"carrier {self.carrier_id} is not idle")
-        if not b_cs.is_idle:
-            raise PreconditionError(f"partner {self.partner_id} is not idle")
+        if a_cs.is_busy:
+            raise PreconditionError(f"carrier {self.carrier_id} is busy")
+        if b_cs.is_busy:
+            raise PreconditionError(f"partner {self.partner_id} is busy")
         if a_cs.load is not None:
             raise PreconditionError(f"carrier {self.carrier_id} is loaded")
         if b_cs.load is not None:
@@ -472,55 +468,17 @@ class MultiRelocate(Command):
         b_cs.position = dst_pos
         a_cs.load = None
         b_cs.load = None
-
-        # Undo masks: A "took" from src; B "gave" to dst.
-        a_cs.last_take_shelf = self.src if self.src in topo.shelves else None
-        a_cs.last_give_shelf = None
-        b_cs.last_take_shelf = None
-        b_cs.last_give_shelf = self.dst if self.dst in topo.shelves else None
         # The cleanup-mask "must_relocate_from" applies if B delivered to a
         # room and the room is still holding cargo — facility's _on_command_done
         # checks this after auto-serve runs.
 
 
 # ---------------------------------------------------------------------------
-# Wait — event-driven idle
+# WAIT is no longer a Command. A carrier that chooses WAIT simply holds —
+# it sets `CarrierState.waiting` (see `Facility`) and is not given a
+# `current_command`/`busy_until`, so it stays recruitable as a handoff
+# partner and is only re-queried when a state change re-opens its decision.
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Wait(Command):
-    """Voluntary idle for `duration` sim-seconds.
-
-    Treated by the engine exactly like Relocate/MultiRelocate: occupies
-    `current_command` + `busy_until` for the duration, fires a normal
-    `command_done` event when finished. The carrier becomes idle and
-    is re-queried by the env. No special-case flags — uniform with
-    every other Command.
-    """
-
-    carrier_id: CarrierId
-    duration: float = 300.0   # sim-seconds before the carrier is re-queried
-                              # (5 sim-minutes). External state changes
-                              # bypass this via Facility.wake_waiting_carriers.
-
-    @property
-    def carrier(self) -> CarrierId:
-        return self.carrier_id
-
-    def check_preconditions(self, state: FacilityState, topo: Topology) -> None:
-        cs = state.carriers[self.carrier_id]
-        if not cs.is_idle:
-            raise PreconditionError(f"carrier {self.carrier_id} is not idle")
-
-    def start(
-        self, state: FacilityState, topo: Topology, durations, now: SimTime
-    ) -> SimTime:
-        # Same contract as other commands: return busy_until.
-        return now + float(self.duration)
-
-    def complete(self, state: FacilityState, topo: Topology) -> None:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -530,13 +488,11 @@ class Wait(Command):
 
 
 def short_action_label(cmd: "Command | None") -> str:
-    """Compact human-readable label for a Command (or "idle" if None)."""
+    """Compact human-readable label for a Command (`None` == WAIT)."""
     if cmd is None:
-        return "idle"
+        return "wait"
     if isinstance(cmd, Relocate):
         return f"reloc {cmd.src}→{cmd.dst}"
     if isinstance(cmd, MultiRelocate):
         return f"multi {cmd.src}→[{cmd.partner_id}]→{cmd.dst}"
-    if isinstance(cmd, Wait):
-        return "wait"
     return type(cmd).__name__.lower()

@@ -6,10 +6,9 @@ from oos.sim.actions import (
     Move,
     MultiRelocate,
     Relocate,
-    Wait,
 )
 from oos.sim.durations import DurationModel, LinearDurations
-from oos.sim.facility import AdvanceResult, Facility, SeedingConfig, TaskCompletion
+from oos.sim.facility import AdvanceResult, SeedingConfig, SimEngine, TaskCompletion
 from oos.sim.scheduler import Event, Scheduler
 from oos.sim.state import (
     CarrierState,
@@ -47,8 +46,8 @@ __all__ = [
     "Command",
     "DurationModel",
     "Event",
-    "Facility",
     "FacilityState",
+    "SimEngine",
     "HandoffEdge",
     "InitialStateSampler",
     "InitialStateSamplerConfig",
@@ -77,6 +76,5 @@ __all__ = [
     "TaskQueue",
     "TaskStream",
     "Topology",
-    "Wait",
     "validate_topology",
 ]

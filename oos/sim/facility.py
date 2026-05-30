@@ -11,7 +11,6 @@ from oos.sim.actions import (
     Command,
     MultiRelocate,
     Relocate,
-    Wait,
 )
 from oos.sim.durations import DurationModel
 from oos.sim.scheduler import Event, Scheduler
@@ -32,6 +31,12 @@ from oos.sim.topology import CarrierId, RoomId, SizeClass, Topology
 class TaskCompletion:
     task: Task
     cost: float
+    # For a Retrieve: True iff a carrier *delivered* the target to the room in
+    # this event (a real dig). False = the pallet was already sitting at the
+    # room (e.g. a just-parked car whose dwell-retrieve fired) — a "free"
+    # completion the reward must NOT pay a delivery bonus for. Always True for
+    # Stores. This is what closes the parked-car exploit.
+    agent_delivered: bool = True
 
 
 @dataclass
@@ -50,8 +55,10 @@ class SeedingConfig:
     empties_on_shelf: dict[str, int] = field(default_factory=dict)
 
 
-class Facility:
-    """Owns topology, state, scheduler, task stream. Steps via submit/advance."""
+class SimEngine:
+    """The sim engine: owns topology, state, scheduler, and task stream. Steps
+    via submit/advance. One engine serves many Environments (which configure
+    its arrival process). The Environment exposes it as `.engine`."""
 
     def __init__(
         self,
@@ -85,10 +92,24 @@ class Facility:
         # don't reach the queue. Training leaves this True; the viz flips it
         # off so a fresh session doesn't immediately start serving customers.
         self.auto_arrivals_enabled = True
+        # When True, a big (SUV) Store arrival is admitted only if a big-shelf
+        # slot is free AND hypothetically placing a big there keeps the layout
+        # retrievable (`_layout_is_solvable`); otherwise it's dropped. Off by
+        # default (preserves the plain saturation-drop behavior for the viz
+        # and the existing envs); ContinuousEnv turns it on.
+        self.gate_big_retrievability = False
         # Completions produced by manual UI actions outside of an `advance_*`
         # call (e.g. `enqueue_store` triggers an auto-serve that completes a
         # task immediately). Drained into the next AdvanceResult.
         self._pending_completions: list[TaskCompletion] = []
+        # Optional predicate `(carrier_id) -> bool` injected by the env layer:
+        # "does this carrier have at least one non-WAIT action available?".
+        # A waiting carrier is only treated as needing a decision when this is
+        # True (so the policy is never queried at a WAIT-only instant). When
+        # None (sim used without the env), every waiting carrier needs a
+        # decision — the original behaviour. Lives here because the action
+        # enumeration is an env-layer concern and the sim must not import it.
+        self.decision_predicate: Optional[Callable[[CarrierId], bool]] = None
         self._schedule_next_arrival()
 
     # ------------------------------------------------------------------
@@ -147,15 +168,66 @@ class Facility:
             ps.command_start_position = ps.position
         self.scheduler.push(busy_until, "command_done", cmd.carrier)
 
-    def idle_carriers(self) -> list[CarrierId]:
-        """Carriers that need a decision right now — those without a
-        current_command. A carrier that just picked WAIT is "busy" with
-        its Wait command until busy_until elapses (same uniform path as
-        Relocate/MultiRelocate), so no special filtering is needed."""
-        return [
-            cid for cid, cs in self.state.carriers.items()
-            if cs.current_command is None
-        ]
+    def needs_decision(self, carrier_id: CarrierId) -> bool:
+        """True iff this carrier should be queried for an action right now:
+        it is waiting (not executing a command), has not already chosen WAIT
+        in the current unchanged state, and — when `decision_predicate` is
+        set — has at least one non-WAIT action available. WAIT-only instants
+        never need a decision, so the policy is only asked at real branch
+        points."""
+        cs = self.state.carriers[carrier_id]
+        if cs.is_busy or cs.waiting:
+            return False
+        if self.decision_predicate is None:
+            return True
+        return self.decision_predicate(carrier_id)
+
+    def carriers_needing_decision(self) -> list[CarrierId]:
+        """Carriers to query right now. Normally the non-holding waiting
+        carriers that have a real (non-WAIT) action — WAIT-only carriers are
+        skipped while anything else is in flight or able to act.
+
+        Frozen fallback: when nothing is in flight AND no carrier can act, the
+        episode is stuck but must NOT terminate — so query the non-holding
+        waiting carriers anyway (they will only have WAIT). The episode then
+        advances event-by-event (each arrival re-opens them), the policy keeps
+        being asked, and any "all idle" penalty keeps applying until the agent
+        is given something it can act on."""
+        ready = [cid for cid in self.state.carriers if self.needs_decision(cid)]
+        if ready:
+            return ready
+        if self.is_frozen():
+            return [
+                cid for cid, cs in self.state.carriers.items()
+                if not cs.is_busy and not cs.waiting
+            ]
+        return []
+
+    def is_frozen(self) -> bool:
+        """True iff the layout can make no progress on its own: nothing is in
+        flight (no carrier executing a command) AND no carrier could act even
+        with its WAIT-hold cleared. Because `enumerate_actions` ignores the
+        task queue, a pending arrival never changes which actions are legal —
+        only a completing command does — so a frozen layout stays frozen until
+        the agent itself is queried (the frozen fallback) and moves something.
+
+        With no `decision_predicate` (sim used standalone) we never report
+        frozen: every non-busy carrier is a decision point there."""
+        if any(cs.is_busy for cs in self.state.carriers.values()):
+            return False
+        if self.decision_predicate is None:
+            return False
+        return not any(
+            self.decision_predicate(cid)
+            for cid, cs in self.state.carriers.items()
+            if not cs.is_busy
+        )
+
+    def wait(self, carrier_id: CarrierId) -> None:
+        """Carrier chooses WAIT: hold in place until a state change re-opens
+        the decision. No timer, no `current_command` — the carrier stays
+        recruitable as a handoff partner but is not re-queried until then."""
+        self.state.carriers[carrier_id].waiting = True
 
     # ------------------------------------------------------------------
     # Manual task injection (used by the viz in manual mode; bypasses the
@@ -172,22 +244,13 @@ class Facility:
         self.queue.pending.clear()
 
     def wake_waiting_carriers(self) -> None:
-        """Force-complete any in-progress Wait commands so the carrier is
-        re-queried immediately on the next env advance. Used by manual
-        state mutations (button clicks, hot-keys) that want the agent to
-        react now instead of waiting out the remainder of its Wait
-        duration.
-
-        The originally-scheduled `command_done` event stays in the
-        scheduler; `_on_command_done` is idempotent against a cleared
-        `current_command` so it fires harmlessly when the timer hits.
-        """
+        """Re-open every waiting carrier's decision: clear the WAIT-hold flag
+        so a waiting carrier is re-queried on the next env advance. Called
+        internally after every state-changing event, and by manual state
+        mutations (button clicks, hot-keys) that want the agent to react now.
+        Carriers executing a real command are untouched."""
         for cs in self.state.carriers.values():
-            if isinstance(cs.current_command, Wait):
-                cs.current_command = None
-                cs.busy_until = None
-                cs.command_started_at = None
-                cs.command_start_position = None
+            cs.waiting = False
 
     def toggle_retrieve_for_pallet(self, pallet_id: PalletId) -> bool:
         """If a pending Retrieve for this pallet exists, remove it; else add
@@ -222,9 +285,15 @@ class Facility:
 
     def advance_until(self, time_limit: SimTime | None) -> AdvanceResult:
         """Process scheduler events until any of:
-        - a decision instant (a carrier becomes idle), OR
+        - a decision instant (a carrier needs a decision — see
+          `carriers_needing_decision`), OR
         - the next scheduled event is past `time_limit`, OR
         - the scheduler is empty (terminal).
+
+        Because WAIT-only instants don't need a decision, the clock fast-
+        forwards through every event that leaves all carriers either busy or
+        waiting-with-nothing-to-do, stopping only when some carrier has a real
+        choice (or time/scheduler runs out).
 
         When `time_limit` is set and reached without a decision, the clock is
         advanced to `time_limit` (so renderers can interpolate based on it).
@@ -238,7 +307,7 @@ class Facility:
         dropped: list[Task] = []
 
         peek = self.scheduler.peek_time()
-        if self.idle_carriers() and (peek is None or peek > self.state.time):
+        if self.carriers_needing_decision() and (peek is None or peek > self.state.time):
             if time_limit is not None and time_limit > self.state.time:
                 self.state.time = time_limit
             return AdvanceResult(dt=self.state.time - start_time)
@@ -291,7 +360,7 @@ class Facility:
             self.state.time = ev.when
             self._handle_event(ev, completions, arrivals, dropped)
 
-            if self.idle_carriers():
+            if self.carriers_needing_decision():
                 return AdvanceResult(
                     dt=self.state.time - start_time,
                     completions=completions,
@@ -328,6 +397,12 @@ class Facility:
             self._on_retrieve_arrival(ev.payload, arrivals, completions)
         else:
             raise RuntimeError(f"unknown event kind {kind}")
+        # Every event is a state change: a carrier finished, a task arrived, a
+        # room load changed. Re-open every waiting carrier's decision so a
+        # carrier that chose WAIT (or could now act, e.g. recruit a handoff
+        # partner that just became free) is re-queried at this instant instead
+        # of holding stale.
+        self.wake_waiting_carriers()
         # After every event, sweep big Stores from the queue if the facility
         # currently has no big capacity. This handles both "arrived when full"
         # and "queued, then capacity disappeared as more bigs landed".
@@ -338,9 +413,8 @@ class Facility:
     ) -> None:
         cs = self.state.carriers[carrier_id]
         cmd = cs.current_command
-        # Idempotent — if `wake_waiting_carriers` cleared this carrier's
-        # Wait early, the scheduled "command_done" timer still fires; we
-        # just have nothing to complete.
+        # Idempotent guard: nothing to complete if the carrier holds no
+        # command (e.g. a MultiRelocate already cleared by its partner).
         if cmd is None:
             return
         cmd.complete(self.state, self.topology)
@@ -360,7 +434,7 @@ class Facility:
         # changes. Both Relocate (single-carrier) and MultiRelocate (two-
         # carrier) can deposit into a room when their dst is a room.
         if isinstance(cmd, (Relocate, MultiRelocate)) and cmd.dst in self.topology.rooms:
-            self._try_auto_serve_room(cmd.dst, completions)
+            self._try_auto_serve_room(cmd.dst, completions, agent_deposit=True)
 
         # "Must cleanup" constraint maintenance — same logic for both
         # command types: whichever carrier ended up at the room (Relocate's
@@ -395,6 +469,15 @@ class Facility:
         # Recreate the task with the arrival time set to current sim time.
         if isinstance(task, Store):
             task = Store(arrived_at=self.state.time, size=task.size)
+            # Big-store admission gate (opt-in): a SUV is only accepted if a
+            # big slot is free and placing it keeps the facility retrievable.
+            if (
+                task.size == "big"
+                and self.gate_big_retrievability
+                and not self._big_admission_ok()
+            ):
+                dropped.append(task)
+                return
         elif isinstance(task, Retrieve):
             task = Retrieve(arrived_at=self.state.time, pallet=task.pallet)
         self.queue.add(task)
@@ -404,6 +487,30 @@ class Facility:
         # Any idle carrier already parked at a room they serve with a usable
         # load state should pick this customer up immediately.
         self._scan_all_for_auto_serve_rooms(completions)
+
+    def _big_admission_ok(self) -> bool:
+        """True iff a big (SUV) Store can be admitted right now: some big
+        shelf has a free slot AND hypothetically pushing a big onto it keeps
+        the layout retrievable. Used only when `gate_big_retrievability`."""
+        from oos.sim.shuffle import _layout_is_solvable
+        from oos.sim.state import Pallet
+
+        target = next(
+            (
+                sid for sid, shelf in self.topology.shelves.items()
+                if shelf.size_class == "big"
+                and self.state.shelves[sid].depth < shelf.capacity
+            ),
+            None,
+        )
+        if target is None:
+            return False
+        stack = self.state.shelves[target].stack
+        stack.append(Pallet(id=-1, contents="big"))   # hypothetical SUV
+        try:
+            return _layout_is_solvable(self)
+        finally:
+            stack.pop()
 
     def _can_accept_big_item(self) -> bool:
         """True iff at least one big-class shelf has a slot that is not
@@ -467,10 +574,17 @@ class Facility:
 
     def _try_auto_serve_room(
         self, room_id: RoomId, completions: list[TaskCompletion],
+        agent_deposit: bool = False,
     ) -> None:
         """If `room.load` matches a pending task, fire the customer interaction
         instantly. Retrieve takes priority over Store (when both could apply,
         the user-requested pallet wins).
+
+        `agent_deposit` is True only when called right after a carrier dropped a
+        pallet at this room (`_on_command_done`). A completed Retrieve records
+        it as `agent_delivered` so the reward can tell a real dig from a
+        parked-car free completion (a dwell-retrieve firing on a pallet that was
+        already sitting in the room).
 
         The carrier that did the deposit is already idle and free to leave —
         customer interactions are zero-duration in this simplified model.
@@ -553,7 +667,7 @@ class Facility:
         return None
 
 
-def _pallet_exists(facility: "Facility", pallet_id: PalletId) -> bool:
+def _pallet_exists(facility: "SimEngine", pallet_id: PalletId) -> bool:
     """True iff a pallet with `pallet_id` is somewhere in the facility
     (on a shelf, in a room's slot, or held by a carrier)."""
     for ss in facility.state.shelves.values():

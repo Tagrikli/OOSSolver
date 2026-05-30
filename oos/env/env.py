@@ -1,18 +1,24 @@
-"""Gymnasium env wrapping the sim, observation, action, reward."""
+"""Plain (non-gym) env wrapping the sim, observation, action, reward.
+
+Exposes the familiar `reset() -> (obs, info)` / `step() -> (obs, reward,
+terminated, truncated, info)` contract without depending on gymnasium —
+nothing real used gym's `spaces` (the network sizes off feature-name enums,
+the trainer reads only the discrete action count), and the `gym.Env` base
+class added nothing but indirection.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-import gymnasium as gym
 import numpy as np
-from gymnasium import spaces
 
 from oos.config.schema import ExperimentConfig
 from oos.env.action import (
     ActionDecoder,
     ActionEntry,
+    ActionType,
     enumerate_actions,
     max_actions_per_carrier,
 )
@@ -24,9 +30,10 @@ from oos.env.observation import (
     build_observation,
     shelf_feature_count,
 )
-from oos.env.reward import RewardConfig, compute_reward
+from oos.env.reward import RewardConfig, RewardEvent
+from oos.env.reward_system import RewardContext, StepEvents, base_system
 from oos.sim.durations import LinearDurations
-from oos.sim.facility import Facility, SeedingConfig
+from oos.sim.facility import SimEngine, SeedingConfig
 from oos.sim.tasks import PoissonTaskStream, Retrieve, Store
 from oos.sim.topology import CarrierId, Topology
 
@@ -40,15 +47,20 @@ FacilityFactory = Callable[[], tuple[Topology, SeedingConfig]]
 
 @dataclass
 class _StepContext:
-    facility: Facility
+    facility: SimEngine
     decoder: ActionDecoder
     querying_carrier: CarrierId
     pending_idle: list[CarrierId]   # carriers still to query at this instant
     instant_dt_consumed: bool       # set True after the first query of an instant
 
 
-class OOSEnv(gym.Env):
-    metadata = {"render_modes": []}
+class Environment:
+    """The runtime environment: owns observation/action encoding, the
+    per-carrier decision loop, episode control, and an injected RewardSystem.
+    Wraps one sim engine (`oos.sim.facility`). Exposes the training API
+    (`reset`/`step`/`advance`) and the embedding/viz API (`apply_action`/
+    `advance_until`/`submit_action`/state reads/`engine`). Subclasses define a
+    scenario via the `setup_episode` / `finalize_reset` hooks."""
 
     def __init__(
         self,
@@ -60,6 +72,10 @@ class OOSEnv(gym.Env):
         self._facility_factory = facility_factory
         self._experiment_cfg = experiment_config or ExperimentConfig()
         self._reward_cfg = reward_config or RewardConfig()
+        # Unified reward suite for the base (advance-path) reward. Subclasses
+        # that compute their own dense reward (ContinuousEnv, SingleTaskEnv)
+        # override it in step(); this still drives the viz/advance path.
+        self._reward_system = base_system(self._reward_cfg)
         self._obs_cfg = observation_config or ObservationConfig()
 
         # Build once to size the action space + observation space, and CACHE
@@ -77,55 +93,18 @@ class OOSEnv(gym.Env):
         self._n_shelves = len(topo.shelves)
         self._n_rooms = len(topo.rooms)
 
-        self.action_space = spaces.Discrete(self._n_max)
-        self.observation_space = self._make_obs_space()
+        # Discrete action count per carrier query (was `action_space.n`).
+        self.n_actions = self._n_max
 
         self._ctx: Optional[_StepContext] = None
         self._step_count: int = 0
         self._rng: np.random.Generator = np.random.default_rng(0)
 
     # ------------------------------------------------------------------
-    # Spaces
-    # ------------------------------------------------------------------
-
-    def _make_obs_space(self) -> spaces.Dict:
-        return spaces.Dict(
-            {
-                "carrier_features": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self._n_carriers, len(CARRIER_FEATURE_NAMES)),
-                    dtype=np.float32,
-                ),
-                "shelf_features": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self._n_shelves, shelf_feature_count()),
-                    dtype=np.float32,
-                ),
-                "room_features": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self._n_rooms, len(ROOM_FEATURE_NAMES)),
-                    dtype=np.float32,
-                ),
-                "global_features": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(len(GLOBAL_FEATURE_NAMES),),
-                    dtype=np.float32,
-                ),
-                "action_mask": spaces.Box(low=0, high=1, shape=(self._n_max,), dtype=np.int8),
-                "querying_carrier": spaces.Discrete(self._n_carriers),
-            }
-        )
-
-    # ------------------------------------------------------------------
     # Reset / Step
     # ------------------------------------------------------------------
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
-        super().reset(seed=seed)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         topo, seeding = self._cached_topology, self._cached_seeding
@@ -160,13 +139,19 @@ class OOSEnv(gym.Env):
                 return float("inf")
             return float(dwell_rng.gamma(shape=gamma_shape, scale=gamma_scale))
 
-        facility = Facility(
+        facility = SimEngine(
             topology=topo,
             seeding=seeding,
             durations=durations,
             task_stream=stream,
             rng=self._rng.spawn(1)[0],
             dwell_sampler=dwell_sampler,
+        )
+        # Teach the sim which instants are real decisions: a carrier needs a
+        # decision only when it has at least one non-WAIT action. WAIT-only
+        # instants are skipped, so the policy is queried only at branch points.
+        facility.decision_predicate = (
+            lambda cid, f=facility: self._has_non_wait_action(f, cid)
         )
 
         self._step_count = 0
@@ -186,11 +171,33 @@ class OOSEnv(gym.Env):
             pending_idle=pending,
             instant_dt_consumed=False,
         )
+        # Episode hooks: the subclass places the initial state, seeds tasks,
+        # and configures arrivals; then rebuild the decision context against
+        # the (possibly mutated) state and let the subclass augment the info.
+        self.setup_episode(facility, seed)
+        self.refresh_decision_context()
         obs, info = self._observation_for_current(facility, dt=0.0, completions=[], arrivals=[])
+        info["sim_time"] = facility.state.time
+        self.finalize_reset(obs, info)
         return obs, info
 
+    # ------------------------------------------------------------------
+    # Episode hooks — overridden by subclasses to define the scenario.
+    # The base env is a no-op scenario: keep the seeded layout, stream on.
+    # ------------------------------------------------------------------
+
+    def setup_episode(self, facility: SimEngine, seed: Optional[int]) -> None:
+        """Place the initial state, seed tasks, and configure the arrival
+        stream for a new episode. Called by `reset()` after the engine is
+        built but before the decision context is finalized."""
+
+    def finalize_reset(self, obs: dict, info: dict) -> None:
+        """Augment the freshly-built reset obs/info with scenario metadata
+        (level id, task fields, action-mask overrides). Base default: no-op."""
+
     def step(self, action: int):
-        """Standard Gym step: submit + advance to next decision."""
+        """Training step: submit the action + advance to the next decision.
+        Returns (obs, reward, terminated, truncated, info)."""
         self.submit_action(int(action))
         return self.advance(time_limit=None)
 
@@ -216,17 +223,22 @@ class OOSEnv(gym.Env):
         ctx = self._ctx
         facility = ctx.facility
         entry: ActionEntry = ctx.decoder.decode(int(action))
-        cmd = entry.to_command(ctx.querying_carrier)
-        try:
-            facility.submit(cmd)
-        except Exception as e:
-            raise IllegalActionError(str(e)) from e
-        # The submission may have locked other carriers as a side effect —
-        # MultiRelocate locks its partner busy. Strip any newly-busy carriers
-        # from pending_idle before continuing to query them.
+        if entry.type == ActionType.WAIT:
+            # WAIT is not a command — hold the carrier until a state change
+            # re-opens its decision (no timer, stays recruitable as a partner).
+            facility.wait(ctx.querying_carrier)
+        else:
+            cmd = entry.to_command(ctx.querying_carrier)
+            try:
+                facility.submit(cmd)
+            except Exception as e:
+                raise IllegalActionError(str(e)) from e
+        # Submitting may have locked another carrier (MultiRelocate locks its
+        # partner) and the carrier we just handled no longer needs a decision.
+        # Keep only carriers that still need one at this instant.
         ctx.pending_idle = [
             c for c in ctx.pending_idle
-            if facility.state.carriers[c].is_idle
+            if facility.needs_decision(c)
         ]
         if ctx.pending_idle:
             ctx.querying_carrier = ctx.pending_idle.pop(0)
@@ -262,9 +274,105 @@ class OOSEnv(gym.Env):
     def needs_decision(self) -> bool:
         """True iff the env is at a decision instant (a carrier needs an action)."""
         assert self._ctx is not None
-        return self._ctx.querying_carrier in self._ctx.facility.idle_carriers() and (
+        return self._ctx.facility.needs_decision(self._ctx.querying_carrier) and (
             len(self._ctx.decoder.entries) > 0
         )
+
+    # ------------------------------------------------------------------
+    # Embedding / viz API (the former `oos.facility` wrapper, merged in).
+    # The 3-tuple variants hide gym's term/trunc inside `info`; the viz and
+    # Agent use these, while training uses reset()/step()/advance() directly.
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_name(
+        cls,
+        facility_name: str,
+        experiment_config: Optional[ExperimentConfig] = None,
+        reward_config: Optional[RewardConfig] = None,
+        observation_config: Optional[ObservationConfig] = None,
+    ) -> "Environment":
+        """Build an Environment over a registered topology from `oos.facilities`.
+        For task-specific envs construct the subclass directly."""
+        from oos.facilities import get_facility
+        return cls(
+            facility_factory=get_facility(facility_name),
+            experiment_config=experiment_config,
+            reward_config=reward_config,
+            observation_config=observation_config,
+        )
+
+    def apply_action(self, action_idx: int) -> tuple[dict, float, dict]:
+        """Submit `action_idx` for the querying carrier, then advance to the
+        next decision instant. Returns (obs, reward, info) with episode
+        boundaries stashed in info["terminated"] / info["truncated"]."""
+        obs, reward, term, trunc, info = self.step(int(action_idx))
+        info["terminated"] = bool(term)
+        info["truncated"] = bool(trunc)
+        return obs, float(reward), info
+
+    def advance_until(
+        self, sim_time: Optional[float] = None
+    ) -> tuple[dict, float, dict]:
+        """Advance the sim WITHOUT submitting an action — until `sim_time` or
+        the next decision instant, whichever comes first (None → next
+        decision). The viz uses this for frame-bounded animation playback.
+        Returns (obs, reward, info)."""
+        obs, reward, term, trunc, info = self.advance(time_limit=sim_time)
+        info["terminated"] = bool(term)
+        info["truncated"] = bool(trunc)
+        return obs, float(reward), info
+
+    # ---- live state read-throughs (for rendering / inspection) -------
+
+    @property
+    def engine(self) -> SimEngine:
+        """The inner sim engine — escape hatch for raw Command submission and
+        state edits (manual_controls, scripted scenarios)."""
+        if self._ctx is None:
+            raise RuntimeError("engine accessed before reset() — call reset() first.")
+        return self._ctx.facility
+
+    @property
+    def state(self):
+        """Current FacilityState (carriers, shelves, rooms, scheduler)."""
+        return self.engine.state
+
+    @property
+    def topology(self):
+        """Static Topology (carrier tracks, shelf placements, handoffs)."""
+        return self.engine.topology
+
+    @property
+    def queue(self):
+        """Current TaskQueue (pending Stores / Retrieves)."""
+        return self.engine.queue
+
+    @property
+    def sim_time(self) -> float:
+        """Current simulation time."""
+        return self.engine.state.time
+
+    @property
+    def querying_carrier(self) -> str:
+        """ID of the carrier currently being queried (if any)."""
+        ctx = self._ctx
+        return str(ctx.querying_carrier) if ctx is not None else "?"
+
+    @property
+    def auto_arrivals_enabled(self) -> bool:
+        return self.engine.auto_arrivals_enabled
+
+    def set_auto_arrivals(self, enabled: bool) -> None:
+        self.engine.set_auto_arrivals(enabled)
+
+    def wake_waiting_carriers(self) -> None:
+        """Re-open every waiting carrier's decision and rebuild the cached
+        decision context against the mutated state — use after manual edits
+        (queue a Store, toggle a Retrieve, randomize shelves) so the agent
+        reacts immediately instead of holding on WAIT."""
+        self.engine.wake_waiting_carriers()
+        self.refresh_decision_context()
 
     def advance(self, time_limit=None):
         """Advance the scheduler up to time_limit (or until the next decision
@@ -287,7 +395,44 @@ class OOSEnv(gym.Env):
         n_stage_events = 0
         n_unstage_events = 0
         n_wrong_item_events = 0
+        # Ungated, symmetric room-workflow transition counts (used by the
+        # continuous env's room-shaping reward). Unlike n_stage/n_unstage above
+        # (which are gated on `no_retrieve_pending` for the legacy base reward),
+        # these fire regardless of pending tasks and form a potential over the
+        # room's load state {free, empty, filled}, so any pallet round-trip
+        # nets zero. free->empty = stage, empty->free = unstage, filled->free =
+        # evacuate; free->filled (a non-target car) is the existing
+        # n_wrong_item_events. The customer-serve transitions empty<->filled are
+        # NOT counted here — they are paid by SERVE / DELIVER instead.
+        n_room_stage = 0
+        n_room_unstage = 0
+        n_room_evacuate = 0
+        # Whether EVERY carrier has chosen WAIT at this resolved instant —
+        # snapshot BEFORE advancing, because the advance processes the next
+        # event which wakes (clears `waiting` on) all carriers. Only meaningful
+        # on a resolving step (all carriers at this instant have been queried,
+        # i.e. pending_idle is empty); intermediate mid-instant steps leave it
+        # False. Surfaced in info so reward shapers (e.g. ContinuousEnv's
+        # all-waiting penalties) can read the true "all declined to act" state.
+        all_carriers_waiting = False
+        # SimEngine state AT the decision point (before the advance mutates it),
+        # used by all-waiting reward shapers: was a Retrieve pending, was an
+        # empty pallet staged in a room. Snapshotted pre-advance because the
+        # advance fast-forwards to the next arrival, which can add a Retrieve
+        # or auto-serve away a staged empty.
+        retrieve_pending_now = False
+        room_has_staged_empty = False
         if not ctx.pending_idle:
+            all_carriers_waiting = all(
+                cs.waiting for cs in facility.state.carriers.values()
+            )
+            retrieve_pending_now = any(
+                isinstance(t, Retrieve) for t in facility.queue.pending
+            )
+            room_has_staged_empty = any(
+                rs.load is not None and rs.load.is_empty
+                for rs in facility.state.rooms.values()
+            )
             # Snapshot positions so we can charge a per-slot travel penalty.
             # Each command moves monotonically in one direction, so summed
             # |Δposition| over the advance interval equals total slots travelled.
@@ -330,12 +475,19 @@ class OOSEnv(gym.Env):
             # `filled → free` (cleanup of a Store-filled pallet) is a
             # necessary act for the next storing cycle and carries no penalty.
             # Retrieve completion (target arriving at room) is handled
-            # separately via Retrieve TaskCompletions in compute_reward.
+            # separately via Retrieve TaskCompletions in the reward suite.
             no_retrieve_pending = not any(
                 isinstance(t, Retrieve) for t in facility.queue.pending
             )
             store_credits = sum(
                 1 for c in completions if isinstance(c.task, Store)
+            )
+            # A Retrieve delivery nets free->empty (deliver the target, customer
+            # takes the car, the pallet is left empty). That empty is a serve
+            # byproduct paid by DELIVER, NOT a fresh agent stage — so consume one
+            # retrieve credit per such transition instead of counting a room-stage.
+            retrieve_credits = sum(
+                1 for c in completions if isinstance(c.task, Retrieve)
             )
             for rid, rs in facility.state.rooms.items():
                 prev = room_was[rid]
@@ -343,11 +495,24 @@ class OOSEnv(gym.Env):
                 if prev == "free" and curr == "empty":
                     if no_retrieve_pending:
                         n_stage_events += 1
+                    if retrieve_credits > 0:
+                        retrieve_credits -= 1   # delivery byproduct, paid by DELIVER
+                    else:
+                        n_room_stage += 1
                 elif prev == "free" and curr == "filled":
                     if store_credits > 0:
                         store_credits -= 1
                         if no_retrieve_pending:
                             n_stage_events += 1
+                        # Path-independent STAGE: the agent brought an empty
+                        # into the room (a real stage) and a pending Store
+                        # consumed it within this same advance, so the
+                        # intermediate `empty` never appears in the endpoint
+                        # diff (free->filled, not free->empty). Credit the stage
+                        # anyway — same total as staging then being served a
+                        # step later. Farm-safe: gated on a real Store
+                        # completion (store_credits > 0), which can't be faked.
+                        n_room_stage += 1
                     else:
                         # Agent placed a filled pallet at a free room and
                         # no Store consumed it. If it had been a target,
@@ -360,8 +525,13 @@ class OOSEnv(gym.Env):
                 elif prev == "empty" and curr == "free":
                     if no_retrieve_pending:
                         n_unstage_events += 1
+                    n_room_unstage += 1
+                elif prev == "filled" and curr == "free":
+                    # Agent evacuated a filled car out of the room (stowed it
+                    # back to a shelf). Symmetric counterpart of free->filled.
+                    n_room_evacuate += 1
             # If we reached a decision instant, set up the next query.
-            if facility.idle_carriers():
+            if facility.carriers_needing_decision():
                 ctx.pending_idle = self._fresh_pending_idle(facility)
                 if ctx.pending_idle:
                     ctx.querying_carrier = ctx.pending_idle.pop(0)
@@ -383,15 +553,37 @@ class OOSEnv(gym.Env):
         )
         idle_with_retrieve = retrieve_pending and no_carrier_working
 
-        reward, reward_events = compute_reward(
-            cfg=self._reward_cfg,
-            completions=completions,
+        # Typed (s → s') diff — the single source every reward context is
+        # built from. `n_free_deliveries` counts Retrieve completions that
+        # finished for an already-parked car (no agent deposit); the base
+        # DeliveryTerm subtracts them so parked-car retrieves don't pay DELIVER.
+        events = StepEvents(
+            completions=tuple(completions),
+            arrivals=tuple(arrivals),
+            dropped=tuple(dropped),
+            dt=total_dt,
             movement_distance=movement_distance,
+            n_deliveries=sum(
+                1 for c in completions if isinstance(c.task, Retrieve)),
+            n_free_deliveries=sum(
+                1 for c in completions
+                if isinstance(c.task, Retrieve) and not c.agent_delivered),
+            n_stores_served=sum(
+                1 for c in completions if isinstance(c.task, Store)),
+            n_room_stage=n_room_stage,
+            n_room_unstage=n_room_unstage,
+            n_room_evacuate=n_room_evacuate,
+            n_wrong_item=n_wrong_item_events,
             n_stage_events=n_stage_events,
             n_unstage_events=n_unstage_events,
-            n_wrong_item_events=n_wrong_item_events,
+            all_carriers_waiting=all_carriers_waiting,
+            retrieve_pending_at_decision=retrieve_pending_now,
+            room_has_staged_empty_at_decision=room_has_staged_empty,
             idle_with_retrieve=idle_with_retrieve,
         )
+        rctx = self._reward_context_from_events(events, facility)
+        reward, breakdown = self._reward_system.compute(rctx)
+        reward_events = [RewardEvent(k, v) for k, v in breakdown.items()]
 
         # `_step_count` counts gym-shaped decisions (incremented in
         # `step()` above), NOT raw advance calls. The viz drives the env
@@ -406,24 +598,68 @@ class OOSEnv(gym.Env):
         obs, info = self._observation_for_current(
             facility, total_dt, completions, arrivals, dropped
         )
+        # `events` is the typed source of truth; the scalar keys below are a
+        # compatibility view kept for the viz and any external readers.
+        info["events"] = events
         info["sim_time"] = facility.state.time
+        info["all_carriers_waiting"] = all_carriers_waiting
+        info["retrieve_pending_at_decision"] = retrieve_pending_now
+        info["room_has_staged_empty_at_decision"] = room_has_staged_empty
         info["n_stage_events"] = n_stage_events
         info["n_unstage_events"] = n_unstage_events
         info["n_wrong_item_events"] = n_wrong_item_events
+        info["n_room_stage"] = n_room_stage
+        info["n_room_unstage"] = n_room_unstage
+        info["n_room_evacuate"] = n_room_evacuate
         info["idle_with_retrieve"] = idle_with_retrieve
         info["reward_events"] = reward_events
+        info["reward_breakdown"] = breakdown
         info["movement_distance"] = float(movement_distance)
         return obs, float(reward), terminated, truncated, info
+
+    # ------------------------------------------------------------------
+    # Reward context
+    # ------------------------------------------------------------------
+
+    def _reward_context_from_events(
+        self, events: StepEvents, facility: SimEngine
+    ) -> RewardContext:
+        """Base (advance-path) reward context: DELIVER / STAGE / UNSTAGE /
+        WRONG / IDLE / MOVE, built purely from the typed `StepEvents`.
+        Subclasses with their own dense reward suite (ContinuousEnv,
+        SingleTaskEnv) build their own context from `info["events"]`."""
+        return RewardContext(
+            n_deliveries=events.n_deliveries,
+            n_free_deliveries=events.n_free_deliveries,
+            n_stage=events.n_stage_events,        # base uses retrieve-gated counts
+            n_unstage=events.n_unstage_events,
+            n_wrong=events.n_wrong_item,
+            movement_distance=events.movement_distance,
+            idle_with_retrieve=events.idle_with_retrieve,
+            completions=events.completions,
+            state=facility.state,
+            queue=facility.queue,
+            topology=facility.topology,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _fresh_pending_idle(self, facility: Facility) -> list[CarrierId]:
-        # facility.idle_carriers() returns only carriers with no current_command.
-        return sorted(facility.idle_carriers())
+    def _fresh_pending_idle(self, facility: SimEngine) -> list[CarrierId]:
+        # Carriers that need a decision now (waiting, not holding, with a
+        # non-WAIT action available — WAIT-only carriers are skipped).
+        return sorted(facility.carriers_needing_decision())
 
-    def _fresh_decoder(self, facility: Facility) -> ActionDecoder:
+    def _has_non_wait_action(self, facility: SimEngine, cid: CarrierId) -> bool:
+        """Decision predicate (injected into the sim): does this carrier have
+        at least one action other than WAIT right now?"""
+        entries = enumerate_actions(
+            cid, facility.state, facility.topology, facility.queue
+        )
+        return any(e.type != ActionType.WAIT for e in entries)
+
+    def _fresh_decoder(self, facility: SimEngine) -> ActionDecoder:
         idle = self._fresh_pending_idle(facility)
         if not idle:
             return ActionDecoder([], self._n_max)
@@ -438,7 +674,7 @@ class OOSEnv(gym.Env):
 
     def _observation_for_current(
         self,
-        facility: Facility,
+        facility: SimEngine,
         dt: float,
         completions: list,
         arrivals: list,

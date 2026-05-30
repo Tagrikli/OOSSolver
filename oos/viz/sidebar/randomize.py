@@ -1,13 +1,14 @@
 """RandomizeContent — panel body for the RANDOMIZE tab.
 
 Lists every SingleTaskEnv knob as either a NumericField (slider + typed
-input) or, for `target_depths`, a CheckboxGroup over the choices
-{1, 2, 3, 4}. A Generate button at the bottom fires `self.on_generate`
-with a parsed dict; the app wires that to a fresh SingleTaskEnv reset.
+input) for the continuous/int knobs, or a RadioGroup for the categorical
+ones (task, retrieve_from, room_state). A Generate button at the bottom
+fires `self.on_generate` with a parsed dict; the app wires that to a fresh
+SingleTaskEnv reset.
 
 Mouse routing model (driven by app.py):
   * MOUSEBUTTONDOWN  → `handle_mouse_down(pos)` — starts a numeric-field
-                       drag, toggles a checkbox, or fires Generate.
+                       drag, selects a radio, or fires Generate.
   * MOUSEMOTION      → `handle_mouse_motion(pos)` — forwards to the
                        currently-dragging field.
   * MOUSEBUTTONUP    → `handle_mouse_up(pos)` — ends the drag; if the
@@ -33,7 +34,7 @@ from oos.viz.components.palette import (
     YELLOW_BRIGHT,
     blit_text,
 )
-from oos.viz.components.widgets import CheckboxGroup, NumericField
+from oos.viz.components.widgets import NumericField, RadioGroup
 
 
 @dataclass(frozen=True)
@@ -48,22 +49,29 @@ class _FieldSpec:
     default: float
 
 
+# Numeric knobs (sliders / typed input). All forwarded straight to
+# SingleTaskConfig / InitialStateSampler.
 FIELD_SPECS: list[_FieldSpec] = [
-    _FieldSpec("bring_empty_prob",  "bring_empty_prob",   "float", 0.0, 1.0, 0.05, 0.0),
-    _FieldSpec("big_ratio_low",     "big_ratio_low",      "float", 0.0, 1.0, 0.05, 0.0),
-    _FieldSpec("big_ratio_high",    "big_ratio_high",     "float", 0.0, 1.0, 0.05, 0.0),
-    _FieldSpec("small_ratio_low",   "small_ratio_low",    "float", 0.0, 1.0, 0.05, 0.1),
-    _FieldSpec("small_ratio_high",  "small_ratio_high",   "float", 0.0, 1.0, 0.05, 0.1),
-    _FieldSpec("room_p_empty",      "room P(empty)",      "float", 0.0, 1.0, 0.05, 1.0),
-    _FieldSpec("room_p_small",      "room P(small_item)", "float", 0.0, 1.0, 0.05, 0.0),
-    _FieldSpec("room_p_big",        "room P(big_item)",   "float", 0.0, 1.0, 0.05, 0.0),
+    _FieldSpec("target_depth",       "target_depth",       "int",   0.0, 12.0, 1.0,  0.0),
+    _FieldSpec("big_shelf_fullness", "big_shelf_fullness", "float", 0.0, 1.0,  0.05, 0.5),
+    _FieldSpec("system_fullness",    "system_fullness",    "float", 0.0, 1.0,  0.05, 0.5),
+    _FieldSpec("big_ratio",          "big_ratio",          "float", 0.0, 1.0,  0.05, 0.5),
+    _FieldSpec("big_disorder",       "big_disorder",       "float", 0.0, 1.0,  0.05, 0.0),
+    _FieldSpec("small_disorder",     "small_disorder",     "float", 0.0, 1.0,  0.05, 0.0),
 ]
 
-# Target-depth checkbox values. Each box represents one element in the
-# `target_depth_choices` tuple SingleTaskConfig samples uniformly from.
-# Depth 0 = top of stack (the easiest, default-on case).
-TARGET_DEPTH_VALUES: list[int] = [0, 1, 2, 3, 4]
-TARGET_DEPTH_DEFAULT: tuple[int, ...] = (0,)
+# Categorical knobs (single-select radios). (value, display-label) pairs.
+RADIO_SPECS: list[tuple[str, str, list[tuple[str, str]], str]] = [
+    ("task", "task",
+     [("retrieve", "retrieve"), ("bring_empty", "bring_empty")], "retrieve"),
+    ("retrieve_from", "retrieve_from",
+     [("big", "big"), ("small", "small")], "big"),
+    ("retrieve_route", "retrieve_route",
+     [("direct", "direct"), ("handoff", "handoff")], "direct"),
+    ("room_state", "room_state",
+     [("empty", "empty"), ("small_item", "small"), ("big_item", "big")],
+     "empty"),
+]
 
 
 class RandomizeContent:
@@ -77,7 +85,7 @@ class RandomizeContent:
     BUTTON_TOP_GAP = 12
     HINT_H = 14
 
-    def __init__(self) -> None:
+    def __init__(self, initial: Optional[dict] = None) -> None:
         self._fields: dict[str, NumericField] = {}
         self._labels: dict[str, str] = {}
         for spec in FIELD_SPECS:
@@ -89,10 +97,29 @@ class RandomizeContent:
                 step=spec.step,
             )
             self._labels[spec.key] = spec.label
-        self._order = [s.key for s in FIELD_SPECS]
-        self._depth_group = CheckboxGroup(
-            values=TARGET_DEPTH_VALUES, initial=TARGET_DEPTH_DEFAULT,
+        self._field_order = [s.key for s in FIELD_SPECS]
+
+        self._radios: dict[str, RadioGroup] = {}
+        self._radio_labels: dict[str, str] = {}
+        for key, label, options, init in RADIO_SPECS:
+            self._radios[key] = RadioGroup(options, init)
+            self._radio_labels[key] = label
+        self._radio_order = [s[0] for s in RADIO_SPECS]
+
+        # Restore persisted knob values (from viz_state), if any.
+        if initial:
+            self.set_values(initial)
+
+        # Draw order: radios first (task / retrieve_from), then numeric
+        # knobs, then room_state radio last.
+        self._rows: list[tuple[str, str]] = (
+            [("radio", "task"),
+             ("radio", "retrieve_from"),
+             ("radio", "retrieve_route")]
+            + [("field", k) for k in self._field_order]
+            + [("radio", "room_state")]
         )
+
         self._generate_btn = Button(
             "generate", variant="accent", text="⟳ GENERATE",
         )
@@ -135,12 +162,13 @@ class RandomizeContent:
             self._focus(None)
             self._fire_generate()
             return True
-        # Target-depth checkboxes.
-        clicked_depth = self._depth_group.hit_test(pos)
-        if clicked_depth is not None:
-            self._depth_group.toggle(clicked_depth)
-            self._focus(None)
-            return True
+        # Radio groups: single-select.
+        for key, group in self._radios.items():
+            clicked = group.hit_test(pos)
+            if clicked is not None:
+                group.select(clicked)
+                self._focus(None)
+                return True
         # Numeric fields: start a (possibly-)drag.
         for key, field in self._fields.items():
             if field.hit_test(pos):
@@ -188,39 +216,53 @@ class RandomizeContent:
         if action == "tab":
             mods = pygame.key.get_mods()
             step = -1 if (mods & pygame.KMOD_SHIFT) else 1
-            i = self._order.index(self._focused_key)
-            self._focus(self._order[(i + step) % len(self._order)])
+            i = self._field_order.index(self._focused_key)
+            self._focus(self._field_order[(i + step) % len(self._field_order)])
             return True
         return True
+
+    # ---- value get/set -----------------------------------------------------
+
+    def current_values(self) -> dict:
+        """Snapshot every knob as a plain dict (the same shape passed to
+        `on_generate` and persisted in viz_state)."""
+        return {
+            "task":              self._radios["task"].selected(),
+            "retrieve_from":     self._radios["retrieve_from"].selected(),
+            "retrieve_route":    self._radios["retrieve_route"].selected(),
+            "target_depth":      int(self._fields["target_depth"].value),
+            "big_shelf_fullness": self._fields["big_shelf_fullness"].value,
+            "system_fullness":   self._fields["system_fullness"].value,
+            "big_ratio":         self._fields["big_ratio"].value,
+            "big_disorder":      self._fields["big_disorder"].value,
+            "small_disorder":    self._fields["small_disorder"].value,
+            "room_state":        self._radios["room_state"].selected(),
+        }
+
+    def set_values(self, values: dict) -> None:
+        """Apply persisted knob values. Unknown keys, out-of-range numbers,
+        and illegal radio options are ignored (the widget clamps numbers and
+        radios silently skip values not in their option set)."""
+        for key, field in self._fields.items():
+            if key in values:
+                try:
+                    field.set_value(float(values[key]))
+                except (TypeError, ValueError):
+                    pass
+        for key, group in self._radios.items():
+            val = values.get(key)
+            if isinstance(val, str) and val in group.values():
+                group.select(val)
 
     # ---- parse + dispatch --------------------------------------------------
 
     def _fire_generate(self) -> None:
-        depths = self._depth_group.selected()
-        if not depths:
-            self._last_error = "select at least one target depth"
-            if self.on_generate is not None:
-                self.on_generate({"_error": self._last_error})
-            return
-
         # Commit any in-progress edit before reading.
         if self._focused_key is not None:
             self._fields[self._focused_key].blur()
             self._focused_key = None
 
-        params = {
-            "bring_empty_prob":  self._fields["bring_empty_prob"].value,
-            "big_ratio_low":     self._fields["big_ratio_low"].value,
-            "big_ratio_high":    self._fields["big_ratio_high"].value,
-            "small_ratio_low":   self._fields["small_ratio_low"].value,
-            "small_ratio_high":  self._fields["small_ratio_high"].value,
-            "target_depths":     depths,
-            "room_state_probs":  (
-                self._fields["room_p_empty"].value,
-                self._fields["room_p_small"].value,
-                self._fields["room_p_big"].value,
-            ),
-        }
+        params = self.current_values()
         self._last_error = None
         if self.on_generate is not None:
             self.on_generate(params)
@@ -229,8 +271,7 @@ class RandomizeContent:
 
     def paint(self, surface: pygame.Surface, fonts: Fonts,
               body: pygame.Rect, panel) -> None:
-        # Content height = N numeric rows + 1 checkbox row + button + hint.
-        n_rows = len(self._order) + 1  # +1 for target_depths
+        n_rows = len(self._rows)
         rows_h = n_rows * self.ROW_H + (n_rows - 1) * self.ROW_GAP
         total_h = rows_h + self.BUTTON_TOP_GAP + self.BUTTON_H + self.HINT_H + 4
 
@@ -247,38 +288,37 @@ class RandomizeContent:
         field_left = x + label_w
         field_w = body.right - field_left - 12   # leave gutter for scrollbar
 
-        # Numeric rows.
-        for key in self._order:
-            label = self._labels[key]
-            field = self._fields[key]
+        for kind, key in self._rows:
             row_top = y
-            blit_text(
-                surface, label,
-                (x, row_top + (self.ROW_H - fonts.body.get_height()) // 2),
-                fonts.body, CYAN_MID,
-            )
-            field.set_rect(pygame.Rect(
-                field_left,
-                row_top + (self.ROW_H - self.FIELD_H) // 2,
-                max(40, field_w), self.FIELD_H,
-            ))
-            field.draw(surface, fonts, wall_now=self._wall_now)
+            if kind == "field":
+                label = self._labels[key]
+                field = self._fields[key]
+                blit_text(
+                    surface, label,
+                    (x, row_top + (self.ROW_H - fonts.body.get_height()) // 2),
+                    fonts.body, CYAN_MID,
+                )
+                field.set_rect(pygame.Rect(
+                    field_left,
+                    row_top + (self.ROW_H - self.FIELD_H) // 2,
+                    max(40, field_w), self.FIELD_H,
+                ))
+                field.draw(surface, fonts, wall_now=self._wall_now)
+            else:  # radio
+                label = self._radio_labels[key]
+                group = self._radios[key]
+                blit_text(
+                    surface, label,
+                    (x, row_top + (self.ROW_H - fonts.body.get_height()) // 2),
+                    fonts.body, CYAN_MID,
+                )
+                group.set_rect(pygame.Rect(
+                    field_left,
+                    row_top + (self.ROW_H - RadioGroup.H) // 2,
+                    max(40, field_w), RadioGroup.H,
+                ))
+                group.draw(surface, fonts)
             y += self.ROW_H + self.ROW_GAP
-
-        # target_depths checkbox row.
-        row_top = y
-        blit_text(
-            surface, "target_depths",
-            (x, row_top + (self.ROW_H - fonts.body.get_height()) // 2),
-            fonts.body, CYAN_MID,
-        )
-        self._depth_group.set_rect(pygame.Rect(
-            field_left,
-            row_top + (self.ROW_H - CheckboxGroup.H) // 2,
-            max(40, field_w), CheckboxGroup.H,
-        ))
-        self._depth_group.draw(surface, fonts)
-        y += self.ROW_H + self.ROW_GAP
 
         # Generate button + hint line.
         y += self.BUTTON_TOP_GAP - self.ROW_GAP

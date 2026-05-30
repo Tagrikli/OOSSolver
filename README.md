@@ -1,263 +1,210 @@
 # OOSKiller
 
-A simulator, DSL, Gymnasium environment, and pygame visualizer for the
-**OOS (Optimal Order Servicing) planner problem** — scheduling automated
-storage / retrieval over a network of carriers, shelves, rooms, and
-handoffs to minimize expected per-task customer wait time.
-
-The end goal is a single trained policy that controls a multi-carrier
-facility end-to-end. This repo is the substrate that policy will train
-on and run inside.
-
-## Status
-
-What ships today:
-
-- **Discrete-event sim** ([oos/sim/](oos/sim/)) — pure physics, no RL deps.
-- **Embedded Python DSL** ([oos/dsl/](oos/dsl/)) for authoring facilities.
-- **Gymnasium env** ([oos/env/](oos/env/)) with standard `step` and a
-  split-step API (`submit_action` + `advance(time_limit)`) for smooth
-  sub-event animation.
-- **Pygame visualizer** ([oos/viz/](oos/viz/)) — cyberpunk themed live
-  view of the facility with controls for stepping, speeding, and
-  toggling between animated and step-through modes. Pluggable policy.
-- **One hand-authored reference facility** ([oos/facilities/dev.py](oos/facilities/dev.py)):
-  3 carriers, 24 shelves (cap 4 each), 2 rooms, 2 handoffs.
-- **Smoke tests** ([tests/test_smoke.py](tests/test_smoke.py)) — DSL
-  build, env contract, pallet conservation, admission control,
-  determinism.
-
-What's deferred (clearly defined, not built yet):
-
-- **Heuristic baseline** (FIFO + nearest-shelf) for comparison.
-- **PPO trainer** + GNN policy network ([docs/SOLUTION_1.md](docs/SOLUTION_1.md)).
-- **Replay recorder / player** for deterministic re-runs.
-- **SubprocVecEnv** for parallel rollouts.
-- **Randomized topology generator** for cross-facility generalization.
-
-## Quick start
-
-```bash
-# install (uses uv, https://docs.astral.sh/uv/)
-uv sync
-
-# run the visualizer with a random policy on the dev facility
-uv run python -m oos.viz
-
-# run the test suite
-uv run pytest
-```
-
-In the visualizer:
-
-| Key | Action |
-|---|---|
-| `space` | pause / resume |
-| `→` | step one decision instant |
-| `m` | toggle anim ↔ step mode |
-| `+` / `-` | speed up / slow down |
-| `r` | reset env |
-| `q` / `esc` | quit |
-| mouse wheel | scroll the pending-tasks panel |
+OOSKiller trains a single reinforcement-learning agent to plan a Parkolay automated storage/retrieval system (ASRS) end-to-end. Customers arrive at rooms to **store** an item onto a staged empty pallet or to **retrieve** a specific stored item; fungible pallets move through a network of carriers (lifts = vertical, shuttles = horizontal) that hand off to each other and to LIFO shelves. The planner must, continuously and concurrently across every carrier, service the incoming store/retrieve stream so that the **expected per-task wait time** is minimized — reshuffling pallets between tasks to lower future cost while never stranding a room. The facility state is encoded as a typed graph and fed through a graph-attention trunk; a pointer-attention head picks **one carrier action per decision instant** with action masking, so one trained agent generalizes across facility layouts. Training is PPO against a torch-free discrete-event simulator, with the current research focus being continuous truncated-episode **Prioritized Level Replay (PLR)** on the `tiny_medipol` facility.
 
 ## The problem
 
-A facility has:
+A planner must service a store/retrieve stream over an ASRS while minimizing expected per-task wait (store cost = arrival → room ready with empty pallet; retrieve cost = request → item delivered to a room). What makes it hard: LIFO burial and blockers make relocation NP-hard, multiple carriers act concurrently with synchronized handoffs, the task distribution is unknown and estimated online, and a hard responsiveness constraint forbids ever stranding a room. The formal specification lives in [`docs/PROBLEM.md`](docs/PROBLEM.md); the design write-ups are in [`docs/`](docs/): [`SOLUTION_1.md`](docs/SOLUTION_1.md) (overall approach), [`SOLUTION_1_ENV.md`](docs/SOLUTION_1_ENV.md) (env design), [`SOLUTION_1_DSL.md`](docs/SOLUTION_1_DSL.md) (topology DSL), and [`SINGLE_TASK_ENV.md`](docs/SINGLE_TASK_ENV.md) (single-task env notes).
 
-- **Carriers** — 1D movers that travel a track of integer-numbered slots, holding at most one pallet.
-- **Shelves** — LIFO stacks (capacity 1–5) accessible by one carrier (or two, for transfer shelves).
-- **Rooms** — customer interface points served by exactly one carrier.
-- **Handoff poses** — synchronous swap points where two carriers exchange a pallet.
-- **Transfer shelves** — single-slot buffers shared by two carriers, time-decoupled.
-- **Pallets** — physical, conserved objects. Empty pallets become loaded when a customer drops an item; loaded pallets revert to empty when a customer collects one.
+## Architecture
 
-The exogenous task stream brings two kinds of work:
+The core is decomposed into four single-responsibility parts. A driver (a trainer or the visualizer) owns an **Agent**, which pairs an injected policy with an **Environment**. The Environment owns episode control and the per-carrier decision loop, and delegates to a **SimEngine** (the world) and an injected **RewardSystem** (the scoring).
 
-- **Store** — a customer with an item of a given size to deposit; the planner picks which room to direct them to.
-- **Retrieve** — a request for a specific item by id. Each stored item schedules its own retrieval after a per-item dwell time, so retrieves track real inventory lifecycle.
+```
+   driver (trainer / viz)
+        │
+        ▼
+   Agent ── policy (random / LearnedPolicy / MCTSPolicy)
+        │   pure (obs, info) -> action_idx
+        ▼
+   Environment            episode control, obs/action encoding,
+        │                 per-carrier decision loop, info["events"]
+        ├──────────────► SimEngine     discrete-event world engine:
+        │                              topology, state, scheduler, queue,
+        │                              dynamics, advance_until  (no torch)
+        └──────────────► RewardSystem  injected, pluggable reward suite:
+                                       StepEvents -> RewardContext -> (total, breakdown)
+```
 
-The planner controls:
+| Part | Module | Responsibility |
+|------|--------|----------------|
+| **Environment** | `oos/env/env.py` | Base class. Owns obs/action encoding, the per-carrier decision loop, episode control, and an injected RewardSystem. Exposes a training API (`reset`/`step`/`advance`) **and** an embedding/viz API (`apply_action`/`advance_until`/`submit_action`/`needs_decision`/`from_name`/…). Action count is `env.n_actions`. |
+| **SimEngine** | `oos/sim/facility.py` | The world engine: state, scheduler, task queue, dynamics, `advance_until`. RL-free and torch-free. Reached as `environment.engine`. |
+| **RewardSystem** | `oos/env/reward_system.py` | Pluggable reward suite (`RewardContext` + `RewardTerm` + factories), injectable into envs. Every term is a pure function of `(s, a, s')`. |
+| **Agent** | `oos/agent/agent.py` | One class, policy injected. Drives an Environment episode-by-episode, recording each decision as an `AgentStep`. UI-free and embeddable. |
 
-- **Room choice** for each incoming store (via the `STAGE_ROOM` action).
-- **Per-carrier routing**: `TAKE`/`GIVE` to shelves, `MOVE_TO_PARTNER`/`HANDOFF` for cross-carrier transfers, `DELIVER_ITEM` to fulfill retrieves, `PARK` to idle.
-- **Storage placement** for each newly-stored item.
-- **Eviction destinations** for blockers during retrieves.
-- **Background reshuffling** during idle time.
+Env subclasses (`ContinuousEnv`, `SingleTaskEnv`, `EpisodeEnv` in `oos/learn/`) are thin: they override only the `setup_episode(facility, seed)` and `finalize_reset(obs, info)` hooks (plus their own `step()` for dense-reward recomputation); none override `reset()`. The reward path is built from a typed `StepEvents` struct surfaced as `info["events"]`.
 
-The objective is the long-run expected per-task wait time. Details and formal model: [docs/PROBLEM.md](docs/PROBLEM.md).
-
-## Layout
+## Repository layout
 
 ```
 oos/
-├── sim/          # discrete-event physics; no RL or torch deps
-├── dsl/          # facility-authoring DSL (Python embedded)
-├── config/       # ExperimentConfig dataclasses
-├── facilities/   # hand-authored facilities (dev.py is the reference)
-├── env/          # gymnasium.Env wrapper
-└── viz/          # pygame live viewer with pluggable policy
+├── sim/         discrete-event facility SimEngine (state, scheduler, queue, dynamics) — no RL, no torch
+├── env/         Environment layer: typed-graph observation, action enum/masking, pluggable reward suite
+├── agent/       embeddable, UI-free Agent runtime (policy + Environment, step-by-step)
+├── learn/       the RL agent: GAT+pointer network, PPO, three trainers, PLR scheduler, viz policy adapters (the only torch package)
+├── viz/         pygame visualizer / interactive driver (canvas + tabbed sidebar)
+├── facilities/  hand-authored facility registry (FACILITIES name -> factory)
+├── dsl/         facility-definition builder DSL (authors + validates topologies)
+└── config/      experiment-config dataclasses (durations, task stream, episode budgets)
 
-docs/
-├── PROBLEM.md           # formal problem statement
-├── SOLUTION_1.md        # GNN + PPO design (not built yet)
-├── SOLUTION_1_DSL.md    # DSL design + API reference
-└── SOLUTION_1_ENV.md    # sim/env design + API reference
-
-tests/
-└── test_smoke.py        # 5 passing tests
+scripts/         shell launchers (train_*.sh) + standalone diagnostics (diagnose_zero.py, test_seeded.py)
+tests/           pytest suite (39 tests / 6 files): smoke, network, reward, shuffle, state-sampler, PLR
+docs/            PROBLEM.md (formal spec) + SOLUTION_1{,_ENV,_DSL}.md + SINGLE_TASK_ENV.md design write-ups
 ```
 
-## Key concepts at a glance
+A separation contract is enforced: `oos.sim` and `oos.env` must **never** import from `oos.learn` (torch is isolated to `oos.learn`).
 
-- **Pallets are conserved.** Same physical pallet morphs between empty and loaded states during customer interactions — never created, never destroyed.
-- **Carrier kind doesn't exist.** All carriers are 1D movers. Shuttle vs lift is a real-world detail the planner doesn't model.
-- **One customer queue.** Store arrivals go into a single global queue. The agent picks the room per store via the `STAGE_ROOM` action.
-- **Per-item dwell-time retrieval.** When an item is stored, the facility samples a delay from `Gamma(mean=300s, std=120s)` and schedules a retrieve for that specific item. Retrieves correlate with stores rather than being an independent Poisson process.
-- **Big-item admission control.** When every slot on every big shelf holds a big item, pending and incoming big stores are silently dropped from the queue — natural capacity behavior, not a rejection.
-- **Bundled movement.** `TAKE(A1)` means "move to A1's position, then take" — the policy never picks raw moves. The only standalone movement is `MOVE_TO_PARTNER` for handoff prep.
-- **Pessimistic shelf reservation.** Two carriers can't both `TAKE` the last pallet from a shared transfer shelf — in-flight takes/gives are subtracted/added when checking preconditions.
-- **Pallet conservation guard.** A regression test exercises 2000 random steps at high store rate and asserts the pallet count never changes from initial.
-- **Determinism.** Same seed + same action trace = byte-identical observations and rewards.
+## Neural architecture (brief)
 
-## Action space
+- **Typed-graph observation** — the facility is encoded as nodes in a canonical `[carriers | shelves | rooms]` index space (carrier / shelf / room / global features) with six typed edge families (`accesses`, `handoff`, `transfer`, `committed`, `in_flight_src`, `in_flight_partner`). An *in-flight overlay* projects mid-`Relocate`/`MultiRelocate` commitments onto carrier loads and source stack-pops so the observation reflects physically-correct in-transit state. Shelves are padded to a hard cap of 5 LIFO slots (index 0 = top).
+- **GAT trunk** — `TypedGATLayer` applies typed multi-head graph attention with per-edge-type weights, segment-softmax over destinations, residual + LayerNorm. `NetworkConfig` defaults to `hidden=64`, `n_heads=4`, and a library default of `n_gat_layers=0` (0 bypasses the trunk for tiny graphs). The continuous and single-task trainers raise the CLI `--n-gat-layers` default to **2** for multi-hop facilities like `tiny_medipol`; the episodic trainer leaves it at 0.
+- **Heads** — a mean-pool **value head**, and per-action-type **pointer-attention policy heads** that score `RELOCATE` / `MULTI_RELOCATE` against src/dst/partner node embeddings plus a targetless `WAIT` head; illegal slots are masked to `-inf`.
+- Because the network scores *node embeddings* via pointer attention and uses **no absolute IDs**, one trained agent transfers across facility layouts. The model is small (well under ~100k parameters at the default width).
 
-Seven action types, all with bundled movement where applicable:
+## Getting started
 
-| Action | Target | Effect |
-|---|---|---|
-| `TAKE` | shelf | move to shelf, pop top pallet onto carrier |
-| `GIVE` | shelf | move to shelf, push current pallet onto top (size-compatible) |
-| `HANDOFF` | partner carrier | instant transfer; both carriers must be co-located |
-| `MOVE_TO_PARTNER` | partner carrier | position at the handoff pose with this partner |
-| `STAGE_ROOM` | room | move to room with an empty pallet; locks in store cost |
-| `DELIVER_ITEM` | room | move to room with a loaded pallet; locks in retrieve cost if a pending retrieve matches |
-| `PARK` | — | brief no-op |
-
-Realized as `Discrete(N_max)` with an action mask in the observation;
-illegal indices have their logit set to `−∞` so the policy can never
-pick them.
-
-## Observation
-
-A typed-graph dict with four node types and four edge types:
-
-- **Carriers** (8 features each): position, load type, busy state, ETA, "is querying" flag.
-- **Shelves** (26 features each: 6 base + 5 slots × 4 one-hot): size class, capacity, depth, transfer flag, and the full per-slot stack content (one-hot of `{empty, empty pallet, small item, big item}`, padded with all-zeros for unused slots beyond capacity).
-- **Rooms** (4 features each): ready, carrier present, carrier busy at room, time since last use.
-- **Global** (6 features): queue mix (small / big / total), retrieve count, oldest pending age, normalized sim time.
-- **Edges**: `accesses` (carrier↔shelf, carrier↔room), `handoff` (carrier↔carrier), `transfer` (carrier↔transfer-shelf), `committed` (carrier→in-flight target).
-
-Full feature catalog and rationale: [docs/SOLUTION_1_ENV.md](docs/SOLUTION_1_ENV.md) §5.3.
-
-## Reward
-
-```
-r = − pending_weight        × dt × n_pending
-    − responsiveness_weight × stranding_penalty
-    + completion_bonus      × n_completions
-```
-
-`−dt × n_pending` is the workload-integrated cost — in expectation it
-sums to the negative of mean per-task wait time. Responsiveness is a
-soft penalty for being unable to stage any room before the next likely
-store arrival. Completion bonus is cosmetic; defaults to 0.
-
-The store/retrieve credit assignment problem is discussed in
-[docs/SOLUTION_1.md](docs/SOLUTION_1.md) §5 — the per-item dwell-time
-retrieval model gives the policy a real lifecycle signal that
-uncorrelated retrievals didn't.
-
-## Authoring a facility
-
-Hand-author in Python via the DSL:
-
-```python
-from oos.dsl import Facility
-
-fac = Facility("my_facility")
-
-C1 = fac.carrier("C1", positions=12)
-C2 = fac.carrier("C2", positions=12)
-C3 = fac.carrier("C3", positions=12)  # mediator (no room)
-
-# 8 shelves per carrier, alternating big/small, capacity 4
-sizes = ("big", "small") * 4
-for i, (slot, size) in enumerate(zip(range(2, 10), sizes), start=1):
-    C1.shelf(f"A{i}", at=slot, capacity=4, size=size)
-    C2.shelf(f"B{i}", at=slot, capacity=4, size=size)
-    C3.shelf(f"M{i}", at=slot, capacity=4, size=size)
-
-C1.room("R1", at=0)
-C2.room("R2", at=0)
-
-# C1↔C3 and C2↔C3 (no direct C1↔C2)
-fac.handoff(between=(C1, C3), at={C1: 1, C3: 1})
-fac.handoff(between=(C2, C3), at={C2: 2, C3: 2})
-
-# Seed up to (total_capacity − biggest_big_shelf_cap) empties
-fac.seed_pool()
-
-topology, seeding = fac.build()
-```
-
-Validation runs at `build()`. Full DSL reference: [docs/SOLUTION_1_DSL.md](docs/SOLUTION_1_DSL.md).
-
-## Plugging in a policy
-
-The visualizer takes a callable `policy_fn(obs, info) → action_idx`:
-
-```python
-import numpy as np
-from oos.viz.app import run_app
-from oos.env.env import OOSEnv
-from oos.facilities import make_facility
-
-def my_policy(obs, info):
-    # mask out illegal actions
-    legal = np.flatnonzero(obs["action_mask"])
-    # ... your logic here ...
-    return int(legal[0])
-
-env = OOSEnv(facility_factory=make_facility)
-run_app(env, policy=my_policy, seed=0)
-```
-
-When you have a trained agent, the same callable shape works — wrap
-your model's `predict` call.
-
-## Docs
-
-- [docs/PROBLEM.md](docs/PROBLEM.md) — formal problem statement and constraints
-- [docs/SOLUTION_1.md](docs/SOLUTION_1.md) — GNN encoder + pointer attention + PPO design (not built yet)
-- [docs/SOLUTION_1_ENV.md](docs/SOLUTION_1_ENV.md) — sim + env design + API reference
-- [docs/SOLUTION_1_DSL.md](docs/SOLUTION_1_DSL.md) — DSL design + API reference
-
-## Tests
+The project uses **uv** and requires **Python ≥ 3.12**.
 
 ```bash
-uv run pytest -q
+uv sync
 ```
 
-5 passing tests:
+Core dependencies: `numpy`, `pygame`, `torch`, `tensorboard` (and `pytest` as a dev dependency group).
 
-1. `test_dsl_builds_dev_facility` — DSL → sim contract
-2. `test_env_reset_and_random_rollout` — random policy runs to truncation
-3. `test_pallet_count_conserved` — 2000-step rollout, pallet count invariant
-4. `test_big_stores_dropped_when_big_capacity_exhausted` — admission control
-5. `test_determinism_across_seeds` — same seed = same trajectory
+### Run the tests
 
-## Dependencies
+```bash
+SDL_VIDEODRIVER=dummy uv run python -m pytest tests/ -q
+```
 
-- Python ≥ 3.12
-- `numpy`, `gymnasium`, `pygame` (runtime)
-- `pytest` (dev)
-- `uv` for environment management
+39 tests across 6 files (smoke / network / reward-system / shuffle / state-sampler / continuous-PLR). The `SDL_VIDEODRIVER=dummy` prefix runs headless.
 
-Managed via `pyproject.toml` + `uv.lock`. Run anything with `uv run ...`.
+### Visualizer
 
-## Conventions worth knowing
+```bash
+python -m oos.viz --facility tiny_medipol --seed 0
+```
 
-- **No legacy code.** When the model has changed (shuttle/lift dropped, transfer width dropped, `Room.accepted_sizes` dropped, `Store.room` dropped, etc.), all references are removed across sim, env, viz, tests, and docs. No backward-compat shims; nothing is deployed.
-- **Sim has no RL deps.** `oos.sim` does not import `oos.env`, `oos.config`, `oos.viz`, or any RL library. Hard rule.
-- **Pallet conservation is invariant.** Don't add code paths that create or destroy pallets — the regression test will catch it.
-- **Determinism is invariant.** Don't introduce `random.seed()` or `np.random.seed()` calls. Spawn child generators from the env's seeded generator.
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--facility` | persisted last-opened, else `tiny_medipol` | Which hand-authored facility to visualize (choices = registered facilities). |
+| `--seed` | `0` | RNG seed passed to `run_app`. |
+
+With no flags, `python -m oos.viz` opens your last-viewed facility (or `tiny_medipol` on a fresh checkout).
+
+### Trainers
+
+**Continuous PLR (current focus)** — `python -m oos.learn.train_continuous`. Each iteration is one truncated continuous episode; a `LevelScheduler` picks a hardness level and value-loss regret feeds back. Outputs `runs/<run-name>/{config.json, tb/, ckpt_latest.pt, metrics.jsonl, progress.md}`.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--facility` | `stacker` | Facility to train on. |
+| `--total-iterations` | `500` | Number of training iterations (each = one rollout-episode). |
+| `--steps-per-iter` | `1024` | Steps per episode (== `max_steps`); episode truncated at this cap. |
+| `--episodes-per-iter` | `1` | Episodes batched into one PPO update (each gets its own PLR level + regret). |
+| `--store-rate` | `0.1` | Poisson store arrival rate (tasks/sim-sec). |
+| `--replay-prob` | `0.5` | PLR probability of replaying a buffered level vs sampling a fresh one. |
+| `--delivery-bonus` | `50.0` | P1 reward: + per retrieve completion. |
+| `--store-serve-bonus` | `15.0` | P2 reward: + per store served (kept below `delivery-bonus`). |
+| `--regret-metric` | `l1_value_loss` | PLR scoring: `l1_value_loss` or `positive_value_loss`. |
+| `--n-gat-layers` | `2` | GAT trunk depth (library default is 0; this trainer raises it for multi-hop facilities). |
+| `--device` | `cpu` | Torch device. |
+| `--run-name` | auto `cont_<timestamp>` | Run name → `runs/<run-name>/`. |
+| `--resume` | — | Path to `ckpt_latest.pt` to continue from (restores net/optim/PLR buffer/counters). |
+
+```bash
+uv run python -m oos.learn.train_continuous \
+  --facility tiny_medipol --total-iterations 100 --steps-per-iter 1024 \
+  --store-rate 0.008 --replay-prob 0.5 --delivery-bonus 50 --store-serve-bonus 15 \
+  --n-gat-layers 2 --run-name medipol_cont1 --device cpu
+```
+
+**Two-phase store→retrieve** — `python -m oos.learn.train` (`EpisodeEnv`). Pallets start empty; phase 1 stores, phase 2 retrieves all; terminates on full clear or step cap. Supports `VecEnv` collection when `--n-envs > 1`, plus an `--eval-only` branch.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--facility` | `tiny` | Facility to train on. |
+| `--total-iterations` | `200` | Number of training iterations. |
+| `--steps-per-iter` | `2048` | Transitions collected per iteration. |
+| `--n-envs` | `1` | Parallel envs; `>1` uses VecEnv collection. |
+| `--big-prob` | `0.15` | Probability a sampled Store is big (gated; may downgrade to small). |
+| `--reward-retrieve` | `50.0` | Reward per Retrieve completion. |
+| `--max-episode-steps` | `400` | Step cap per full store+retrieve cycle. |
+| `--n-gat-layers` | `0` | GAT trunk depth. |
+| `--eval-only` | `False` | Skip training; run `--eval-episodes` and report. |
+| `--device` | `cpu` | Torch device. |
+| `--run-name` | auto `episode_<timestamp>` | Run name → `runs/<run-name>/`. |
+| `--resume` | — | Checkpoint path to resume from (`ckpt_best.pt` / `ckpt_latest.pt` / `ckpt_iter_*.pt`). |
+
+```bash
+uv run python -m oos.learn.train --total-iterations 200 --run-name v1 --n-envs 10 --facility tiny --device cpu
+uv run python -m oos.learn.train --eval-only --eval-episodes 100 --resume runs/v1/ckpt_best.pt --facility tiny
+```
+
+**Single atomic task** — `python -m oos.learn.train_single_task` (`SingleTaskEnv`). Each episode is one atomic task (`retrieve` or `bring_empty`), sampled per reset; single-env only. Has an `--eval-only` branch reporting per-task success.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--facility` | `stacker` | Facility to train on. |
+| `--total-iterations` | `200` | Number of training iterations. |
+| `--steps-per-iter` | `1024` | Transitions collected per iteration. |
+| `--task` | `retrieve` | Task type: `retrieve` or `bring_empty`. |
+| `--retrieve-from` | `big` | Shelf class the retrieve target is drawn from (`big`/`small`). |
+| `--retrieve-route` | `direct` | Delivery route of target shelf: `direct` or `handoff` (handoff is harder). |
+| `--target-depth` | `0` | Retrieve target's stack depth (0 = top/accessible). |
+| `--big-shelf-fullness` | `0.5` | Fraction of big-shelf slots occupied; dominant retrieve-hardness lever. |
+| `--reward-success` | `2.0` | Reward paid once per successful episode (terminates same step). |
+| `--n-gat-layers` | `2` | GAT trunk depth (library default is 0; this trainer raises it). |
+| `--eval-only` | `False` | Skip training; run `--eval-episodes` and report per-task success. |
+| `--device` | `cpu` | Torch device. |
+| `--run-name` | auto `single_task_<timestamp>` | Run name → `runs/<run-name>/`. |
+| `--resume` | — | Checkpoint path to resume from. |
+
+```bash
+uv run python -m oos.learn.train_single_task \
+  --facility tiny_medipol --total-iterations 500 --steps-per-iter 1024 \
+  --task bring_empty --target-depth 0 --reward-success 20 \
+  --no-reward-scaling --n-gat-layers 1 --run-name st1 --device cpu
+```
+
+All three trainers draw `--facility` from the registered facilities and write to `runs/<run-name>/` with `config.json`, a `tb/` TensorBoard directory, and checkpoints. `train_continuous` saves `ckpt_latest.pt` (resume from it); `train` and `train_single_task` additionally save periodic `ckpt_iter_<NNNNNN>.pt` and a best-so-far `ckpt_best.pt`. Curated shell launchers wrap these with hyperparameter sets and forward extra flags: `./scripts/train_cont.sh`, `./scripts/train_cont_easy.sh`, `./scripts/train_st.sh`.
+
+### Inspecting results
+
+```bash
+tensorboard --logdir runs/
+```
+
+Every trainer streams scalars to `runs/<run-name>/tb/`. `train_continuous` also writes `runs/<run-name>/progress.md` — a human-readable live summary rewritten every `--log-every` iterations — and `metrics.jsonl`, a machine-readable per-iteration log.
+
+### Training environments
+
+| Env | Trainer | What an episode is |
+|-----|---------|--------------------|
+| **`ContinuousEnv`** *(current focus)* | `train_continuous` | One truncated continuous episode reset into a PLR-scheduler-chosen hardness *level* (via `InitialStateSampler`), with a buried `Retrieve` seeded and the Poisson store stream + dwell retrievals kept on. **Never terminates, only truncates.** Sparse outcome reward (`delivery > serve >> movement`); urgency comes from the discount `gamma`, not a per-step wait penalty. |
+| **`EpisodeEnv`** | `train` | Two-phase: phase 1 fills the facility from empty via gated random Store sampling; phase 2 drains all stored pallets one at a time. Terminates on full clear. The only env wired into the multiprocess `VecEnv` (so only `train` can use `--n-envs > 1`). |
+| **`SingleTaskEnv`** | `train_single_task` | One atomic goal per episode — `retrieve` a marked pallet, or `bring_empty` (stage an empty at a room and WAIT). Initial state from `InitialStateSampler`; reward via `single_task_system`. The curriculum baseline — design notes in [`docs/SINGLE_TASK_ENV.md`](docs/SINGLE_TASK_ENV.md). |
+
+## Visualizer
+
+`python -m oos.viz` launches a pygame app: a left canvas renders the live facility (carrier strips, shelves, rooms, the customer queue, in-flight pallets, and a solvability overlay) alongside a tabbed sidebar (status, randomize, auto-queue, and an action-distribution panel). You can play/pause/step the sim, **swap policy and facility at runtime** (the policy picker discovers checkpoints under `runs/`, with an optional inference-time MCTS toggle), queue tasks and randomize state by hand, click pallets to request retrieves, and edit pallet/shelf contents directly. It boots in manual mode (auto-arrivals off; `m` toggles); press `h` for the full keybinding/colour legend. The session (facility, policy path, zoom, speed, knob dicts) persists in `runs/.viz_state.json`. torch is imported lazily, so the viz runs with only the random policy when torch is absent.
+
+## Facilities
+
+Ten hand-authored facilities are registered (look up via `get_facility(name)`; `--facility` choices are these names sorted):
+
+`mini` · `tiny` · `tiny_tall` · `tiny_wide` · `tiny_medipol` · `stacker` · `stacker_deep` · `stacker_wide` · `dibaji` · `campus`
+
+`tiny_medipol` is the canonical training target — the only facility mixing **direct** (lift) and **handoff** (shuttle) retrieve routes. New facilities are authored with the `oos.dsl` builder, which validates and compiles to a frozen `(Topology, SeedingConfig)`:
+
+```python
+from oos.dsl import Carrier, Facility, Handoff, Room, Shelf
+
+def make_facility():
+    fac = Facility("tiny_medipol")
+    fac.register_carriers(L1, L2, S1, S2)   # carriers, their tracks, shelves, rooms
+    fac.pair(h_L1_S1, h_S1_L1)              # declare handoff poses between carriers
+    fac.seed_pool()                         # seed initial empty pallets
+    return fac.build()                      # -> (Topology, SeedingConfig)
+```

@@ -32,11 +32,11 @@ from oos.sim.scheduler import Scheduler
 from oos.sim.state import Pallet
 
 if TYPE_CHECKING:
-    from oos.sim.facility import Facility
+    from oos.sim.facility import SimEngine
 
 
 def shuffle_state(
-    facility: "Facility",
+    facility: "SimEngine",
     fullness: float,
     rng: np.random.Generator | None = None,
     require_solvable: bool = False,
@@ -107,7 +107,7 @@ def shuffle_state(
 
 
 def _place_pallets(
-    facility: "Facility",
+    facility: "SimEngine",
     pallet_ids: list[int],
     fullness: float,
     rng: np.random.Generator,
@@ -129,8 +129,6 @@ def _place_pallets(
         cs.busy_until = None
         cs.command_started_at = None
         cs.command_start_position = None
-        cs.last_take_shelf = None
-        cs.last_give_shelf = None
         cs.must_relocate_from = None
     for rs in facility.state.rooms.values():
         rs.load = None
@@ -189,30 +187,37 @@ def _place_pallets(
 # ---------------------------------------------------------------------------
 
 
-def _layout_is_solvable(facility: "Facility") -> bool:
+def _layout_is_solvable(facility: "SimEngine") -> bool:
     """Conservative feasibility check on the current shelf layout.
 
-    Algorithm (matches the user-specified spec exactly):
+    Depth convention: depth 0 = the slot at the shaft (no blocker). In the
+    underlying `stack` list, depth grows toward index 0, so `stack[-1]` is
+    depth 0 and `stack[0]` is the deepest pallet. "In front of" means
+    closer to the shaft (higher stack index, lower depth).
 
-    1. For each big shelf pick a `representative` worst-case target:
-         - empty shelf → skip
-         - has a big item → find the deepest big item; if there's a small or
-           empty pallet *deeper* than that big, use it (the deepest one that
-           sits beneath the deepest big); otherwise the deepest big itself.
-         - no big item on the shelf → use the deepest small pallet.
-    2. Closure: iteratively prune `removable` small pallets from big shelves.
-       A small at depth d on shelf s is removable iff the count of big items
-       physically in front of it (closer to the top) is ≤ the empty slot
-       count across all *other* big shelves. Removing a small frees a slot
-       on s (it relocates to a small shelf, which is assumed to have room).
-       Re-scan until no more removals.
-    3. Retrievability per representative:
-         - small/empty target  → retrievable iff closure removed it.
-         - big target          → retrievable iff bigs_in_front_of_target ≤
-                                 empty_slots_on_other_big_shelves.
-    4. Layout is solvable iff every big shelf passes its representative.
+    Algorithm:
 
-    Returns True if solvable.
+    1. Pick a representative per big shelf:
+         - no big item on the shelf (empty or all small/empty) → skip
+         - has a big → find the deepest big; if there is anything deeper
+           than it (which must be small or empty, since this is the deepest
+           big), the first such item going outward — i.e. the immediate
+           neighbour at `deepest_big_idx - 1` — is the rep. Otherwise the
+           deepest big itself is the rep.
+    2. Closure: iteratively prune removable non-big pallets (small or
+       empty) from big shelves. A non-big at index idx on shelf s is
+       removable iff
+           bigs_in_front(s, idx)  ≤  free_slots_on_other_big_shelves
+       Intuition: each big in front can be temporarily relocated to a free
+       slot on another big shelf; once cleared, the non-big can be moved
+       out (smalls go to a small shelf, empties just vanish). Removing the
+       pallet frees its slot on s, which may unlock further removals.
+       Restart the scan after each removal until no change.
+    3. Decide per representative:
+         - rep is small or empty → retrievable iff closure removed it.
+         - rep is big            → retrievable iff after closure
+           `bigs_in_front(rep) ≤ free_slots_on_other_big_shelves`.
+    4. Layout is solvable iff every big shelf passes.
     """
     topology = facility.topology
     state = facility.state
@@ -224,8 +229,7 @@ def _layout_is_solvable(facility: "Facility") -> bool:
 
     cap = {sid: topology.shelves[sid].capacity for sid in big_shelf_ids}
 
-    # Pallets we've conceptually removed during closure. Treated as if they
-    # were relocated to a small shelf (which is assumed to have capacity).
+    # Pallets conceptually removed during closure (relocated off the shelf).
     removed: set[int] = set()
 
     def free_on(sid: str) -> int:
@@ -237,23 +241,29 @@ def _layout_is_solvable(facility: "Facility") -> bool:
 
     def bigs_in_front(sid: str, idx: int) -> int:
         """Count of non-removed big-content pallets at stack positions > idx
-        on shelf `sid` — i.e., physically above the pallet at idx."""
+        on shelf `sid` — i.e., physically in front of (closer to the shaft
+        than) the pallet at idx."""
         s = state.shelves[sid].stack
         return sum(
             1 for j in range(idx + 1, len(s))
             if s[j].id not in removed and s[j].contents == "big"
         )
 
-    # ----- Closure: iteratively remove movable smalls from big shelves -----
+    # ----- Pick representatives (before closure runs) -----
+    reps: dict[str, tuple[int, Pallet] | None] = {}
+    for sid in big_shelf_ids:
+        reps[sid] = _pick_representative(state.shelves[sid].stack)
+
+    # ----- Closure: iteratively remove movable non-bigs from big shelves -----
     changed = True
     while changed:
         changed = False
         for sid in big_shelf_ids:
             s = state.shelves[sid].stack
-            # Scan front-to-back: top of stack (high idx) toward bottom.
+            # Front-to-back: shaft side (high idx) toward the back.
             for idx in range(len(s) - 1, -1, -1):
                 p = s[idx]
-                if p.id in removed or p.contents != "small":
+                if p.id in removed or p.contents == "big":
                     continue
                 if bigs_in_front(sid, idx) <= free_other_bigs(sid):
                     removed.add(p.id)
@@ -263,51 +273,34 @@ def _layout_is_solvable(facility: "Facility") -> bool:
                 break  # restart outer loop
 
     # ----- Decide retrievability for each representative -----
-    for sid in big_shelf_ids:
-        rep = _pick_representative(state.shelves[sid].stack, removed)
+    for sid, rep in reps.items():
         if rep is None:
-            continue  # shelf has no candidate target
+            continue
         idx, p = rep
         if p.contents == "big":
             if bigs_in_front(sid, idx) > free_other_bigs(sid):
                 return False
         else:  # small or empty
             if p.id not in removed:
-                # Closure couldn't clear it → unsolvable.
                 return False
 
     return True
 
 
-def _pick_representative(
-    stack: list[Pallet], removed: set[int]
-) -> tuple[int, Pallet] | None:
-    """Pick the worst-case representative target on a single big shelf.
+def _pick_representative(stack: list[Pallet]) -> tuple[int, Pallet] | None:
+    """Worst-case representative target on a single big shelf.
 
-    `stack` is bottom-up (stack[0] is the deepest pallet, stack[-1] the top).
-    Returns (stack_index, pallet) or None if the shelf has nothing eligible.
+    `stack` is bottom-up (stack[0] is the deepest pallet, stack[-1] the
+    shaft side). Returns (stack_index, pallet) or None if the shelf has
+    no big item (nothing to check — all items are directly retrievable).
     """
-    active = [(i, p) for i, p in enumerate(stack) if p.id not in removed]
-    if not active:
-        return None
-
-    # Deepest big = lowest stack index with contents == "big".
-    deepest_big = next((ip for ip in active if ip[1].contents == "big"), None)
-
-    if deepest_big is None:
-        # No big on shelf → deepest small (or empty if no smalls).
-        small = next((ip for ip in active if ip[1].contents == "small"), None)
-        if small is not None:
-            return small
-        return None  # all empty
-
-    deepest_big_idx = deepest_big[0]
-    # Look for small/empty deeper than the deepest big (smaller idx).
-    # "First such" = closest to the deepest big = highest idx below it.
-    behind = [
-        (i, p) for i, p in active
-        if i < deepest_big_idx and p.contents in ("small", "empty")
-    ]
-    if behind:
-        return max(behind, key=lambda ip: ip[0])
-    return deepest_big
+    deepest_big_idx = next(
+        (i for i, p in enumerate(stack) if p.contents == "big"), None
+    )
+    if deepest_big_idx is None:
+        return None  # no big → nothing to check on this shelf
+    if deepest_big_idx > 0:
+        # First small/empty deeper than the big = immediate neighbour.
+        j = deepest_big_idx - 1
+        return j, stack[j]
+    return deepest_big_idx, stack[deepest_big_idx]

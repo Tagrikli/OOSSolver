@@ -1,4 +1,4 @@
-"""Agent — RL agent driving a Facility, decoupled from any UI.
+"""Agent — RL agent driving an Environment, decoupled from any UI.
 
 Two interfaces:
 
@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from oos.facility import Facility
+from oos.env import Environment
 from oos.sim.actions import short_action_label
 
 PolicyFn = Callable[[dict, dict], int]
@@ -48,7 +48,7 @@ class AgentStep:
 
 
 class Agent:
-    """An RL agent paired with a Facility.
+    """An RL agent paired with an Environment.
 
     Construct from a trained checkpoint:
 
@@ -72,7 +72,7 @@ class Agent:
 
     def __init__(
         self,
-        facility: Facility,
+        facility: Environment,
         policy: PolicyFn,
         seed: int = 0,
     ):
@@ -103,7 +103,7 @@ class Agent:
     def from_checkpoint(
         cls,
         checkpoint_path: str,
-        facility: Facility,
+        facility: Environment,
         *,
         deterministic: bool = False,
         device: str = "cpu",
@@ -122,7 +122,7 @@ class Agent:
         if mcts_n_sims > 0:
             from oos.learn.policy import MCTSPolicy
             policy = MCTSPolicy(
-                learned=policy, env=facility.env, n_sims=mcts_n_sims,
+                learned=policy, env=facility, n_sims=mcts_n_sims,
             )
         return cls(facility=facility, policy=policy, seed=seed)
 
@@ -140,6 +140,11 @@ class Agent:
         self.total_completions = 0
         self.total_actions = 0
         self.done = False
+        # Clear the per-carrier policy-query snapshots — otherwise carriers
+        # from a previous facility/episode (e.g. C1/C2 from `tiny`, L1 from
+        # `tiny_medipol`) linger as stale rows in the Action-dist panel after
+        # a facility swap.
+        self.policy_query_log = {}
         return self.obs, self.info
 
     def act(

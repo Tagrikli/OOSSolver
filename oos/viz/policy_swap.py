@@ -5,8 +5,8 @@ These are the "user pressed enter on the picker / 'g' for generate"
 operations. Split out of `app.py` so the main loop reads as dispatch.
 
 All helpers mutate the Agent in place (`agent.policy = ...`, or replace
-the underlying env via a new Facility) and emit toasts. The viz-side
-swap functions also rebuild the Renderer when the facility changes.
+the underlying Environment) and emit toasts. The viz-side swap functions
+also rebuild the Renderer when the environment changes.
 """
 
 from __future__ import annotations
@@ -14,8 +14,7 @@ from __future__ import annotations
 from typing import Optional
 
 from oos.agent import Agent, random_policy
-from oos.env.env import OOSEnv
-from oos.facility import Facility
+from oos.env import Environment
 from oos.viz.components import ToastManager
 from oos.viz.layout import LayoutConfig, compute_layout
 from oos.viz.renderer import Renderer
@@ -55,7 +54,7 @@ def load_policy(
         )
         if mcts_enabled:
             agent.policy = MCTSPolicy(
-                learned=policy, env=agent.facility.env, n_sims=mcts_n_sims,
+                learned=policy, env=agent.facility, n_sims=mcts_n_sims,
             )
         else:
             agent.policy = policy
@@ -93,7 +92,7 @@ def rewrap_with_mcts(
         return
     if mcts_enabled:
         agent.policy = MCTSPolicy(
-            learned=inner, env=agent.facility.env, n_sims=mcts_n_sims,
+            learned=inner, env=agent.facility, n_sims=mcts_n_sims,
         )
         toasts.info(f"MCTS ON  (n_sims={mcts_n_sims})", lifetime=3.0)
     else:
@@ -115,8 +114,8 @@ def generate_single_task(
     """Replace the agent's underlying env with a fresh SingleTaskEnv
     wired to the configured knobs, then reset. Returns True on success,
     False if params failed validation. The caller should refresh any
-    cached references to `agent.facility.sim` after this returns
-    (the SingleTaskEnv builds its own sim Facility)."""
+    cached references to `agent.facility.engine` after this returns
+    (the SingleTaskEnv builds its own sim engine)."""
     from oos.facilities import get_facility
     from oos.learn.single_task_env import (
         SingleTaskConfig,
@@ -124,44 +123,32 @@ def generate_single_task(
         SingleTaskRewardConfig,
     )
     try:
-        br_lo = float(params["big_ratio_low"])
-        br_hi = float(params["big_ratio_high"])
-        sr_lo = float(params["small_ratio_low"])
-        sr_hi = float(params["small_ratio_high"])
-        # Auto-swap inverted ranges instead of crashing — friendlier than
-        # making the user reorder sliders by hand.
-        if br_lo > br_hi:
-            br_lo, br_hi = br_hi, br_lo
-            toasts.warn("big_ratio: low > high — swapped", lifetime=3.0)
-        if sr_lo > sr_hi:
-            sr_lo, sr_hi = sr_hi, sr_lo
-            toasts.warn("small_ratio: low > high — swapped", lifetime=3.0)
-        depths = tuple(int(d) for d in params["target_depths"])
-        if not depths:
-            toasts.error("select at least one target depth")
-            return False
         task_cfg = SingleTaskConfig(
-            bring_empty_prob=float(params["bring_empty_prob"]),
-            big_ratio_range=(br_lo, br_hi),
-            small_ratio_range=(sr_lo, sr_hi),
-            target_depth_choices=depths,
-            room_state_probs=tuple(
-                float(p) for p in params["room_state_probs"]
-            ),
+            task=str(params["task"]),
+            retrieve_from=str(params["retrieve_from"]),
+            retrieve_route=str(params["retrieve_route"]),
+            target_depth=int(params["target_depth"]),
+            big_shelf_fullness=float(params["big_shelf_fullness"]),
+            system_fullness=float(params["system_fullness"]),
+            big_ratio=float(params["big_ratio"]),
+            big_disorder=float(params["big_disorder"]),
+            small_disorder=float(params["small_disorder"]),
+            room_state=str(params["room_state"]),
         )
     except (KeyError, ValueError, TypeError) as e:
         toasts.error(f"GEN FAILED: {type(e).__name__}: {e}"[:80])
         return False
-    old_env = agent.facility.env
+    old_env = agent.facility
     preserve_auto = agent.facility.auto_arrivals_enabled
+    prev_policy = agent.policy   # preserve the loaded policy across the swap
     new_env = SingleTaskEnv(
         facility_factory=get_facility(facility_name),
         task_config=task_cfg,
         reward_config=SingleTaskRewardConfig(),
         experiment_config=old_env._experiment_cfg,  # type: ignore[attr-defined]
     )
-    agent.facility = Facility(new_env)
-    agent.policy = random_policy
+    agent.facility = new_env
+    agent.policy = prev_policy   # keep the loaded policy (was wrongly reset to random_policy)
     # Fresh seed per Generate — without this every press would produce the
     # same RNG stream and the same layout.
     import secrets
@@ -172,113 +159,44 @@ def generate_single_task(
     return True
 
 
-def load_run_config(
-    cfg: dict,
+def apply_auto_queue(
+    params: dict,
     agent: Agent,
-    facility_name: str,
     toasts: ToastManager,
+    do_reset: bool = True,
 ) -> bool:
-    """Apply a saved `runs/<name>/config.json`'s **sampler knobs** to the
-    agent's env, on the user-supplied `facility_name`. Returns True on
-    success.
+    """Rebuild the env's `TaskStreamConfig` from the auto-queue tab knobs and
+    (optionally) reset so the new stream takes effect.
 
-    What the config contributes:
-      * sampler ranges      (big_ratio_low/high, small_ratio_low/high)
-      * target depth set    (target_depths)
-      * room initial probs  (room_state_probs)
-      * task probability    (bring_empty_prob)
-      * episode caps        (max_sim_time, max_episode_steps)
-
-    What the config does NOT touch — picked independently in the viz:
-      * facility — the `facility_name` arg wins (use the F picker).
-      * policy   — preserved across the call (use the P picker).
-      * reward   — SingleTaskRewardConfig defaults are used; reward
-                   weights are training-specific shaping, not
-                   inspection-relevant.
+    The auto-queue is just the task generator: a Poisson store stream
+    (`store_rate`, `big_prob` → size mix) plus per-item dwell retrievals
+    (`mean_dwell`/`std_dwell`). `TaskStreamConfig`/`ExperimentConfig` are
+    frozen, so we build a fresh `ExperimentConfig` (keeping durations +
+    episode caps) and swap it onto the inner env; the next `reset()` rebuilds
+    the stream. Policy + auto_arrivals toggle are preserved.
     """
-    from oos.config.schema import EpisodeConfig as ExpEpisodeConfig
     from oos.config.schema import ExperimentConfig, TaskStreamConfig
-    from oos.env.env import OOSEnv
-    from oos.facilities import get_facility
-    from oos.learn.single_task_env import (
-        SingleTaskConfig,
-        SingleTaskEnv,
-        SingleTaskRewardConfig,
-    )
-
     try:
-        factory = get_facility(facility_name)
-    except ValueError as e:
-        toasts.error(f"unknown facility: {e}"[:80])
-        return False
-
-    preserve_auto = agent.facility.auto_arrivals_enabled
-
-    is_single_task = (
-        "bring_empty_prob" in cfg and "target_depths" in cfg
-    )
-    if is_single_task:
-        try:
-            depths = tuple(int(d) for d in cfg["target_depths"])
-            if not depths:
-                raise ValueError("target_depths is empty")
-            raw_probs = cfg.get(
-                "room_state_probs", (1.0 / 3, 1.0 / 3, 1.0 / 3),
-            )
-            if len(raw_probs) != 3:
-                raise ValueError(
-                    f"room_state_probs must have 3 entries, got {len(raw_probs)}"
-                )
-            room_probs: tuple[float, float, float] = (
-                float(raw_probs[0]), float(raw_probs[1]), float(raw_probs[2]),
-            )
-            task_cfg = SingleTaskConfig(
-                bring_empty_prob=float(cfg.get("bring_empty_prob", 0.0)),
-                big_ratio_range=(
-                    float(cfg.get("big_ratio_low", 0.0)),
-                    float(cfg.get("big_ratio_high", 0.0)),
-                ),
-                small_ratio_range=(
-                    float(cfg.get("small_ratio_low", 0.0)),
-                    float(cfg.get("small_ratio_high", 0.0)),
-                ),
-                target_depth_choices=depths,
-                room_state_probs=room_probs,
-            )
-            experiment_cfg = ExperimentConfig(
-                task_stream=TaskStreamConfig(store_rate=0.0),
-                episode=ExpEpisodeConfig(
-                    max_sim_time=float(cfg.get("max_sim_time", 1200.0)),
-                    max_steps=int(cfg.get("max_episode_steps", 200)),
-                ),
-            )
-        except (KeyError, ValueError, TypeError) as e:
-            toasts.error(f"CONFIG ERROR: {type(e).__name__}: {e}"[:80])
-            return False
-        new_env = SingleTaskEnv(
-            facility_factory=factory,
-            task_config=task_cfg,
-            reward_config=SingleTaskRewardConfig(),  # defaults
-            experiment_config=experiment_cfg,
+        big = float(params["big_prob"])
+        ts = TaskStreamConfig(
+            store_rate=float(params["store_rate"]),
+            size_mix={"small": 1.0 - big, "big": big},
+            mean_dwell_seconds=float(params["mean_dwell"]),
+            std_dwell_seconds=float(params["std_dwell"]),
         )
-        kind = "SingleTask"
-    else:
-        # Fallback: plain OOSEnv with defaults — useful if a non-
-        # single-task config is picked.
-        new_env = OOSEnv(facility_factory=factory)
-        kind = "OOSEnv"
-
-    prev_policy = agent.policy   # preserved across the swap
-    agent.facility = Facility(new_env)
-    agent.policy = prev_policy
-    # Fresh seed so each episode samples differently.
-    import secrets
-    agent.seed = secrets.randbits(31)
-    agent.reset()
-    agent.facility.set_auto_arrivals(preserve_auto)
-    toasts.success(
-        f"CONFIG → {kind} sampler on {facility_name}", lifetime=3.5,
+    except (KeyError, ValueError, TypeError) as e:
+        toasts.error(f"AUTO-QUEUE FAILED: {type(e).__name__}: {e}"[:80])
+        return False
+    env = agent.facility
+    old = env._experiment_cfg  # type: ignore[attr-defined]
+    env._experiment_cfg = ExperimentConfig(  # type: ignore[attr-defined]
+        durations=old.durations, task_stream=ts, episode=old.episode,
     )
+    if do_reset:
+        preserve_auto = agent.facility.auto_arrivals_enabled
+        agent.reset()
+        agent.facility.set_auto_arrivals(preserve_auto)
+    toasts.success("AUTO-QUEUE config applied", lifetime=2.5)
     return True
 
 
@@ -289,26 +207,29 @@ def swap_facility(
     window_w: int,
     window_h: int,
     toasts: ToastManager,
+    zoom: float = 1.0,
 ) -> Renderer:
     """Rebuild the agent's facility with a different topology. Resets the
     agent, builds a fresh layout + renderer, persists the choice. Returns
-    the new renderer."""
+    the new renderer. The current `zoom` is carried over so the new
+    facility renders at the same scale the user was already viewing."""
     from oos.facilities import get_facility
-    old_env = agent.facility.env
+    old_env = agent.facility
     preserve_auto = agent.facility.auto_arrivals_enabled
-    new_env = OOSEnv(
+    new_env = Environment(
         facility_factory=get_facility(name),
         experiment_config=old_env._experiment_cfg,  # type: ignore[attr-defined]
         reward_config=old_env._reward_cfg,          # type: ignore[attr-defined]
     )
-    agent.facility = Facility(new_env)
+    agent.facility = new_env
     agent.policy = random_policy
     agent.reset()
     agent.facility.set_auto_arrivals(preserve_auto)
     new_topo = agent.facility.topology
     new_layout = compute_layout(
-        new_topo, LayoutConfig(window_w=window_w, window_h=window_h),
+        new_topo,
+        LayoutConfig(window_w=window_w, window_h=window_h, zoom=zoom),
     )
     save_viz_state(runs_dir, facility_name=name)
     toasts.success(f"FACILITY → {name}", lifetime=4.0)
-    return Renderer(new_layout, new_topo)
+    return Renderer(new_layout, new_topo, zoom=zoom)

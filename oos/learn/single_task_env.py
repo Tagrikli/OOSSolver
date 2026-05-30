@@ -1,41 +1,36 @@
 """Single-task episodic env: each episode is exactly one atomic goal.
 
-Two task types, sampled per episode:
+The task type is an EXPLICIT config knob (`SingleTaskConfig.task`), not a
+per-episode draw:
 
-  * **retrieve** (default 80%): a specific pallet (could be empty / small /
-    big) is marked as the Retrieve target. The agent succeeds when that
-    pallet is delivered to a room.
-  * **bring_empty** (default 20%): no Retrieve is queued. The agent succeeds
-    when (a) at least one room currently has an empty pallet AND (b) the
-    submitted action is WAIT. Rewarding only the wait — rather than the
-    moment an empty first lands in the room — forces the agent to
-    explicitly recognise the satisfied state instead of moving pallets
-    forever.
+  * **retrieve**: a specific pallet (could be empty / small / big) is marked
+    as the Retrieve target. The agent succeeds when that pallet is
+    delivered to a room.
+  * **bring_empty**: no Retrieve is queued. The agent succeeds when (a) at
+    least one room currently has an empty pallet AND (b) the submitted
+    action is WAIT. Rewarding only the wait — rather than the moment an
+    empty first lands in the room — forces the agent to explicitly
+    recognise the satisfied state instead of moving pallets forever.
 
 Episode termination:
   * On success → terminated=True, success reward paid.
   * On `max_steps` or `max_sim_time` → truncated=True.
 
-Random initial state (shared by both task types):
-  * Pallet counts are *deterministic* from the two ratio knobs (no
-    per-episode uniform sampling on fill level — see SINGLE_TASK_ENV.md).
-  * Pallet placement on size-class-compatible shelves is uniform random.
-  * Carrier positions are drawn uniformly over their tracks.
+Random initial state is built by the shared `InitialStateSampler` from the
+explicit occupancy / content / disorder / room knobs forwarded on
+`SingleTaskConfig` (see `oos.sim.state_sampler`). Carrier positions are
+uniform over their tracks.
 
 Retrieve-target selection (retrieve task only):
-  * Configurable depth (0 = top of stack).
-  * 50/50 stratified between big-shelf candidates and small-shelf candidates
-    (independent of the number of shelves in each class), so the agent
-    sees the two stratum equally often. Falls back to the other class if
-    one is empty.
+  * Explicit depth (`target_depth`, 0 = top of stack) and shelf class
+    (`retrieve_from` ∈ {big, small}).
+  * Falls back to any depth on that class, then any pallet anywhere.
 
 Edge cases:
-  * bring_empty sampled but no empty pallets exist (ratios=1) → re-roll
-    task as retrieve. The sampled task ratio becomes approximate but
-    episodes are always feasible.
-  * retrieve sampled but no item exists at the requested depth in either
-    class → fall back to any item at any depth; if no items exist at all,
-    fall back to bring_empty (which presupposes empties).
+  * task=bring_empty but no empty pallets exist → switch to retrieve (keep
+    the episode feasible).
+  * task=retrieve but no pallets exist at all → fall back to bring_empty if
+    an empty exists, else raise (pathological topology).
 
 Reward:
   * +reward_success on goal complete (then terminate).
@@ -52,18 +47,25 @@ The legacy stage/unstage/retrieve reward terms are unified into
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 
 from oos.config.schema import ExperimentConfig
 from oos.env.action import ActionType
-from oos.env.env import FacilityFactory, OOSEnv
+from oos.env.env import FacilityFactory, Environment
 from oos.env.observation import ObservationConfig
 from oos.env.reward import RewardConfig
+from oos.env.reward_system import (
+    RewardContext,
+    RewardSystem,
+    single_task_system,
+)
+from oos.learn import targeting
 from oos.sim.state_sampler import (
     InitialStateSampler,
     InitialStateSamplerConfig,
+    RoomState,
     has_empty_pallet_anywhere,
 )
 from oos.sim.tasks import Retrieve
@@ -71,55 +73,51 @@ from oos.sim.tasks import Retrieve
 
 @dataclass(frozen=True)
 class SingleTaskConfig:
-    """Per-episode scenario knobs.
+    """Per-episode scenario knobs — all explicit values (no per-episode
+    distributions). One config defines one point in hardness-space; a
+    higher layer can sweep these to generate variety.
 
-    The ratio and depth knobs are *sampled per episode* from the configured
-    range / choice set. To get a fixed value, set the low and high bounds
-    equal (e.g. `big_ratio_range=(0.5, 0.5)`) or pass a single-element
-    `target_depth_choices=(0,)`.
+    Holds both the task knobs (owned here) and the initial-state knobs
+    (forwarded to `InitialStateSampler`). See `oos.sim.state_sampler` for
+    the occupancy -> content -> ordering generation model.
     """
 
-    # Probability that an episode is the bring-empty task (else retrieve).
-    bring_empty_prob: float = 0.2
+    # --- task ---
+    # "retrieve": one specific pallet is the Retrieve target; success on
+    # its delivery to a room. "bring_empty": no Retrieve queued; success
+    # when the agent stages an empty at a room and WAITs.
+    task: Literal["retrieve", "bring_empty"] = "retrieve"
 
-    # Per-episode big_ratio is drawn ~ Uniform(low, high) at reset(). The
-    # episode then uses
-    #   big_count = round((A - B) * big_ratio)
-    # where A is the total big-shelf slot count across the facility and B
-    # is the deepest single big shelf's capacity. The `- B` reserves one
-    # full big shelf's worth of empty slots as retrieval headroom; a ratio
-    # of 1.0 therefore places exactly `A - B` big items, not `A`.
-    big_ratio_range: tuple[float, float] = (0.5, 0.5)
+    # --- target (retrieve only) ---
+    # Shelf class the retrieve target is drawn from.
+    retrieve_from: Literal["big", "small"] = "big"
+    # Delivery route of the target's shelf:
+    #   "direct"  — the shelf's carrier serves a room (no handoff needed).
+    #   "handoff" — the shelf's carrier has no room, so the pallet must be
+    #               handed off to reach one (a distinctly harder retrieve).
+    retrieve_route: Literal["direct", "handoff"] = "direct"
+    # Depth of the target from the shaft (0 = top of stack, accessible).
+    target_depth: int = 0
 
-    # Per-episode small_ratio is drawn ~ Uniform(low, high) at reset(). The
-    # episode then uses
-    #   small_count = round((total_capacity - big_count) * small_ratio)
-    # If both ranges collapse to (1.0, 1.0) the facility has zero empties.
-    small_ratio_range: tuple[float, float] = (0.5, 0.5)
+    # --- initial state (forwarded to InitialStateSampler) ---
+    # Fraction of big-shelf SLOTS occupied (eviction headroom = the rest).
+    big_shelf_fullness: float = 0.5
+    # Fraction of the NON-big trays carrying a small item (rest empty).
+    system_fullness: float = 0.5
+    # Fraction of the OCCUPIED big-shelf slots that hold a big item.
+    big_ratio: float = 0.5
+    # Within-shelf ordering (see state_sampler._order_by_disorder).
+    # 0 = larger items most accessible; 1 = larger items buried.
+    big_disorder: float = 0.0
+    small_disorder: float = 0.0
+    # Room initial load: "empty" | "small_item" | "big_item".
+    room_state: RoomState = "empty"
 
-    # Per-episode target_depth is drawn uniformly from this tuple at reset().
-    # 0 = top of stack. Shelves whose stack is shorter than `target_depth + 1`
-    # are skipped during target picking.
-    target_depth_choices: tuple[int, ...] = (0,)
-
-    # Per-episode room initial state probabilities: (empty, small_item,
-    # big_item). Sampled categorically at reset(). When small/big is drawn,
-    # one empty pallet on the shelves is taken and re-issued as the room's
-    # item — total pallet count is preserved. Falls back silently to
-    # "empty" if no empty pallet exists on the shelves at sampling time
-    # (e.g. when both ratios collapsed to 1.0).
-    room_state_probs: tuple[float, float, float] = (1.0 / 3, 1.0 / 3, 1.0 / 3)
-
-    # If True, the random placement is retried until the resulting layout
-    # passes `_layout_is_solvable` (the same retrievability check used by
-    # the live Store-gate flow). Guarantees every episode's retrieve has
-    # a feasible plan — otherwise high big_ratio + deep target_depth can
-    # roll an unrecoverable state.
+    # If True, the random placement is retried until `_layout_is_solvable`
+    # passes (then repaired if the budget runs out). Guarantees the retrieve
+    # has a feasible plan.
     require_solvable: bool = True
-    # Safety bound on the rejection loop. If hit, the last (unsolvable)
-    # layout is accepted rather than spinning forever on a pathological
-    # config.
-    max_solvable_retries: int = 200
+    max_solvable_retries: int = 50
 
 
 @dataclass(frozen=True)
@@ -144,12 +142,12 @@ class SingleTaskRewardConfig:
     time_weight: float = 0.0
 
 
-class SingleTaskEnv(OOSEnv):
-    """One-goal-per-episode env. Subclasses OOSEnv to inherit the
+class SingleTaskEnv(Environment):
+    """One-goal-per-episode env. Subclasses Environment to inherit the
     observation, action, decoder, and step-time event bookkeeping; the
     reward is recomputed from scratch in `step()` against
     `SingleTaskRewardConfig`. The base class's RewardConfig is set to
-    all-zeros so its `compute_reward` produces 0 and we don't double-pay
+    all-zeros so its base reward suite produces 0 and we don't double-pay
     anything.
     """
 
@@ -160,10 +158,14 @@ class SingleTaskEnv(OOSEnv):
         reward_config: SingleTaskRewardConfig | None = None,
         experiment_config: Optional[ExperimentConfig] = None,
         observation_config: Optional[ObservationConfig] = None,
+        reward_system: Optional[RewardSystem] = None,
     ) -> None:
         self._task_reward_cfg = reward_config or SingleTaskRewardConfig()
+        # The gym-path reward suite (step()); pass an explicit RewardSystem to
+        # experiment, else the default reproduces the old inline reward.
+        self._reward_system = reward_system or single_task_system(self._task_reward_cfg)
         # Pass the *overlapping* weights through to the base RewardConfig
-        # so OOSEnv.advance produces real, labelled events even in viz
+        # so Environment.advance produces real, labelled events even in viz
         # mode (which bypasses SingleTaskEnv.step). The task-only weights
         # (`reward_success`, `time_weight`) live on the subclass and are
         # applied in step() for gym callers.
@@ -187,90 +189,95 @@ class SingleTaskEnv(OOSEnv):
         # shape); the world's random initial state is built by the
         # generic sampler so other envs can reuse it.
         self._sampler = InitialStateSampler(InitialStateSamplerConfig(
-            big_ratio_range=self._task_cfg.big_ratio_range,
-            small_ratio_range=self._task_cfg.small_ratio_range,
-            room_state_probs=self._task_cfg.room_state_probs,
+            big_shelf_fullness=self._task_cfg.big_shelf_fullness,
+            system_fullness=self._task_cfg.system_fullness,
+            big_ratio=self._task_cfg.big_ratio,
+            big_disorder=self._task_cfg.big_disorder,
+            small_disorder=self._task_cfg.small_disorder,
+            room_state=self._task_cfg.room_state,
             require_solvable=self._task_cfg.require_solvable,
             max_solvable_retries=self._task_cfg.max_solvable_retries,
         ))
         self._task: str = "retrieve"           # set in reset()
         self._target_id: Optional[int] = None  # set in reset() for retrieve
         self._success: bool = False
-        # Per-episode sampled scenario values. Set in reset() and surfaced
+        # Per-episode realised scenario values. Set in reset() and surfaced
         # via info[] so the trainer can log distributions.
+        self._big_shelf_fullness: float = 0.0
+        self._system_fullness: float = 0.0
         self._big_ratio: float = 0.0
-        self._small_ratio: float = 0.0
         self._target_depth: int = 0
-        # One of {"empty", "small_item", "big_item"}. Sampled per episode.
+        # One of {"empty", "small_item", "big_item"}.
         self._room_state: str = "empty"
         self._rng: np.random.Generator = np.random.default_rng()
+        # shelf_id -> "direct" | "handoff" (min handoffs from the shelf's
+        # carrier to a room). Topology-derived; cached on first reset.
+        self._route_by_shelf: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
 
-    def reset(self, seed=None, options=None):
-        obs, info = super().reset(seed=seed, options=options)
+    def setup_episode(self, facility, seed):
         self._rng = np.random.default_rng(seed)
-        facility = self._ctx.facility  # type: ignore[union-attr]
         facility.set_auto_arrivals(False)
+        if not self._route_by_shelf:
+            self._route_by_shelf = self._route_class_map(facility.topology)
 
-        # Mutate the facility into a fresh random initial state via the
-        # standalone sampler. Returns the per-episode big_ratio,
-        # small_ratio, room_state so we can surface them via info[].
-        result = self._sampler.sample(facility, self._rng)
-        self._big_ratio = result.big_ratio
-        self._small_ratio = result.small_ratio
-        self._room_state = result.room_state
-
-        # Task layer: pick the target depth + decide retrieve vs
-        # bring_empty.
-        choices = self._task_cfg.target_depth_choices
-        if not choices:
-            raise ValueError("target_depth_choices must be non-empty")
-        self._target_depth = int(self._rng.choice(np.asarray(choices)))
-
-        # Sample task. If bring_empty was drawn but the state has no
-        # empties at all, switch to retrieve (skip-rather-than-block).
-        if self._rng.random() < self._task_cfg.bring_empty_prob:
-            self._task = "bring_empty"
-        else:
-            self._task = "retrieve"
-        if self._task == "bring_empty" and not has_empty_pallet_anywhere(facility):
-            self._task = "retrieve"
-
+        self._task = self._task_cfg.task
         self._target_id = None
+        self._target_depth = int(self._task_cfg.target_depth)
         self._success = False
 
         if self._task == "retrieve":
-            target = self._pick_retrieve_target(facility)
+            # Re-sample layouts until a target exists at the requested depth
+            # on the requested shelf class; if no layout produces one within
+            # the attempt budget, step the depth down by one and try again
+            # (never silently pick a random depth). `result` is the layout
+            # finally kept.
+            result, target, depth = self._sample_retrieve_layout(facility)
             if target is None:
-                # No items at all in the facility → can't form a retrieve.
-                # Only viable if at least one empty exists.
+                # Pathological: the requested class has no pallets at any
+                # depth across every attempt. Fall back so the episode still
+                # forms.
                 if has_empty_pallet_anywhere(facility):
                     self._task = "bring_empty"
                 else:
-                    # Pathological: ratios + topology yielded a facility with
-                    # no pallets at all. Fall back to a retrieve over an
-                    # arbitrary slot — should never happen with sane topo.
-                    raise RuntimeError(
-                        "SingleTaskEnv reset: facility has no pallets — "
-                        "check facility topology / shuffle_state."
-                    )
-            else:
+                    target = self._any_pallet(facility)
+                    if target is None:
+                        raise RuntimeError(
+                            "SingleTaskEnv reset: facility has no pallets — "
+                            "check facility topology / sampler config."
+                        )
+            if self._task == "retrieve":
                 self._target_id = target
+                self._target_depth = depth
                 facility.queue.add(
                     Retrieve(arrived_at=facility.state.time, pallet=target)
                 )
+        else:
+            result = self._sampler.sample(facility, self._rng)
 
-        # Rebuild observation / decoder against the post-mutation state.
-        self.refresh_decision_context()
-        obs, info = self._observation_for_current(
-            facility, dt=0.0, completions=[], arrivals=[]
-        )
-        info["sim_time"] = facility.state.time
+        # bring_empty (configured or fallen-back-to) needs an empty to exist.
+        if self._task == "bring_empty" and not has_empty_pallet_anywhere(facility):
+            t = self._any_pallet(facility)
+            if t is None:
+                raise RuntimeError(
+                    "SingleTaskEnv reset: facility has no pallets."
+                )
+            self._task = "retrieve"
+            self._target_id = t
+            facility.queue.add(
+                Retrieve(arrived_at=facility.state.time, pallet=t)
+            )
+
+        self._big_shelf_fullness = result.big_shelf_fullness
+        self._system_fullness = result.system_fullness
+        self._big_ratio = result.big_ratio
+        self._room_state = result.room_state
+
+    def finalize_reset(self, obs, info):
         self._populate_task_info(info)
-        return obs, info
 
     # ------------------------------------------------------------------
     # Step
@@ -323,40 +330,27 @@ class SingleTaskEnv(OOSEnv):
             ):
                 success = True
 
-        # Reward from scratch — base class's compute_reward produced 0
-        # because we passed it an all-zero RewardConfig. We replace its
-        # info["reward_events"] with our own (label, amount) list so the
-        # viz toasts the actual signed contributions.
-        from oos.env.reward import RewardEvent
-        rcfg = self._task_reward_cfg
-        events: list[RewardEvent] = []
-
-        move_dist = float(info.get("movement_distance", 0.0))
-        if move_dist > 0 and rcfg.movement_weight > 0:
-            events.append(RewardEvent(
-                "MOVE", -rcfg.movement_weight * move_dist,
-            ))
-        n_wrong = int(info.get("n_wrong_item_events", 0))
-        if n_wrong > 0:
-            events.append(RewardEvent(
-                "WRONG", -rcfg.penalty_wrong_item_to_room * n_wrong,
-            ))
-        if info.get("idle_with_retrieve", False):
-            events.append(RewardEvent("IDLE", -rcfg.penalty_idle_with_retrieve))
+        # Success terminates the episode (the reward suite reads `success`).
         if success:
-            events.append(RewardEvent("SUCCESS", rcfg.reward_success))
             terminated = True
             self._success = True
-        else:
-            # Time penalty only on non-success steps. A success step's dt
-            # can be huge (a WAIT that skips ahead until end of horizon)
-            # and would otherwise swamp `reward_success`.
-            dt = float(info.get("dt", 0.0))
-            if rcfg.time_weight > 0 and dt > 0:
-                events.append(RewardEvent("TIME", -rcfg.time_weight * dt))
 
-        r = float(sum(e.amount for e in events))
-        info["reward_events"] = events
+        # Score the (s, a, s') with the reward suite. The base class's reward
+        # (from super().step()) is discarded — the suite is the single source.
+        # Built from the typed StepEvents Environment.advance produced.
+        from oos.env.reward import RewardEvent
+        events = info["events"]
+        ctx = RewardContext(
+            success=success,
+            n_wrong=events.n_wrong_item,
+            idle_with_retrieve=events.idle_with_retrieve,
+            movement_distance=events.movement_distance,
+            dt=events.dt,
+            completions=events.completions,
+        )
+        r, breakdown = self._reward_system.compute(ctx)
+        info["reward_breakdown"] = breakdown
+        info["reward_events"] = [RewardEvent(k, v) for k, v in breakdown.items()]
 
         self._populate_task_info(info)
         return obs, float(r), terminated, truncated, info
@@ -367,52 +361,22 @@ class SingleTaskEnv(OOSEnv):
     # selection + target picking here)
     # ------------------------------------------------------------------
 
-    def _pick_retrieve_target(self, facility) -> Optional[int]:
-        """50/50 stratified pick between big-shelf and small-shelf
-        candidates at the configured depth.
+    # Retrieve-target acquisition is shared with ContinuousEnv — see
+    # oos.learn.targeting. These thin wrappers keep the call sites readable.
 
-        Stack convention: `stack[-1]` is the top (carrier-accessible).
-        `stack[-1 - depth]` is at depth `depth` from the top. Shelves with
-        stack shorter than `depth + 1` contribute no candidate.
+    @staticmethod
+    def _route_class_map(topo) -> dict:
+        return targeting.route_class_map(topo)
 
-        Falls back to: (a) other class if one is empty, then (b) ANY
-        candidate at ANY depth across all shelves, then (c) returns None
-        if the facility has no pallets at all.
-        """
-        rng = self._rng
-        topo = facility.topology
-        state = facility.state
-        depth = self._target_depth
+    def _sample_retrieve_layout(self, facility):
+        return targeting.sample_retrieve_layout(
+            self._sampler, facility, self._rng, self._route_by_shelf,
+            self._task_cfg.retrieve_from, self._task_cfg.retrieve_route,
+            self._task_cfg.target_depth,
+        )
 
-        big_candidates: list[int] = []
-        small_candidates: list[int] = []
-        for sid, s in topo.shelves.items():
-            stk = state.shelves[sid].stack
-            if depth >= len(stk):
-                continue
-            p = stk[-1 - depth]
-            if s.size_class == "big":
-                big_candidates.append(p.id)
-            else:
-                small_candidates.append(p.id)
-
-        if big_candidates and small_candidates:
-            pool = big_candidates if rng.random() < 0.5 else small_candidates
-            return int(rng.choice(pool))
-        if big_candidates:
-            return int(rng.choice(big_candidates))
-        if small_candidates:
-            return int(rng.choice(small_candidates))
-
-        # No candidate at the requested depth on either class — fall back
-        # to any pallet anywhere. Lets the curriculum keep moving even on
-        # shallow facilities where target_depth=2 is unreachable.
-        all_ids: list[int] = []
-        for ss in state.shelves.values():
-            all_ids.extend(p.id for p in ss.stack)
-        if not all_ids:
-            return None
-        return int(rng.choice(all_ids))
+    def _any_pallet(self, facility) -> Optional[int]:
+        return targeting.any_pallet(facility, self._rng)
 
     def _room_has_empty_pallet(self) -> bool:
         """True iff at least one room currently has an empty pallet loaded."""
@@ -436,9 +400,12 @@ class SingleTaskEnv(OOSEnv):
         info["task"] = self._task
         info["target_pallet_id"] = self._target_id
         info["success"] = self._success
+        info["episode_big_shelf_fullness"] = self._big_shelf_fullness
+        info["episode_system_fullness"] = self._system_fullness
         info["episode_big_ratio"] = self._big_ratio
-        info["episode_small_ratio"] = self._small_ratio
         info["episode_target_depth"] = self._target_depth
+        info["episode_retrieve_from"] = self._task_cfg.retrieve_from
+        info["episode_retrieve_route"] = self._task_cfg.retrieve_route
         info["episode_room_state"] = self._room_state
         # Compatibility with rollout.py / train.py success-rate logic, which
         # reads retrieves_completed/total. SingleTaskEnv has exactly one goal

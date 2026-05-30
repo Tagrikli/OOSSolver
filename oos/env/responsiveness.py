@@ -11,12 +11,12 @@ from __future__ import annotations
 import math
 
 from oos.config.schema import TaskStreamConfig
-from oos.sim.facility import Facility
+from oos.sim.facility import SimEngine
 from oos.sim.topology import RoomId
 
 
 def stranding_penalty(
-    facility: Facility, task_cfg: TaskStreamConfig, dt: float
+    facility: SimEngine, task_cfg: TaskStreamConfig, dt: float
 ) -> float:
     """Risk that a store arrives while NO room is ready to receive it.
 
@@ -37,7 +37,7 @@ def stranding_penalty(
     return p_strand * dt
 
 
-def _eta_to_ready(facility: Facility, room_id: RoomId) -> float:
+def _eta_to_ready(facility: SimEngine, room_id: RoomId) -> float:
     """Rough estimate: time for serving carrier to be at room with empty pallet.
 
     Considers the carrier's current commitment but does not plan future moves.
@@ -48,10 +48,10 @@ def _eta_to_ready(facility: Facility, room_id: RoomId) -> float:
     cs = state.carriers[r.served_by]
     c = topo.carriers[r.served_by]
 
-    # If the carrier is at the room, idle, with an empty pallet: ready now.
+    # If the carrier is at the room, waiting, with an empty pallet: ready now.
     carrier_present = cs.position == r.position
     if (
-        cs.is_idle
+        not cs.is_busy
         and carrier_present
         and cs.load is not None
         and cs.load.is_empty

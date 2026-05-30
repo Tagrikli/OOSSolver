@@ -36,7 +36,7 @@ from typing import Optional
 import numpy as np
 
 from oos.env.action import ActionType
-from oos.env.env import FacilityFactory, OOSEnv
+from oos.env.env import FacilityFactory, Environment
 from oos.env.observation import ObservationConfig
 from oos.env.reward import RewardConfig
 from oos.env.store_sampler import sample_store_size
@@ -61,7 +61,7 @@ class EpisodeConfig:
     store_arrival_delay: float = 10.0
 
 
-class EpisodeEnv(OOSEnv):
+class EpisodeEnv(Environment):
     """Two-phase episode: phase 1 fills the facility from empty (gated random
     store sampling), phase 2 drains it in a random order."""
 
@@ -91,10 +91,8 @@ class EpisodeEnv(OOSEnv):
 
     # ------------------------------------------------------------------
 
-    def reset(self, seed=None, options=None):
-        obs, info = super().reset(seed=seed, options=options)
+    def setup_episode(self, facility, seed):
         self._rng = np.random.default_rng(seed)
-        facility = self._ctx.facility  # type: ignore[union-attr]
         facility.set_auto_arrivals(False)
         # All pallets empty, locations randomized per episode.
         shuffle_state(facility, fullness=0.0, rng=self._rng)
@@ -112,14 +110,9 @@ class EpisodeEnv(OOSEnv):
         # shuffled with fullness=0).
         self._tick_scenario()
 
-        self.refresh_decision_context()
-        obs, info = self._observation_for_current(
-            facility, dt=0.0, completions=[], arrivals=[]
-        )
-        info["sim_time"] = facility.state.time
+    def finalize_reset(self, obs, info):
         self._populate_info(info)
         self._apply_action_mask_overrides(obs)
-        return obs, info
 
     def step(self, action: int):
         facility = self._ctx.facility  # type: ignore[union-attr]

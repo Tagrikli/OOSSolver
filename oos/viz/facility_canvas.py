@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pygame
 
-from oos.facility import Facility
+from oos.env import Environment
 from oos.sim.actions import MultiRelocate, Relocate
 from oos.sim.tasks import Retrieve, Store, TaskQueue
 from oos.sim.topology import Topology
@@ -192,7 +192,7 @@ class FacilityCanvas:
     def draw(
         self,
         surface: pygame.Surface,
-        facility: Facility,
+        facility: Environment,
         queue: TaskQueue,
         anim_now: float,
         wall_now: float = 0.0,
@@ -203,9 +203,9 @@ class FacilityCanvas:
                 "relayout(rect, zoom) at least once first.",
             )
         rect = self._rect
-        # Sim engine — most helpers below want the inner sim.Facility,
-        # not the user-facing wrapper. Resolve once.
-        sim = facility.sim
+        # Sim engine — most helpers below want the inner engine, not the
+        # Environment. Resolve once.
+        sim = facility.engine
 
         # Grid background inside our rect.
         draw_grid_background(surface, rect, spacing=24)

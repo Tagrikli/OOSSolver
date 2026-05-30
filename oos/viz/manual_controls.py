@@ -18,7 +18,7 @@ from __future__ import annotations
 import numpy as np
 
 from oos.agent import Agent
-from oos.facility import Facility
+from oos.env import Environment
 from oos.sim.state import Pallet
 from oos.viz.components import ToastManager
 
@@ -30,14 +30,14 @@ from oos.viz.components import ToastManager
 
 def handle_queue_button(
     btn: str,
-    facility: Facility,
+    facility: Environment,
     agent: Agent,
     fullness: float,
     toasts: ToastManager,
 ) -> bool:
     """Apply the action for a queue-panel button click. Returns True iff
     the click was a known button (so the caller can short-circuit)."""
-    sim = facility.sim
+    sim = facility.engine
     if btn == "queue small":
         sim.enqueue_store("small")
         facility.wake_waiting_carriers()
@@ -70,12 +70,12 @@ def handle_queue_button(
 
 def handle_pallet_click(
     pallet_id: int,
-    facility: Facility,
+    facility: Environment,
     agent: Agent,
     toasts: ToastManager,
 ) -> None:
     """Left-click on a pallet toggles a Retrieve for it."""
-    now_pending = facility.sim.toggle_retrieve_for_pallet(pallet_id)
+    now_pending = facility.engine.toggle_retrieve_for_pallet(pallet_id)
     facility.wake_waiting_carriers()
     if now_pending:
         toasts.info(f"+ RETRIEVE pallet={pallet_id}", lifetime=2.5)
@@ -91,12 +91,12 @@ def handle_pallet_click(
 def set_pallet_contents(
     pallet_id: int,
     target_contents: str,
-    facility: Facility,
+    facility: Environment,
     agent: Agent,
     toasts: ToastManager,
 ) -> None:
     """Replace the pallet's contents in-place; reject big-on-small."""
-    sim = facility.sim
+    sim = facility.engine
     owner_sid: str | None = None
     owner_idx = -1
     for sid, ss in sim.state.shelves.items():
@@ -129,11 +129,11 @@ def set_pallet_contents(
 
 def pop_shelf_top(
     shelf_id: str,
-    facility: Facility,
+    facility: Environment,
     agent: Agent,
     toasts: ToastManager,
 ) -> None:
-    ss = facility.sim.state.shelves[shelf_id]
+    ss = facility.engine.state.shelves[shelf_id]
     if not ss.stack:
         toasts.warn(f"shelf {shelf_id} already empty", lifetime=2.0)
         return
@@ -144,11 +144,11 @@ def pop_shelf_top(
 
 def push_empty_pallet(
     shelf_id: str,
-    facility: Facility,
+    facility: Environment,
     agent: Agent,
     toasts: ToastManager,
 ) -> None:
-    sim = facility.sim
+    sim = facility.engine
     ss = sim.state.shelves[shelf_id]
     shelf_topo = sim.topology.shelves[shelf_id]
     if len(ss.stack) >= shelf_topo.capacity:

@@ -19,7 +19,7 @@ Pure functions; no pygame import.
 from __future__ import annotations
 
 from oos.sim.actions import MultiRelocate, Relocate
-from oos.sim.facility import Facility
+from oos.sim.facility import SimEngine
 from oos.sim.topology import Carrier
 
 
@@ -39,7 +39,7 @@ def _position_at(
     return float(start) + sign * traveled
 
 
-def interpolated_position(facility: Facility, carrier_id: str, anim_now: float) -> float:
+def interpolated_position(facility: SimEngine, carrier_id: str, anim_now: float) -> float:
     """Carrier mm-position along its track at `anim_now`.
 
     Only the MOVE portion of a command's duration is used for interpolation;
@@ -75,7 +75,7 @@ def location_visual_pos(loc: str, carrier_id: str, topo) -> int | None:
     return None
 
 
-def relocate_visual_state(facility: Facility, carrier_id: str, anim_now: float):
+def relocate_visual_state(facility: SimEngine, carrier_id: str, anim_now: float):
     """Synthesize the physical visual position of a carrier mid-Relocate.
 
     The sim treats Relocate as one atomic command — at `start()` the carrier
@@ -132,7 +132,7 @@ def relocate_visual_state(facility: Facility, carrier_id: str, anim_now: float):
 
 
 def multi_relocate_visual_position(
-    facility: Facility, carrier_id: str, cmd, anim_now: float,
+    facility: SimEngine, carrier_id: str, cmd, anim_now: float,
 ) -> float:
     """Phase-aware physical position for a carrier mid-MultiRelocate.
 
@@ -210,7 +210,7 @@ def multi_relocate_visual_position(
     return float(state.carriers[carrier_id].position)
 
 
-def command_end_position(facility: Facility, cmd, carrier_id: str):
+def command_end_position(facility: SimEngine, cmd, carrier_id: str):
     """Visual endpoint where the carrier ends up when `cmd` completes.
 
     For Relocate this is dst. For MultiRelocate it depends on which carrier

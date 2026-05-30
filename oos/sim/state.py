@@ -51,15 +51,6 @@ class CarrierState:
     command_started_at: Optional[SimTime] = None
     command_start_position: Optional[Position] = None
     current_command: Optional["object"] = None  # Command; avoid import cycle
-    # Last shelf this carrier took from / gave to, used to mask out
-    # immediate-undo cycles in `enumerate_actions`:
-    #   - GIVE back to last_take_shelf  → blocked (undoes the take)
-    #   - TAKE from last_give_shelf     → blocked (undoes the give)
-    # Each side clears the other when it fires (a TAKE clears last_give,
-    # a GIVE clears last_take), so the constraint never blocks legitimate
-    # multi-step sequences. Cleared on shuffle/reset.
-    last_take_shelf: Optional[str] = None
-    last_give_shelf: Optional[str] = None
     # When the carrier finishes a Relocate-to-room and the room still holds
     # cargo (didn't get consumed by the auto-serve), this is set to that
     # room id. While set, enumerate_actions only emits Relocate entries with
@@ -68,10 +59,21 @@ class CarrierState:
     # when a Relocate-from-that-room completes, or when the room's load
     # vanishes for any other reason. Wiped on shuffle/reset.
     must_relocate_from: Optional[str] = None
+    # WAIT state. A carrier is either *busy* (executing a Relocate/
+    # MultiRelocate — `current_command is not None`) or *waiting* (doing
+    # nothing — `current_command is None`). There is no separate "idle"
+    # notion: not-busy == waiting. `waiting` records that the carrier has
+    # *chosen* WAIT and is holding until the next state change re-opens its
+    # decision; a waiting carrier stays recruitable as a handoff partner
+    # (it is not busy) but is not re-queried until something changes. Reset
+    # to False on any state-changing event (see `Facility.wake_waiting_carriers`).
+    waiting: bool = False
 
     @property
-    def is_idle(self) -> bool:
-        return self.current_command is None
+    def is_busy(self) -> bool:
+        """True iff executing a command (Relocate/MultiRelocate). A waiting
+        carrier is NOT busy — it can be recruited as a handoff partner."""
+        return self.current_command is not None
 
 
 @dataclass

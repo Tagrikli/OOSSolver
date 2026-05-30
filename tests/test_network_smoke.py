@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from oos.config.schema import ExperimentConfig, TaskStreamConfig
-from oos.env.env import OOSEnv
+from oos.env.env import Environment
 from oos.env.observation import (
     CARRIER_FEATURE_NAMES,
     GLOBAL_FEATURE_NAMES,
@@ -19,10 +19,10 @@ from oos.learn.batching import GraphCollator, sample_from_env_step
 from oos.learn.network import NetworkConfig, PolicyValueNet
 
 
-def _make_env() -> OOSEnv:
+def _make_env() -> Environment:
     # Bump store rate so action masks are non-trivial within a few resets.
     cfg = ExperimentConfig(task_stream=TaskStreamConfig(store_rate=0.5))
-    return OOSEnv(facility_factory=make_facility, experiment_config=cfg)
+    return Environment(facility_factory=make_facility, experiment_config=cfg)
 
 
 def test_network_forward_single_sample_shapes_and_mask():
@@ -33,7 +33,7 @@ def test_network_forward_single_sample_shapes_and_mask():
     collator = GraphCollator(topo)
     sample = sample_from_env_step(obs, info, info["action_entries"])
 
-    n_max = env.action_space.n
+    n_max = env.n_actions
     batch = collator.collate([sample], n_max=n_max)
 
     net = PolicyValueNet(
@@ -61,7 +61,7 @@ def test_network_forward_batched_independence():
     env = _make_env()
     topo, _ = make_facility()
     collator = GraphCollator(topo)
-    n_max = env.action_space.n
+    n_max = env.n_actions
 
     net = PolicyValueNet(
         carrier_feat_dim=len(CARRIER_FEATURE_NAMES),
@@ -112,7 +112,7 @@ def test_network_backward_pass():
     env = _make_env()
     topo, _ = make_facility()
     collator = GraphCollator(topo)
-    n_max = env.action_space.n
+    n_max = env.n_actions
 
     net = PolicyValueNet(
         carrier_feat_dim=len(CARRIER_FEATURE_NAMES),

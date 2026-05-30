@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch.distributions import Categorical
 
-from oos.env.env import OOSEnv
+from oos.env.env import Environment
 from oos.learn.batching import GraphCollator, Sample, sample_from_env_step
 from oos.learn.network import PolicyValueNet
 from oos.learn.normalize import RewardNormalizer
@@ -44,6 +44,8 @@ class RolloutBuffer:
     ep_retrieves_completed: list[int] = field(default_factory=list)
     ep_retrieves_total: list[int] = field(default_factory=list)
     ep_stores_completed: list[int] = field(default_factory=list)
+    # Mean per-episode retrieve wait (s); 0 when no retrieve completed.
+    ep_retrieve_latency: list[float] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.actions)
@@ -63,7 +65,7 @@ def _value_of(
 @dataclass
 class CollectorState:
     """Carries env+obs state across rollout calls so collection is resumable."""
-    env: OOSEnv
+    env: Environment
     obs: dict
     info: dict
     ep_return: float = 0
@@ -73,7 +75,7 @@ class CollectorState:
     next_seed: int = 0
 
 
-def make_collector(env: OOSEnv, seed: int) -> CollectorState:
+def make_collector(env: Environment, seed: int) -> CollectorState:
     obs, info = env.reset(seed=seed)
     return CollectorState(env=env, obs=obs, info=info, next_seed=seed + 1)
 
@@ -156,6 +158,7 @@ def collect_rollout(
             buf.ep_retrieves_completed.append(int(next_info.get("retrieves_completed", 0)))
             buf.ep_retrieves_total.append(int(next_info.get("retrieves_total", 0)))
             buf.ep_stores_completed.append(int(next_info.get("stores_completed", 0)))
+            buf.ep_retrieve_latency.append(float(next_info.get("retrieve_latency_mean", 0.0)))
             state.ep_return = 0
             state.ep_length = 0
             state.ep_completions = 0

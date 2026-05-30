@@ -284,7 +284,7 @@ def main() -> None:
     env = _build_env(args)
     topo, _ = get_facility(args.facility)()
     collator = GraphCollator(topo)
-    n_max = env.action_space.n
+    n_max = env.n_actions
     _kv(
         "layout",
         f"{_v_num(len(collator.carrier_ids))} {C_DIM}carriers{_C.RESET}  "

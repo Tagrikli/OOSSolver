@@ -25,7 +25,6 @@ from oos.sim.actions import (
     LocationId,
     MultiRelocate,
     Relocate,
-    Wait,
 )
 from oos.sim.state import FacilityState
 from oos.sim.tasks import TaskQueue
@@ -47,7 +46,9 @@ class ActionEntry:
       - MULTI_RELOCATE: src + dst are LocationIds; partner is the carrier id
         of the receiving partner (which is locked busy alongside the querying
         carrier for the full sequence)
-      - WAIT: all fields None
+      - WAIT: all fields None. WAIT is not a Command — the env handles it by
+        holding the carrier (see `Facility.wait`), so `to_command` is never
+        called for a WAIT entry.
     """
 
     type: ActionType
@@ -68,9 +69,9 @@ class ActionEntry:
                 carrier_id=carrier, partner_id=self.partner,
                 src=self.src, dst=self.dst,
             )
-        if self.type == ActionType.WAIT:
-            return Wait(carrier_id=carrier)
-        raise ValueError(f"unknown action type {self.type}")
+        raise ValueError(
+            f"{self.type} has no Command (WAIT is handled by Facility.wait)"
+        )
 
 
 def enumerate_actions(
@@ -115,12 +116,8 @@ def enumerate_actions(
         for src in reachable:
             if forced_src is not None and src != forced_src:
                 continue
-            if src == cs.last_give_shelf:
-                continue
             for dst in reachable:
                 if dst == src:
-                    continue
-                if dst == cs.last_take_shelf:
                     continue
                 cmd = Relocate(carrier_id=carrier, src=src, dst=dst)
                 if _ok(cmd, state, topo):
@@ -129,14 +126,15 @@ def enumerate_actions(
                     ))
 
     # MULTI_RELOCATE: querying carrier picks up from src, partner delivers
-    # to dst. Only enumerable when the partner is currently idle, empty,
-    # and we're not under the cleanup constraint.
+    # to dst. Only enumerable when the partner is free (not executing a
+    # command — a *waiting* partner qualifies and is recruited), empty, and
+    # we're not under the cleanup constraint.
     if cs.load is None and forced_src is None:
         my_reachable = list(topo.accessible_shelves[carrier])
         my_reachable.extend(topo.accessible_rooms[carrier])
         for partner in topo.handoff_partners[carrier]:
             ps = state.carriers[partner]
-            if not ps.is_idle or ps.load is not None:
+            if ps.is_busy or ps.load is not None:
                 continue
             # Partner with an active cleanup obligation (must_relocate_from
             # pointing at a still-loaded room) cannot be recruited — being
@@ -153,8 +151,6 @@ def enumerate_actions(
             )
             partner_reachable.extend(topo.accessible_rooms[partner])
             for src in my_reachable:
-                if src == cs.last_give_shelf:
-                    continue
                 for dst in partner_reachable:
                     if dst == src:
                         continue

@@ -20,6 +20,7 @@ from oos.viz.components.widgets.carrier_strip import CarrierStripBackground
 from oos.viz.components.widgets.checkbox import Checkbox, CheckboxGroup
 from oos.viz.components.widgets.customer_queue import CustomerQueueWidget
 from oos.viz.components.widgets.numeric_field import NumericField
+from oos.viz.components.widgets.radio import Radio, RadioGroup
 from oos.viz.components.widgets.room import RoomWidget
 from oos.viz.components.widgets.shelf import ShelfWidget
 from oos.viz.components.widgets.solvability_overlay import SolvabilityOverlay
@@ -33,6 +34,8 @@ __all__ = [
     "CheckboxGroup",
     "CustomerQueueWidget",
     "NumericField",
+    "Radio",
+    "RadioGroup",
     "RoomWidget",
     "ShelfWidget",
     "SolvabilityOverlay",

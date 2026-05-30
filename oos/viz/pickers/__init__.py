@@ -13,12 +13,9 @@ Public API:
 from oos.viz.pickers.facility import FacilityPickerWidget
 from oos.viz.pickers.help import HelpModalWidget
 from oos.viz.pickers.policy import PolicyPickerWidget
-from oos.viz.pickers.run_config import RunConfigEntry, RunConfigPickerWidget
 
 __all__ = [
     "FacilityPickerWidget",
     "HelpModalWidget",
     "PolicyPickerWidget",
-    "RunConfigEntry",
-    "RunConfigPickerWidget",
 ]

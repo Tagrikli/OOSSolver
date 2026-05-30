@@ -10,13 +10,14 @@ The driver knows how to:
   * `emit_toasts(info)`          — fan info-events out as toasts (arrivals,
                                   completions, stage/unstage, wrong-item).
 
-No pygame imports — pure Agent + Facility + toast plumbing.
+No pygame imports — pure Agent + Environment + toast plumbing.
 """
 
 from __future__ import annotations
 
 from oos.agent import Agent, AgentStep
-from oos.facility import Facility
+from oos.env import Environment
+from oos.env.action import ActionType
 from oos.sim.actions import short_action_label
 from oos.sim.tasks import Retrieve, Store
 from oos.viz.components import ToastManager
@@ -32,7 +33,7 @@ class SimDriver:
         self.toasts = toasts
 
     @property
-    def facility(self) -> Facility:
+    def facility(self) -> Environment:
         return self.agent.facility
 
     # ─────────────────────────────────────────────────────────────────────
@@ -88,7 +89,7 @@ class SimDriver:
 
         # Reward toasts — read DIRECTLY from `info["reward_events"]` so
         # they show the actual signed amounts the env attributed (single
-        # source of truth in oos.env.reward.compute_reward). Positive →
+        # source of truth in oos.env.reward_system). Positive →
         # success toast (green); negative → error toast (red).
         for ev in info.get("reward_events", []):
             sign = "+" if ev.amount >= 0 else "−"
@@ -117,14 +118,19 @@ class SimDriver:
 
         # Belt-and-suspenders: out-of-range action_idx → fall back to WAIT
         # (always the last legal entry per enumerate_actions).
-        live_n_legal = len(fac.env._ctx.decoder.entries)  # type: ignore[attr-defined]
+        live_n_legal = len(fac._ctx.decoder.entries)  # type: ignore[attr-defined]
         if not (0 <= action_idx < live_n_legal):
             action_idx = live_n_legal - 1
 
         entries = agent.info.get("action_entries", [])
         if 0 <= action_idx < len(entries):
-            cmd = entries[action_idx].to_command(querying)
-            label = short_action_label(cmd)
+            entry = entries[action_idx]
+            # WAIT is not a Command — it's handled by holding the carrier
+            # (Facility.wait), so don't try to build a command for it.
+            if entry.type == ActionType.WAIT:
+                label = "wait"
+            else:
+                label = short_action_label(entry.to_command(querying))
         else:
             label = f"#{action_idx}"
 

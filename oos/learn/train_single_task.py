@@ -49,71 +49,23 @@ from oos.learn.single_task_env import (
 )
 
 
-# ── Color helpers (same palette as train.py) ─────────────────────────────
-def _fg(hex_color: str) -> str:
-    r = int(hex_color[1:3], 16)
-    g = int(hex_color[3:5], 16)
-    b = int(hex_color[5:7], 16)
-    return f"\033[38;2;{r};{g};{b}m"
-
-
-class _C:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    MUTED = _fg("#5a4a78")
-    MAGENTA = _fg("#ff2a6d")
-    YELLOW = _fg("#fcee0c")
-    YELLOW_MID = _fg("#e0c020")
-    CYAN = _fg("#05d9e8")
-    CYAN_MID = _fg("#05a9c4")
-    LIME = _fg("#ccff00")
-    ERROR = _fg("#ff003c")
-    VIOLET = _fg("#b967ff")
-
-
-C_SUCCESS = _C.LIME
-C_RETURN = _C.YELLOW
-C_ANCHOR = _C.MAGENTA
-C_SUPPORT = _C.CYAN_MID
-C_WALL = _C.YELLOW_MID
-C_DIM = _C.MUTED
-
-
-def _color_success(rate: float) -> str:
-    if rate >= 0.8:
-        return _C.LIME
-    if rate >= 0.5:
-        return _C.YELLOW
-    return _C.ERROR
-
-
-def _color_ev(ev: float) -> str:
-    if ev > 0.5:
-        return _C.LIME
-    if ev > 0.0:
-        return _C.YELLOW
-    return _C.ERROR
-
-
-def _color_kl(kl: float) -> str:
-    return _C.ERROR if abs(kl) > 0.05 else C_SUPPORT
-
-
-def _banner(title: str) -> None:
-    bar = f"{_C.BOLD}{C_ANCHOR}▓▓▓▓{_C.RESET}"
-    print(f"{bar} {_C.BOLD}{C_ANCHOR}{title.upper()}{_C.RESET} {bar}")
-
-
-def _kv(label: str, value: str) -> None:
-    print(f"  {_C.VIOLET}▶{_C.RESET} {C_DIM}{label:<15}{_C.RESET} {value}")
-
-
-def _v_num(s: object) -> str:
-    return f"{_C.BOLD}{C_ANCHOR}{s}{_C.RESET}"
-
-
-def _v(s: object) -> str:
-    return f"{C_SUPPORT}{s}{_C.RESET}"
+# Terminal styling lives in oos.learn._style (shared with train_continuous).
+from oos.learn._style import (  # noqa: E402
+    C_ANCHOR,
+    C_DIM,
+    C_RETURN,
+    C_SUCCESS,
+    C_SUPPORT,
+    C_WALL,
+    _C,
+    _banner,
+    _color_ev,
+    _color_kl,
+    _color_success,
+    _kv,
+    _v,
+    _v_num,
+)
 
 
 # ── Config builders ──────────────────────────────────────────────────────
@@ -138,22 +90,19 @@ def _reward_config(args: argparse.Namespace) -> SingleTaskRewardConfig:
 
 
 def _task_config(args: argparse.Namespace) -> SingleTaskConfig:
-    if args.big_ratio_low > args.big_ratio_high:
-        raise ValueError("--big-ratio-low must be ≤ --big-ratio-high")
-    if args.small_ratio_low > args.small_ratio_high:
-        raise ValueError("--small-ratio-low must be ≤ --small-ratio-high")
-    if not args.target_depths:
-        raise ValueError("--target-depths must list at least one depth")
-    if len(args.room_state_probs) != 3:
-        raise ValueError("--room-state-probs must take exactly 3 values")
-    if any(p < 0 for p in args.room_state_probs):
-        raise ValueError("--room-state-probs values must be ≥ 0")
+    if args.target_depth < 0:
+        raise ValueError("--target-depth must be ≥ 0")
     return SingleTaskConfig(
-        bring_empty_prob=args.bring_empty_prob,
-        big_ratio_range=(args.big_ratio_low, args.big_ratio_high),
-        small_ratio_range=(args.small_ratio_low, args.small_ratio_high),
-        target_depth_choices=tuple(int(d) for d in args.target_depths),
-        room_state_probs=tuple(args.room_state_probs),
+        task=args.task,
+        retrieve_from=args.retrieve_from,
+        retrieve_route=args.retrieve_route,
+        target_depth=int(args.target_depth),
+        big_shelf_fullness=args.big_shelf_fullness,
+        system_fullness=args.system_fullness,
+        big_ratio=args.big_ratio,
+        big_disorder=args.big_disorder,
+        small_disorder=args.small_disorder,
+        room_state=args.room_state,
     )
 
 
@@ -209,52 +158,49 @@ def main() -> None:
                    help="Step cap per single-task episode. Smaller than the "
                         "two-phase env since each episode is now one atomic "
                         "task, not a full store+retrieve cycle.")
-    # Task scenario
-    p.add_argument("--bring-empty-prob", type=float, default=0.2,
-                   help="Probability the episode is the bring-empty task "
-                        "(else retrieve). If sampled but no empties exist "
-                        "in the random state, falls back to retrieve.")
-    # Per-episode big_ratio is sampled Uniform(low, high). Set low==high for
-    # a fixed ratio. big_count = round(max_big_capacity * big_ratio).
-    p.add_argument("--big-ratio-low", type=float, default=0.5,
-                   help="Lower bound of per-episode big_ratio (set "
-                        "==--big-ratio-high for a fixed value).")
-    p.add_argument("--big-ratio-high", type=float, default=0.5,
-                   help="Upper bound of per-episode big_ratio.")
-    # Per-episode small_ratio is sampled Uniform(low, high). small_count =
-    # round((total_capacity - big_count) * small_ratio).
-    p.add_argument("--small-ratio-low", type=float, default=0.5,
-                   help="Lower bound of per-episode small_ratio.")
-    p.add_argument("--small-ratio-high", type=float, default=0.5,
-                   help="Upper bound of per-episode small_ratio. Set "
-                        "high==low==1.0 with big-ratio also 1.0 for zero "
-                        "empties.")
-    # Per-episode target_depth is drawn uniformly from this list. Single
-    # value = fixed depth. Accepts both space-separated tokens
-    # (`--target-depths 0 1 2 4`) and comma-separated within tokens
-    # (`--target-depths 0,1,2,4` or `--target-depths "0, 1, 2"`).
-    def _parse_depth_token(s: str) -> list[int]:
-        # argparse calls this per token; split commas so a single
-        # comma-joined token expands to multiple ints.
-        return [int(x) for x in s.replace(",", " ").split()]
-    p.add_argument("--target-depths", type=_parse_depth_token, nargs="+",
-                   default=[[0]],
-                   help="Discrete choice set for the retrieve target's "
-                        "stack depth (0 = top). One is drawn uniformly per "
-                        "episode. Accepts space- or comma-separated values: "
-                        "e.g. `--target-depths 0 1 2` or `--target-depths 0,1,2`.")
-    # Per-episode room initial state probabilities (categorical over
-    # empty / small_item / big_item). Pass three values; they get
-    # normalized internally. Default is 1/3 each.
-    p.add_argument("--room-state-probs", type=float, nargs=3,
-                   default=[1.0 / 3, 1.0 / 3, 1.0 / 3],
-                   metavar=("P_EMPTY", "P_SMALL", "P_BIG"),
-                   help="Three probabilities for the room's initial load "
-                        "(empty, small_item, big_item). When small/big is "
-                        "drawn, one empty pallet is taken from the shelves "
-                        "and reissued as the room item (total pallet count "
-                        "preserved). Falls back to empty if no empty "
-                        "exists on the shelves.")
+    # Task scenario — all explicit (one config = one point in hardness-space)
+    p.add_argument("--task", type=str, default="retrieve",
+                   choices=("retrieve", "bring_empty"),
+                   help="Task type. retrieve: deliver a marked pallet to a "
+                        "room. bring_empty: stage an empty at a room and "
+                        "WAIT. (If bring_empty but no empties exist, falls "
+                        "back to retrieve.)")
+    p.add_argument("--retrieve-from", type=str, default="big",
+                   choices=("big", "small"),
+                   help="Shelf class the retrieve target is drawn from.")
+    p.add_argument("--retrieve-route", type=str, default="direct",
+                   choices=("direct", "handoff"),
+                   help="Delivery route of the target's shelf. direct: the "
+                        "shelf's carrier serves a room (no handoff). handoff: "
+                        "the carrier has no room, so the pallet must be handed "
+                        "off to reach one (a harder retrieve).")
+    p.add_argument("--target-depth", type=int, default=0,
+                   help="Retrieve target's stack depth (0 = top/accessible). "
+                        "Deeper = more blockers to dig out.")
+    # Initial-state knobs (forwarded to InitialStateSampler).
+    p.add_argument("--big-shelf-fullness", type=float, default=0.5,
+                   help="Fraction of big-shelf SLOTS occupied by a pallet. "
+                        "Eviction headroom = the rest. Dominant retrieve "
+                        "hardness lever.")
+    p.add_argument("--system-fullness", type=float, default=0.5,
+                   help="Fraction of the NON-big trays that carry a small "
+                        "item; the rest stay empty.")
+    p.add_argument("--big-ratio", type=float, default=0.5,
+                   help="Fraction of the OCCUPIED big-shelf slots that hold a "
+                        "big item — facility-invariant big-shelf saturation.")
+    p.add_argument("--big-disorder", type=float, default=0.0,
+                   help="Fraction of big items buried DEEPER than the "
+                        "smalls/empties on the same shelf. 0 = bigs most "
+                        "accessible.")
+    p.add_argument("--small-disorder", type=float, default=0.0,
+                   help="Fraction of small items buried deeper than the "
+                        "empties on the same shelf. 0 = smalls above empties.")
+    p.add_argument("--room-state", type=str, default="empty",
+                   choices=("empty", "small_item", "big_item"),
+                   help="Room's initial load. For small/big, one empty pallet "
+                        "is taken off the shelves and reissued as the room "
+                        "item (pallet count preserved); falls back to empty "
+                        "if no empty exists.")
     # PPO / optim
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--clip-range", type=float, default=0.2)
@@ -313,13 +259,6 @@ def main() -> None:
     p.add_argument("--resume", type=str, default=None)
     args = p.parse_args()
 
-    # _parse_depth_token returns a list per token; flatten so that
-    # `--target-depths 0 1,2 3` is identical to `--target-depths 0 1 2 3`.
-    flat_depths: list[int] = []
-    for tok in args.target_depths:
-        flat_depths.extend(tok if isinstance(tok, list) else [int(tok)])
-    args.target_depths = flat_depths
-
     run_name = args.run_name or "single_task_" + time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path(args.runs_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -329,15 +268,15 @@ def main() -> None:
     _banner("single-task · retrieve OR bring-empty")
     _kv("run dir", _v(run_dir))
     _kv("facility", _v(args.facility))
-    _kv("bring_empty_prob", _v(args.bring_empty_prob))
-    _kv("big_ratio",   f"{C_DIM}U[{_C.RESET}{_v(args.big_ratio_low)}{C_DIM}, {_C.RESET}"
-                       f"{_v(args.big_ratio_high)}{C_DIM}]{_C.RESET}")
-    _kv("small_ratio", f"{C_DIM}U[{_C.RESET}{_v(args.small_ratio_low)}{C_DIM}, {_C.RESET}"
-                       f"{_v(args.small_ratio_high)}{C_DIM}]{_C.RESET}")
-    _kv("target_depths", _v(args.target_depths))
-    _kv("room probs", f"{C_DIM}E{_C.RESET} {_v(args.room_state_probs[0])}  "
-                       f"{C_DIM}S{_C.RESET} {_v(args.room_state_probs[1])}  "
-                       f"{C_DIM}B{_C.RESET} {_v(args.room_state_probs[2])}")
+    _kv("task", f"{_v(args.task)} {C_DIM}from{_C.RESET} {_v(args.retrieve_from)} "
+                f"{C_DIM}via{_C.RESET} {_v(args.retrieve_route)} "
+                f"{C_DIM}@ depth{_C.RESET} {_v(args.target_depth)}")
+    _kv("big_shelf_fullness", _v(args.big_shelf_fullness))
+    _kv("system_fullness", _v(args.system_fullness))
+    _kv("big_ratio", _v(args.big_ratio))
+    _kv("disorder", f"{C_DIM}big{_C.RESET} {_v(args.big_disorder)}  "
+                    f"{C_DIM}small{_C.RESET} {_v(args.small_disorder)}")
+    _kv("room_state", _v(args.room_state))
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -346,7 +285,7 @@ def main() -> None:
     env = _build_env(args)
     topo, _ = get_facility(args.facility)()
     collator = GraphCollator(topo)
-    n_max = env.action_space.n
+    n_max = env.n_actions
     _kv(
         "layout",
         f"{_v_num(len(collator.carrier_ids))} {C_DIM}carriers{_C.RESET}  "

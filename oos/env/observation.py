@@ -7,8 +7,8 @@ from typing import Any
 
 import numpy as np
 
-from oos.sim.actions import MultiRelocate, Relocate, Wait
-from oos.sim.facility import Facility
+from oos.sim.actions import MultiRelocate, Relocate
+from oos.sim.facility import SimEngine
 from oos.sim.state import Pallet
 from oos.sim.tasks import Retrieve, TaskQueue
 from oos.sim.topology import CarrierId
@@ -99,7 +99,7 @@ GLOBAL_FEATURE_NAMES: tuple[str, ...] = ()
 
 
 def compute_in_flight_overlay(
-    facility: Facility,
+    facility: SimEngine,
 ) -> tuple[dict[str, Pallet], dict[str, int]]:
     """Physically-faithful in-flight overlay for mid-Relocate carriers.
 
@@ -232,7 +232,7 @@ def compute_in_flight_overlay(
 
 
 def build_observation(
-    facility: Facility,
+    facility: SimEngine,
     queue: TaskQueue,
     querying_carrier: CarrierId,
     cfg: ObservationConfig,
@@ -272,17 +272,11 @@ def build_observation(
             carrier_features[i, 3] = 1.0
         else:
             carrier_features[i, 4] = 1.0
-        # Wait is observationally treated as idle. It's a no-op the
-        # carrier opted into; it wakes early on external state changes
-        # (`Facility.wake_waiting_carriers`) and after at most
-        # `Wait.duration`. Surfacing it as "busy with ETA" makes the
-        # policy's output depend on whether another carrier happened to
-        # pick WAIT — bad for a deterministic policy. Equivalent to
-        # pre-unification semantics where WAIT carriers looked idle.
-        is_busy_cmd = (
-            cs.current_command is not None
-            and not isinstance(cs.current_command, Wait)
-        )
+        # A waiting carrier (no command — it chose WAIT or has nothing to do)
+        # is observed as not-busy: WAIT is a no-op hold, re-opened on any
+        # state change, so surfacing it as "busy with ETA" would make the
+        # policy's output depend on whether another carrier happened to wait.
+        is_busy_cmd = cs.current_command is not None
         carrier_features[i, 5] = 1.0 if is_busy_cmd else 0.0
         if is_busy_cmd and cs.busy_until is not None:
             eta = max(0.0, cs.busy_until - state.time)
@@ -465,12 +459,11 @@ def _target_node(
         Move,
         MultiRelocate,
         Relocate,
-        Wait,
     )
 
     if isinstance(cmd, (Relocate, MultiRelocate)):
         return _location_node(cmd.dst, s_off, r_off, shelf_idx, room_idx)
-    if isinstance(cmd, (Move, Wait)):
+    if isinstance(cmd, Move):
         return None
     return None
 

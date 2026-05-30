@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 import pygame
 
-from oos.facility import Facility
+from oos.env import Environment
 from oos.sim.tasks import TaskQueue
 from oos.sim.topology import Topology
 from oos.viz.components import (
@@ -36,10 +36,10 @@ from oos.viz.components import (
 )
 from oos.viz.layout import Layout
 from oos.viz.sidebar import (
+    AutoQueueContent,
     DistributionContent,
     QueueContent,
     RandomizeContent,
-    ReplayContent,
     StatsContent,
 )
 
@@ -65,6 +65,7 @@ class RenderState:
     policy_chosen: int | None = None
     policy_action_entries: list = field(default_factory=list)
     policy_query_log: dict = field(default_factory=dict)
+    reward_breakdown: dict = field(default_factory=dict)
     mouse_pos: tuple[int, int] = (0, 0)
 
 
@@ -130,12 +131,12 @@ class Renderer:
         return self._randomize_panel.content  # type: ignore[return-value]
 
     @property
-    def replay_panel(self) -> Panel:
-        return self._replay_panel
+    def auto_queue_panel(self) -> Panel:
+        return self._auto_queue_panel
 
     @property
-    def replay_content(self) -> ReplayContent:
-        return self._replay_panel.content  # type: ignore[return-value]
+    def auto_queue_content(self) -> AutoQueueContent:
+        return self._auto_queue_panel.content  # type: ignore[return-value]
 
     @property
     def tab_strip(self) -> TabStrip:
@@ -154,8 +155,8 @@ class Renderer:
             return [self._queue_panel, self._dist_panel]
         if self._tab_strip.active == 1:        # randomize
             return [self._randomize_panel]
-        # tab 2 — replay
-        return [self._replay_panel, self._dist_panel]
+        # tab 2 — auto-queue (task-stream config)
+        return [self._auto_queue_panel]
 
     def __init__(
         self,
@@ -208,13 +209,13 @@ class Renderer:
             title="Random initial state", content=RandomizeContent(),
             accent=MAGENTA_BRIGHT, preferred_h=400, collapsable=False,
         )
-        self._replay_panel = Panel(
-            pygame.Rect(self._col_x, 0, self._panel_w, 220),
-            title="Training Replay", content=ReplayContent(),
-            accent=YELLOW_BRIGHT, preferred_h=220, collapsable=False,
+        self._auto_queue_panel = Panel(
+            pygame.Rect(self._col_x, 0, self._panel_w, 240),
+            title="Auto-queue (task stream)", content=AutoQueueContent(),
+            accent=YELLOW_BRIGHT, preferred_h=240, collapsable=False,
         )
         self._tab_strip = TabStrip(
-            labels=["status", "randomize", "replay"],
+            labels=["status", "randomize", "auto-queue"],
             active=0, accent=MAGENTA_BRIGHT,
         )
 
@@ -282,7 +283,7 @@ class Renderer:
     def draw(
         self,
         surface: pygame.Surface,
-        facility: Facility,
+        facility: Environment,
         queue: TaskQueue,
         rs: RenderState,
         manual_mode: bool = False,
@@ -312,6 +313,7 @@ class Renderer:
             querying=rs.querying,
             policy_label=rs.policy_label,
             facility_name=rs.facility_name,
+            last_reward_breakdown=rs.reward_breakdown,
         )
         self._queue_panel.content.update(
             pending=queue.pending, now=rs.anim_now, manual_mode=manual_mode,
@@ -322,6 +324,7 @@ class Renderer:
             mouse_pos=rs.mouse_pos,
         )
         self._randomize_panel.content.update(wall_now=rs.wall_now)  # type: ignore[attr-defined]
+        self._auto_queue_panel.content.update(wall_now=rs.wall_now)  # type: ignore[attr-defined]
 
         # Persistent Status panel at the top (visible on every tab).
         self._stats_panel.draw(surface, self.fonts)

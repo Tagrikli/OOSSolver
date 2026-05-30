@@ -28,25 +28,25 @@ from typing import Literal
 
 import numpy as np
 
-from oos.sim.facility import Facility
+from oos.sim.facility import SimEngine
 from oos.sim.shuffle import _layout_is_solvable
 from oos.sim.state import Pallet
 from oos.sim.topology import SizeClass
 
 
-def _big_shelf_ids(facility: Facility) -> list[str]:
+def _big_shelf_ids(facility: SimEngine) -> list[str]:
     return [
         sid for sid, s in facility.topology.shelves.items() if s.size_class == "big"
     ]
 
 
-def _small_shelf_ids(facility: Facility) -> list[str]:
+def _small_shelf_ids(facility: SimEngine) -> list[str]:
     return [
         sid for sid, s in facility.topology.shelves.items() if s.size_class == "small"
     ]
 
 
-def _count_bigs_stored(facility: Facility) -> int:
+def _count_bigs_stored(facility: SimEngine) -> int:
     n = 0
     for ss in facility.state.shelves.values():
         n += sum(1 for p in ss.stack if p.contents == "big")
@@ -59,7 +59,7 @@ def _count_bigs_stored(facility: Facility) -> int:
     return n
 
 
-def _big_capacity_stats(facility: Facility) -> tuple[int, int]:
+def _big_capacity_stats(facility: SimEngine) -> tuple[int, int]:
     """Returns (total_big_capacity, deepest_big_shelf_capacity)."""
     caps = [
         facility.topology.shelves[sid].capacity for sid in _big_shelf_ids(facility)
@@ -67,7 +67,7 @@ def _big_capacity_stats(facility: Facility) -> tuple[int, int]:
     return (sum(caps), max(caps) if caps else 0)
 
 
-def _first_empty_big_slot(facility: Facility) -> tuple[str, int] | None:
+def _first_empty_big_slot(facility: SimEngine) -> tuple[str, int] | None:
     """Returns (shelf_id, stack_index_to_overwrite) for the first big shelf
     slot whose pallet is empty, else None.
 
@@ -82,7 +82,7 @@ def _first_empty_big_slot(facility: Facility) -> tuple[str, int] | None:
     return None
 
 
-def big_is_feasible(facility: Facility) -> bool:
+def big_is_feasible(facility: SimEngine) -> bool:
     """All three gates: headroom, slot exists, retrievability after hypothetical."""
     total_cap, deepest = _big_capacity_stats(facility)
     if total_cap == 0:
@@ -108,7 +108,7 @@ def big_is_feasible(facility: Facility) -> bool:
     return ok
 
 
-def small_is_feasible(facility: Facility) -> bool:
+def small_is_feasible(facility: SimEngine) -> bool:
     """A small can be stored iff some small-acceptant slot (small shelf OR
     big shelf — bigs accept smalls) has an empty pallet."""
     for sid, s in facility.topology.shelves.items():
@@ -119,7 +119,7 @@ def small_is_feasible(facility: Facility) -> bool:
 
 
 def sample_store_size(
-    facility: Facility,
+    facility: SimEngine,
     rng: np.random.Generator,
     big_prob: float = 0.15,
 ) -> SizeClass | None:

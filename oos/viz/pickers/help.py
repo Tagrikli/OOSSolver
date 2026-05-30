@@ -49,7 +49,6 @@ BINDINGS: list[tuple[str, str]] = [
     ("+ / −",        "speed up / down"),
     ("r",            "reset env"),
     ("p / f",        "policy / facility picker"),
-    ("c",            "training-run config picker"),
     ("h",            "this help modal"),
     ("d",            "(in picker) deterministic"),
     ("s",            "(in picker) MCTS search"),

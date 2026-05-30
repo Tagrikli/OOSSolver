@@ -11,3 +11,6 @@ wheels/
 
 # Training artifacts
 runs/
+
+# Claude Code local runtime state
+.claude/

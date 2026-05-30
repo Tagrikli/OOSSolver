@@ -1,6 +1,6 @@
 """Pygame visualization for a facility and a running Agent.
 
-The Agent + Facility classes live in `oos.agent` and `oos.facility` —
+The Agent + Environment classes live in `oos.agent` and `oos.env` —
 this package only consumes them.
 """
 

@@ -9,14 +9,14 @@ from oos.config.schema import ExperimentConfig, TaskStreamConfig
 from oos.facilities import get_facility
 from oos.learn.episode_env import EpisodeConfig, EpisodeEnv
 from oos.sim.durations import LinearDurations
-from oos.sim.facility import Facility
+from oos.sim.facility import SimEngine
 from oos.sim.shuffle import shuffle_state
 from oos.sim.tasks import Store
 
 
-def _fresh_facility(name: str = "tiny") -> Facility:
+def _fresh_facility(name: str = "tiny") -> SimEngine:
     topo, seed = get_facility(name)()
-    return Facility(topology=topo, seeding=seed, durations=LinearDurations())
+    return SimEngine(topology=topo, seeding=seed, durations=LinearDurations())
 
 
 def test_shuffle_preserves_pallet_ids():
