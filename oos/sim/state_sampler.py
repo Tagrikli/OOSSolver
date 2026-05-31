@@ -67,7 +67,7 @@ import numpy as np
 
 from oos.sim.facility import SimEngine
 from oos.sim.shuffle import _layout_is_solvable, shuffle_state
-from oos.sim.state import Pallet
+from oos.sim.state import DockRef, Pallet
 
 RoomState = Literal["empty", "small_item", "big_item"]
 
@@ -145,8 +145,11 @@ class InitialStateSampler:
         realised per-episode values."""
         cfg = self.cfg
         counts = self._place_pallets(facility, rng)
-        room_state = self._apply_room_state(facility, rng)
+        # Randomize carrier positions first, THEN stage the room: a staged
+        # carrier is parked at the room (its position is fixed), so it must
+        # override the random draw, not the other way round.
         self._randomize_carriers(facility, rng)
+        room_state = self._apply_room_state(facility, rng)
 
         trays_on_big, n_big, n_small, n_empty, total_big_slots, n_total = counts
         return SampleResult(
@@ -258,19 +261,12 @@ class InitialStateSampler:
         total_small_slots = sum(caps[s] for s in small_ids)
 
         state = facility.state
-        # Fold any existing room loads back onto a shelf so they re-enter
-        # the pool — shuffle_state collects from shelves + carriers only and
-        # then wipes rooms, so a pre-existing room pallet would otherwise be
-        # destroyed (drops the conserved count). Makes sample() idempotent
-        # when called repeatedly on the same facility.
-        if state.shelves:
-            sink = next(iter(state.shelves.values())).stack
-            for rs in state.rooms.values():
-                if rs.load is not None:
-                    sink.append(Pallet(id=rs.load.id, contents="empty"))
-                    rs.load = None
+        # A carrier staged at a room (from a prior sample) holds its pallet on
+        # cs.load; shuffle_state collects carrier loads back into the pool and
+        # wipes carriers, so the conserved count is preserved automatically —
+        # no room-fold needed (rooms hold nothing of their own anymore).
 
-        # shuffle_state(fullness=0) wipes carriers/rooms/scheduler and lays
+        # shuffle_state(fullness=0) wipes carriers/scheduler and lays
         # all N pallets out as empties. We then collect the IDs and re-place
         # them per the occupancy targets — the wipe is the part we want.
         shuffle_state(facility, fullness=0.0, rng=rng)
@@ -352,13 +348,19 @@ class InitialStateSampler:
     def _apply_room_state(
         self, facility: SimEngine, rng: np.random.Generator,
     ) -> str:
-        """Apply the configured room_state. For small/big, pull an empty
-        pallet off the shelves and re-issue it as the room load (pallet
-        count preserved). Falls back to 'empty' if no empty exists."""
+        """Apply the configured room_state. Rooms hold no pallet of their own
+        now; "staging a room" means the room's serving carrier starts docked +
+        WAITing at the room, physically holding a {small|big} pallet pulled off
+        the shelves (pallet count preserved). Falls back to 'empty' if no empty
+        exists or no room is present."""
         want = self.cfg.room_state
         if want == "empty":
             return "empty"
         contents = "small" if want == "small_item" else "big"
+
+        room_ids = list(facility.topology.rooms.keys())
+        if not room_ids:
+            return "empty"
 
         empty_locations: list[tuple[str, int]] = []
         for sid, ss in facility.state.shelves.items():
@@ -371,13 +373,13 @@ class InitialStateSampler:
         sid, idx = empty_locations[rng.integers(len(empty_locations))]
         old_pallet = facility.state.shelves[sid].stack.pop(idx)
 
-        room_ids = list(facility.state.rooms.keys())
-        if not room_ids:
-            facility.state.shelves[sid].stack.insert(idx, old_pallet)
-            return "empty"
-        facility.state.rooms[room_ids[0]].load = Pallet(
-            id=old_pallet.id, contents=contents,
-        )
+        room_id = room_ids[0]
+        room = facility.topology.rooms[room_id]
+        cs = facility.state.carriers[room.served_by]
+        cs.load = Pallet(id=old_pallet.id, contents=contents)
+        cs.docked_at = DockRef("room", room_id)
+        cs.position = room.position
+        cs.waiting = True
         return want
 
     # ─────────────────────────────────────────────────────────────────────
@@ -442,16 +444,12 @@ def _order_by_disorder(
 
 
 def has_empty_pallet_anywhere(facility: SimEngine) -> bool:
-    """True iff any empty pallet exists on a shelf, on a carrier, or in a
-    room."""
+    """True iff any empty pallet exists on a shelf or on a carrier."""
     for ss in facility.state.shelves.values():
         for p in ss.stack:
             if p.is_empty:
                 return True
     for cs in facility.state.carriers.values():
         if cs.load is not None and cs.load.is_empty:
-            return True
-    for rs in facility.state.rooms.values():
-        if rs.load is not None and rs.load.is_empty:
             return True
     return False

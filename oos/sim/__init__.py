@@ -2,19 +2,18 @@
 
 from oos.sim.actions import (
     Command,
-    LocationId,
-    Move,
-    MultiRelocate,
-    Relocate,
+    Give,
+    Goto,
+    Take,
 )
 from oos.sim.durations import DurationModel, LinearDurations
 from oos.sim.facility import AdvanceResult, SeedingConfig, SimEngine, TaskCompletion
 from oos.sim.scheduler import Event, Scheduler
 from oos.sim.state import (
     CarrierState,
+    DockRef,
     FacilityState,
     Pallet,
-    RoomState,
     ShelfState,
     SimTime,
 )
@@ -44,25 +43,24 @@ __all__ = [
     "CarrierId",
     "CarrierState",
     "Command",
+    "DockRef",
     "DurationModel",
     "Event",
     "FacilityState",
     "SimEngine",
+    "Give",
+    "Goto",
     "HandoffEdge",
     "InitialStateSampler",
     "InitialStateSamplerConfig",
     "LinearDurations",
-    "LocationId",
-    "Move",
-    "MultiRelocate",
     "Pallet",
     "Position",
-    "Relocate",
     "Retrieve",
     "Room",
     "RoomId",
-    "RoomState",
     "SampleResult",
+    "Take",
     "Scheduler",
     "SeedingConfig",
     "has_empty_pallet_anywhere",

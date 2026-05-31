@@ -17,6 +17,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from oos.env import Environment
+from oos.env.action import ActionType
 from oos.sim.actions import short_action_label
 
 PolicyFn = Callable[[dict, dict], int]
@@ -174,8 +175,11 @@ class Agent:
         # Build the human-readable label from the entry list, if available.
         entries = self.info.get("action_entries", [])
         if 0 <= action_idx < len(entries):
-            cmd = entries[action_idx].to_command(querying)
-            label = short_action_label(cmd)
+            entry = entries[action_idx]
+            if entry.type == ActionType.WAIT:
+                label = "wait"   # WAIT has no Command (handled by Facility.wait)
+            else:
+                label = short_action_label(entry.to_command(querying))
         else:
             label = f"#{action_idx}"
 

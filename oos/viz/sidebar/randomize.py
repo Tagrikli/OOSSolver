@@ -123,6 +123,11 @@ class RandomizeContent:
         self._generate_btn = Button(
             "generate", variant="accent", text="⟳ GENERATE",
         )
+        # Reproduce an exact episode from a code copied off the training
+        # terminal (clipboard → decode → regenerate). Mirrors the V hotkey.
+        self._load_btn = Button(
+            "load_code", variant="primary", text="⎘ LOAD CODE (V)",
+        )
         self._wall_now: float = 0.0
         self._last_error: Optional[str] = None
         self._focused_key: Optional[str] = None
@@ -132,6 +137,9 @@ class RandomizeContent:
         # Set by the renderer; called when the user fires Generate.
         # Signature: on_generate(params: dict) -> None
         self.on_generate: Optional[Callable[[dict], None]] = None
+        # Set by the renderer; called when the user clicks LOAD CODE.
+        # Signature: on_load_code() -> None  (reads the clipboard itself)
+        self.on_load_code: Optional[Callable[[], None]] = None
 
     # ---- per-frame state setters ------------------------------------------
 
@@ -161,6 +169,12 @@ class RandomizeContent:
         if self._generate_btn.hit_test(pos):
             self._focus(None)
             self._fire_generate()
+            return True
+        # Load-code button (reproduce an exact episode from the clipboard).
+        if self._load_btn.hit_test(pos):
+            self._focus(None)
+            if self.on_load_code is not None:
+                self.on_load_code()
             return True
         # Radio groups: single-select.
         for key, group in self._radios.items():
@@ -273,7 +287,9 @@ class RandomizeContent:
               body: pygame.Rect, panel) -> None:
         n_rows = len(self._rows)
         rows_h = n_rows * self.ROW_H + (n_rows - 1) * self.ROW_GAP
-        total_h = rows_h + self.BUTTON_TOP_GAP + self.BUTTON_H + self.HINT_H + 4
+        # Two stacked buttons (GENERATE + LOAD CODE) above the hint line.
+        total_h = (rows_h + self.BUTTON_TOP_GAP + 2 * self.BUTTON_H + 4
+                   + self.HINT_H + 4)
 
         # Pixel-granular scrolling (row_h=1, n_rows=total_h px).
         panel.draw_scrollbar(surface, fonts, body, total_h, 1)
@@ -320,15 +336,18 @@ class RandomizeContent:
                 group.draw(surface, fonts)
             y += self.ROW_H + self.ROW_GAP
 
-        # Generate button + hint line.
+        # Generate + Load-code buttons, then the hint line.
+        btn_w = body.right - x - 12
         y += self.BUTTON_TOP_GAP - self.ROW_GAP
-        self._generate_btn.set_rect(pygame.Rect(
-            x, y, body.right - x - 12, self.BUTTON_H,
-        ))
+        self._generate_btn.set_rect(pygame.Rect(x, y, btn_w, self.BUTTON_H))
         self._generate_btn.draw(surface, fonts)
 
+        y += self.BUTTON_H + 4
+        self._load_btn.set_rect(pygame.Rect(x, y, btn_w, self.BUTTON_H))
+        self._load_btn.draw(surface, fonts)
+
         y += self.BUTTON_H + 2
-        hint = "drag to scrub  ·  click to type  ·  enter: generate"
+        hint = "enter: generate  ·  V / LOAD CODE: paste an OOS1- episode code"
         blit_text(surface, hint, (x, y), fonts.tiny, BASE_MUTED)
 
         if self._last_error:

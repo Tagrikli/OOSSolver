@@ -500,6 +500,8 @@ class VizApp:
             save_viz_state(self.runs_dir, speed=s.speed)
         elif event.key == pygame.K_r:
             self._reset_env(s)
+        elif event.key == pygame.K_v:
+            self._load_episode_from_clipboard(s)
         elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
             target = {pygame.K_1: "empty", pygame.K_2: "small",
                       pygame.K_3: "big"}[event.key]
@@ -559,6 +561,20 @@ class VizApp:
                     save_viz_state(self.runs_dir, policy_path=entry.path)
             s.picker.close()
 
+    def _load_episode_from_clipboard(self, s: _RunState) -> None:
+        """V-key / LOAD CODE button: read an episode code off the system
+        clipboard and regenerate its exact layout."""
+        from oos.viz.clipboard import read_clipboard_text
+        from oos.viz.policy_swap import load_episode_code
+        text = read_clipboard_text()
+        if not text:
+            s.toasts.error("CLIPBOARD EMPTY — copy an OOS1- code first", lifetime=3.0)
+            return
+        load_episode_code(
+            text, self.facility_name, s.renderer.randomize_content,
+            s.pending_generate, s.toasts,
+        )
+
     def _reset_env(self, s: _RunState) -> None:
         """R-key handler. If we're on a Generate-spawned SingleTaskEnv,
         revert to the original Environment on this facility instead of
@@ -616,6 +632,10 @@ class VizApp:
             save_viz_state(self.runs_dir, randomize=self._randomize_cfg)
             pending_generate.append(params)
         r.randomize_content.on_generate = fire_generate
+        if state is not None:
+            r.randomize_content.on_load_code = (
+                lambda st=state: self._load_episode_from_clipboard(st)
+            )
         if getattr(self, "_randomize_cfg", None):
             r.randomize_content.set_values(self._randomize_cfg)
 

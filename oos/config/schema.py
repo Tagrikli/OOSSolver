@@ -4,13 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from oos.sim.motion import SHELF_OP_FLOOR_S, SHELF_OP_STROKE_MM
 from oos.sim.state import SimTime
 from oos.sim.topology import SizeClass
 
 
 @dataclass(frozen=True)
 class DurationsConfig:
-    shelf_op_time: SimTime = 0.5
+    # A take/give is a trapezoidal fork reach (vmax/accel from SHELF_OP_PROFILE)
+    # over this fixed stroke, floored at `shelf_op_floor`. Same for every op.
+    shelf_op_stroke_mm: float = SHELF_OP_STROKE_MM
+    shelf_op_floor: SimTime = SHELF_OP_FLOOR_S
     handoff_time: SimTime = 1.0
 
 

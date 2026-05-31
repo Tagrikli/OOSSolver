@@ -128,7 +128,7 @@ def main():
         )
         env = make_env(cfg, level)
         if n_max is None:
-            n_max = env.action_space.n
+            n_max = env.n_actions
         res = [run(env, net, collator, n_max, device, args.deterministic, seed=s)
                for s in range(args.episodes)]
         res = [r for r in res if r["had_target"]]

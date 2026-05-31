@@ -41,6 +41,7 @@ from oos.env.observation import ObservationConfig
 from oos.env.reward import RewardConfig
 from oos.env.store_sampler import sample_store_size
 from oos.config.schema import ExperimentConfig
+from oos.sim.state import pallet_depth
 from oos.sim.shuffle import shuffle_state
 from oos.sim.tasks import Retrieve, Store
 
@@ -198,9 +199,6 @@ class EpisodeEnv(Environment):
         for cs in facility.state.carriers.values():
             if cs.load is not None and not cs.load.is_empty:
                 ids.append(int(cs.load.id))
-        for rs in facility.state.rooms.values():
-            if rs.load is not None and not rs.load.is_empty:
-                ids.append(int(rs.load.id))
         self._rng.shuffle(ids)
         self._retrieve_order = ids
         self._retrieve_idx = 0
@@ -215,9 +213,10 @@ class EpisodeEnv(Environment):
         target = self._retrieve_order[self._retrieve_idx]
         self._retrieve_idx += 1
         self._active_retrieve_id = target
-        facility.queue.add(
-            Retrieve(arrived_at=facility.state.time, pallet=target)
-        )
+        facility.queue.add(Retrieve(
+            arrived_at=facility.state.time, pallet=target,
+            initial_depth=pallet_depth(facility.state, target),
+        ))
 
     @staticmethod
     def _has_empty_pallet_anywhere(facility) -> bool:
@@ -227,9 +226,6 @@ class EpisodeEnv(Environment):
                     return True
         for cs in facility.state.carriers.values():
             if cs.load is not None and cs.load.is_empty:
-                return True
-        for rs in facility.state.rooms.values():
-            if rs.load is not None and rs.load.is_empty:
                 return True
         return False
 

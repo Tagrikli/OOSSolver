@@ -57,13 +57,16 @@ from oos.learn._style import (
     _v,
     _v_num,
 )
+from oos.env.reward import RewardConfig
 from oos.learn.batching import GraphCollator
-from oos.learn.continuous_env import ContinuousEnv, ContinuousRewardConfig
+from oos.learn.continuous_env import ContinuousEnv
+from oos.learn.greedy_eval import GreedyEvaluator, print_eval
 from oos.learn.level_scheduler import LevelScheduler, LevelSpace, PLRConfig
 from oos.learn.network import NetworkConfig, PolicyValueNet
 from oos.learn.normalize import RewardNormalizer
 from oos.learn.ppo import PPOConfig, ppo_update
 from oos.learn.rollout import collect_rollout, compute_gae, make_collector
+from oos.sim.episode_code import encode_episode
 
 
 def _level_space(args: argparse.Namespace) -> LevelSpace:
@@ -103,16 +106,16 @@ def _experiment_config(args: argparse.Namespace) -> ExperimentConfig:
     )
 
 
-def _reward_config(args: argparse.Namespace) -> ContinuousRewardConfig:
-    return ContinuousRewardConfig(
-        delivery_bonus=args.delivery_bonus,
-        store_serve_bonus=args.store_serve_bonus,
-        wrong_item_penalty=args.wrong_item_penalty,
-        stage_bonus=args.stage_bonus,
-        time_weight=args.time_weight,
-        movement_weight=args.movement_weight,
-        all_idle_retrieve_penalty=args.all_idle_retrieve_penalty,
-        all_idle_no_room_empty_penalty=args.all_idle_no_room_empty_penalty,
+def _reward_config(args: argparse.Namespace) -> RewardConfig:
+    # The continuous reward: DELIVER + SERVE outcomes over the 3-term PBRS
+    # potential; ContinuousEnv runs it via base_system + Environment._potential.
+    return RewardConfig(
+        reward_deliver=args.reward_deliver,
+        reward_serve=args.reward_serve,
+        potential_item_retrieval=args.potential_item_retrieval,
+        potential_room_ready=args.potential_room_ready,
+        potential_wrong_car=args.potential_wrong_car,
+        potential_shallowest_empty=args.potential_shallowest_empty,
     )
 
 
@@ -182,37 +185,31 @@ def main() -> None:
     p.add_argument("--lambda-value", type=float, default=0.0,
                    help="Weight on the workload-integrated cost dt*n_pending "
                         "subtracted from reward in the collector.")
-    # Reward — three sparse outcome terms; urgency comes from gamma, not a
-    # wait penalty. P1 (delivery) > P2 (serve) by magnitude. See
-    # ContinuousRewardConfig.
-    p.add_argument("--delivery-bonus", type=float, default=50.0,
-                   help="P1: + per retrieve completion.")
-    p.add_argument("--store-serve-bonus", type=float, default=15.0,
-                   help="P2: + per store served (empty pallet at room → car "
-                        "loaded). Keep below delivery-bonus so P1 outranks P2.")
-    p.add_argument("--wrong-item-penalty", type=float, default=5.0,
-                   help="± filled-car half of the symmetric room workflow: "
-                        "−per non-target car placed at a room (WRONG) and "
-                        "+per filled car evacuated out of a room (EVAC). Same "
-                        "magnitude both ways → clearing can't be farmed.")
-    p.add_argument("--stage-bonus", type=float, default=0.0,
-                   help="± empty-pallet half of the symmetric room workflow: "
-                        "+per empty staged into a free room (STAGE, the 'ready' "
-                        "home state) and −per staged empty removed (UNSTAGE). "
-                        "Same magnitude both ways (R1==R2). Off by default.")
-    p.add_argument("--time-weight", type=float, default=0.0,
-                   help="− w·(ticks since last completion) every step; resets "
-                        "to 0 on any delivery/serve. Escalating throughput "
-                        "pressure anchored to completions. Off by default.")
-    p.add_argument("--movement-weight", type=float, default=1e-5,
-                   help="P3: −w·distance_mm (tiny).")
-    p.add_argument("--all-idle-retrieve-penalty", type=float, default=0.0,
-                   help="−per step where NO carrier is working (all waiting) "
-                        "AND a Retrieve is pending.")
-    p.add_argument("--all-idle-no-room-empty-penalty", type=float, default=0.0,
-                   help="−per step where NO carrier is working (all waiting) "
-                        "AND no room holds a staged empty pallet. Independent "
-                        "of --all-idle-retrieve-penalty (both can fire).")
+    # Reward — two pump-safe outcome rewards over a three-term PBRS potential
+    # (see RewardConfig / Environment._potential). DELIVER + SERVE consume a
+    # queued task each; the potential shapes the dig (retrieval depth), staging
+    # an empty at a room, and not leaving a parked car at a room. No movement /
+    # idle / time penalties — urgency comes from gamma.
+    p.add_argument("--reward-deliver", type=float, default=50.0,
+                   help="+ per requested item delivered (flat; depth is in the potential).")
+    p.add_argument("--reward-serve", type=float, default=20.0,
+                   help="+ per store served onto a staged empty. Should exceed the "
+                        "serve-step Φ drop = room-ready + wrong-car (+ up to "
+                        "shallowest-empty·max-depth) or serving is net-negative.")
+    # PBRS potential weights. Φ(s) = − w_ret·Σ(depth+1) + w_ready·#ready − w_wrong·#wrong.
+    p.add_argument("--potential-item-retrieval", type=float, default=1.0,
+                   help="PBRS w_ret: Φ drops by w_ret·(depth+1) per requested item; "
+                        "digging it shallower raises Φ.")
+    p.add_argument("--potential-room-ready", type=float, default=2.0,
+                   help="PBRS w_ready: Φ rises by w_ready per carrier docked at a "
+                        "room holding an empty pallet (staging).")
+    p.add_argument("--potential-wrong-car", type=float, default=2.0,
+                   help="PBRS w_wrong: Φ drops by w_wrong per carrier docked at a "
+                        "room holding a non-requested car; restored on leaving.")
+    p.add_argument("--potential-shallowest-empty", type=float, default=1.0,
+                   help="PBRS w_empty: Φ drops by w_empty·(burial depth of the "
+                        "shallowest empty pallet anywhere); keeps an empty reachable "
+                        "for staging. 0 = off.")
     # Network
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--n-heads", type=int, default=4)
@@ -236,6 +233,21 @@ def main() -> None:
     p.add_argument("--log-every", type=int, default=5,
                    help="Rewrite progress.md every N iters (metrics.jsonl is "
                         "appended every iter regardless).")
+    # Greedy held-out eval — the SKILL signal (vs sampled-throughput noise).
+    # Runs the policy at argmax on a fixed depth×route×class grid with the
+    # stream OFF, scoring how many seeded digs it actually delivers. Immune to
+    # the level-sampling and entropy confounds that make retr/ep unreadable.
+    p.add_argument("--eval-every", type=int, default=10,
+                   help="Run the greedy held-out eval every N iters (and on the "
+                        "final iter). 0 = off. Logs eval/* to TB, the terminal, "
+                        "progress.md, and greedy_metrics.jsonl.")
+    p.add_argument("--eval-max-steps", type=int, default=300,
+                   help="Step cap per held-out dig before it's scored unsolved "
+                        "(greedy episodes early-exit the instant the dig lands).")
+    p.add_argument("--eval-seed", type=int, default=12345,
+                   help="Seed for the held-out levels' concrete state. Fixed and "
+                        "separate from --seed so the benchmark is identical every "
+                        "eval — solve-rate moves reflect the policy, nothing else.")
     p.add_argument("--regret-metric", type=str, default="l1_value_loss",
                    choices=("l1_value_loss", "positive_value_loss"),
                    help="PLR scoring. l1_value_loss = mean|return-value| "
@@ -280,6 +292,7 @@ def main() -> None:
         reward_config=_reward_config(args),
         experiment_config=_experiment_config(args),
     )
+    env.reward_gamma = args.gamma   # PBRS shaping uses the training discount
     topo, _ = get_facility(args.facility)()
     collator = GraphCollator(topo)
     n_max = env.n_actions
@@ -312,6 +325,18 @@ def main() -> None:
     if args.reward_scaling:
         clip = args.reward_clip if args.reward_clip > 0 else None
         reward_normalizer = RewardNormalizer(n_envs=1, gamma=ppo_cfg.gamma, clip=clip)
+
+    # Greedy held-out evaluator — own stream-OFF env + frozen dig grid. Built
+    # once; `evaluate(net)` is called every --eval-every iters in the loop.
+    evaluator: GreedyEvaluator | None = None
+    if args.eval_every > 0:
+        evaluator = GreedyEvaluator(
+            facility_factory=get_facility(args.facility),
+            reward_config=_reward_config(args),
+            experiment_config=_experiment_config(args),
+            collator=collator, n_max=n_max, device=device,
+            max_steps=args.eval_max_steps, seed=args.eval_seed,
+        )
 
     # Resume (restore net/optimizer/PLR buffer/counters) before the first
     # reset, so the env's initial level comes from the restored scheduler.
@@ -348,17 +373,24 @@ def main() -> None:
     _kv("PLR", f"{C_DIM}replay{_C.RESET} {_v(args.replay_prob)}  "
                f"{C_DIM}staleness{_C.RESET} {_v(args.staleness_coef)}  "
                f"{C_DIM}metric{_C.RESET} {_v(args.regret_metric)}")
-    _kv("reward", f"{C_DIM}deliver{_C.RESET} {_v(args.delivery_bonus)}  "
-                  f"{C_DIM}serve{_C.RESET} {_v(args.store_serve_bonus)}  "
-                  f"{C_DIM}wrong{_C.RESET} {_v(args.wrong_item_penalty)}  "
-                  f"{C_DIM}time{_C.RESET} {_v(args.time_weight)}  "
-                  f"{C_DIM}move{_C.RESET} {_v(args.movement_weight)}")
+    _kv("reward", f"{C_DIM}deliver{_C.RESET} {_v(args.reward_deliver)}  "
+                  f"{C_DIM}serve{_C.RESET} {_v(args.reward_serve)}")
+    _kv("potential", f"{C_DIM}retrieval{_C.RESET} {_v(args.potential_item_retrieval)}  "
+                     f"{C_DIM}room-ready{_C.RESET} {_v(args.potential_room_ready)}  "
+                     f"{C_DIM}wrong-car{_C.RESET} {_v(args.potential_wrong_car)}  "
+                     f"{C_DIM}empty-reach{_C.RESET} {_v(args.potential_shallowest_empty)}")
     _kv("network", f"{_v_num(f'{sum(p.numel() for p in net.parameters()):,}')} "
                    f"{C_DIM}params{_C.RESET}  {C_DIM}hidden{_C.RESET} {_v(args.hidden)}")
+    if evaluator is not None:
+        _kv("greedy eval", f"{_v(len(evaluator.levels))} {C_DIM}held-out digs every{_C.RESET} "
+                           f"{_v(args.eval_every)} {C_DIM}iters (stream off, argmax){_C.RESET}")
 
     metrics_path = run_dir / "metrics.jsonl"
     progress_path = run_dir / "progress.md"
     mf = open(metrics_path, "w", buffering=1)   # line-buffered → survives kill
+    # Greedy eval gets its own jsonl (sparser cadence than per-iter metrics).
+    gf = open(run_dir / "greedy_metrics.jsonl", "w", buffering=1) if evaluator else None
+    eval_state: dict = {"latest": None}   # newest greedy result, for progress.md
     history: list[dict] = []
 
     def _regret(returns: np.ndarray, values: np.ndarray) -> float:
@@ -391,8 +423,10 @@ def main() -> None:
             f"env_steps: {total_env_steps:,}   elapsed: {elapsed:.0f}s",
             f"- episode: {args.steps_per_iter} steps (~{args.steps_per_iter*0.3:.0f} sim-s)   "
             f"store_rate {args.store_rate}  dwell {args.mean_dwell}±{args.std_dwell}",
-            f"- reward: deliver {args.delivery_bonus}  serve {args.store_serve_bonus}  "
-            f"move {args.movement_weight}",
+            f"- reward: deliver {args.reward_deliver}  serve {args.reward_serve}   "
+            f"potential: retrieval {args.potential_item_retrieval}  "
+            f"room-ready {args.potential_room_ready}  wrong-car {args.potential_wrong_car}  "
+            f"empty-reach {args.potential_shallowest_empty}",
             "",
             f"## Running stats (last {len(recent)} iters)",
             f"- mean ep_return: {_avg('ep_return'):+.2f}",
@@ -416,6 +450,21 @@ def main() -> None:
                 f"{h.get('retrieves', 0):.2f} | {h.get('stores', 0):.2f} | "
                 f"{h['regret']:.3f} | {h['v_loss']:.3f} | {h['wall']:.1f}s |"
             )
+        ev = eval_state["latest"]
+        if ev is not None:
+            def _rate(x):
+                return "n/a" if x is None else f"{x*100:.0f}%"
+            bd, br = ev["by_depth"], ev["by_route"]
+            lines += [
+                "",
+                f"## Greedy held-out eval (iter {ev['iter']}, stream off, argmax)",
+                f"- **dig-solve: {ev['n_solved']}/{ev['n']} "
+                f"({ev['solve_pct']*100:.0f}%)**   mean steps-to-solve "
+                f"{ev['mean_steps_solved']:.0f}",
+                f"- by depth:  d0 {_rate(bd[0])}   d1 {_rate(bd[1])}   d2 {_rate(bd[2])}",
+                f"- by route:  direct {_rate(br['direct'])}   handoff {_rate(br['handoff'])}",
+                f"- unsolved:  {', '.join(ev['unsolved']) if ev['unsolved'] else '(none — all solved)'}",
+            ]
         lines += ["", "## Hardest levels in buffer (highest regret)", ""]
         for score, lvl in scheduler.top_levels(8):
             lines.append(f"- `{score:.3f}`  {_level_brief(lvl)}")
@@ -437,11 +486,20 @@ def main() -> None:
             buffers: list = []
             ep_regrets: list[float] = []
             ep_levels: list = []     # (level, return, retrieves) per episode
+            ep_codes: list = []      # reproducible episode code per episode
             # Collect K whole episodes (each its own PLR level); batch them
             # into one PPO update and average the metrics → cleaner signal.
             for _k in range(max(1, args.episodes_per_iter)):
                 level_id = env.current_level_id
                 level_k = env.current_level
+                # The seed that produced level_k's concrete state — captured
+                # BEFORE collect_rollout (which auto-resets into the next level
+                # at the rollout's end, overwriting last_reset_seed).
+                seed_k = env.last_reset_seed
+                ep_codes.append(
+                    encode_episode(args.facility, dataclasses.asdict(level_k), seed_k)
+                    if (level_k is not None and seed_k is not None) else None
+                )
                 buf_k = collect_rollout(
                     state=collector, net=net, collator=collator, n_max=n_max,
                     n_steps=args.steps_per_iter, device=device,
@@ -495,6 +553,9 @@ def main() -> None:
                 "approx_kl": metrics.approx_kl, "buffer_size": scheduler.size,
                 "score_mean": s_mean, "score_max": s_max, "wall": it_secs,
                 "level": dataclasses.asdict(first_level) if first_level is not None else None,
+                # Reproducible episode code (facility+level+seed). Paste into the
+                # viz RANDOMIZE tab to regenerate this exact initial layout.
+                "episode_code": ep_codes[0] if ep_codes else None,
             }
             history.append(row)
             mf.write(json.dumps(row) + "\n")
@@ -534,6 +595,30 @@ def main() -> None:
                     print(f"  {C_DIM}▎ {_C.RESET}{C_RETURN}{ep_r:+7.1f}{_C.RESET} "
                           f"{C_DIM}retr{_C.RESET} {_v(ep_rt)}  "
                           f"{_v(_level_brief(lv))}")
+            # Reproducible episode code — paste into the viz to regenerate this
+            # exact initial layout (first episode of the batch).
+            if ep_codes and ep_codes[0] is not None:
+                print(f"  {C_DIM}▎ code{_C.RESET} {C_DIM}{ep_codes[0]}{_C.RESET}")
+
+            # ---- greedy held-out eval (the skill signal) ----
+            if evaluator is not None and (
+                it % args.eval_every == 0 or it == total_target - 1
+            ):
+                ev = evaluator.evaluate(net)
+                ev_row = {"iter": it, "env_steps": total_env_steps, **ev}
+                eval_state["latest"] = ev_row
+                if gf is not None:
+                    gf.write(json.dumps(ev_row) + "\n")
+                print_eval(ev, it)
+                writer.add_scalar("eval/dig_solve_pct", ev["solve_pct"], it)
+                writer.add_scalar("eval/n_solved", ev["n_solved"], it)
+                writer.add_scalar("eval/mean_steps_to_solve", ev["mean_steps_solved"], it)
+                for d in (0, 1, 2):
+                    if ev["by_depth"][d] is not None:
+                        writer.add_scalar(f"eval/solve_d{d}", ev["by_depth"][d], it)
+                for rt in ("direct", "handoff"):
+                    if ev["by_route"][rt] is not None:
+                        writer.add_scalar(f"eval/solve_{rt}", ev["by_route"][rt], it)
 
             if it % max(1, args.log_every) == 0 or it == total_target - 1:
                 _write_progress("RUNNING", it, time.time() - t0)
@@ -561,6 +646,8 @@ def main() -> None:
     finally:
         _write_progress(status, max(it, 0), time.time() - t0)
         mf.close()
+        if gf is not None:
+            gf.close()
         writer.close()
 
     _banner("done")

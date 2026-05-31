@@ -62,6 +62,7 @@ from oos.env.reward_system import (
     single_task_system,
 )
 from oos.learn import targeting
+from oos.sim.state import pallet_depth
 from oos.sim.state_sampler import (
     InitialStateSampler,
     InitialStateSamplerConfig,
@@ -161,28 +162,19 @@ class SingleTaskEnv(Environment):
         reward_system: Optional[RewardSystem] = None,
     ) -> None:
         self._task_reward_cfg = reward_config or SingleTaskRewardConfig()
-        # The gym-path reward suite (step()); pass an explicit RewardSystem to
-        # experiment, else the default reproduces the old inline reward.
-        self._reward_system = reward_system or single_task_system(self._task_reward_cfg)
-        # Pass the *overlapping* weights through to the base RewardConfig
-        # so Environment.advance produces real, labelled events even in viz
-        # mode (which bypasses SingleTaskEnv.step). The task-only weights
-        # (`reward_success`, `time_weight`) live on the subclass and are
-        # applied in step() for gym callers.
-        base_reward = RewardConfig(
-            reward_retrieve=0.0,           # SingleTask uses reward_success
-            reward_stage_room=0.0,         # not part of SingleTask shaping
-            penalty_unstage_room=0.0,
-            penalty_wrong_item_to_room=self._task_reward_cfg.penalty_wrong_item_to_room,
-            penalty_idle_with_retrieve=self._task_reward_cfg.penalty_idle_with_retrieve,
-            movement_weight=self._task_reward_cfg.movement_weight,
-        )
         super().__init__(
             facility_factory=facility_factory,
             experiment_config=experiment_config,
-            reward_config=base_reward,
+            # The base reward suite is unused — SingleTaskEnv scores every step
+            # itself via `single_task_system` (set below). A default RewardConfig
+            # is fine; the base path is overridden.
+            reward_config=RewardConfig(),
             observation_config=observation_config,
         )
+        # Override the base reward suite with the single-task (success-based)
+        # one. Set AFTER super().__init__ so Environment.__init__'s
+        # `self._reward_system = base_system(...)` doesn't clobber it.
+        self._reward_system = reward_system or single_task_system(self._task_reward_cfg)
         self._task_cfg = task_config or SingleTaskConfig()
         # Standalone initial-state sampler. SingleTaskEnv only owns the
         # task layer (task selection + retrieve target picking + reward
@@ -252,9 +244,10 @@ class SingleTaskEnv(Environment):
             if self._task == "retrieve":
                 self._target_id = target
                 self._target_depth = depth
-                facility.queue.add(
-                    Retrieve(arrived_at=facility.state.time, pallet=target)
-                )
+                facility.queue.add(Retrieve(
+                    arrived_at=facility.state.time, pallet=target,
+                    initial_depth=pallet_depth(facility.state, target),
+                ))
         else:
             result = self._sampler.sample(facility, self._rng)
 
@@ -267,9 +260,10 @@ class SingleTaskEnv(Environment):
                 )
             self._task = "retrieve"
             self._target_id = t
-            facility.queue.add(
-                Retrieve(arrived_at=facility.state.time, pallet=t)
-            )
+            facility.queue.add(Retrieve(
+                arrived_at=facility.state.time, pallet=t,
+                initial_depth=pallet_depth(facility.state, t),
+            ))
 
         self._big_shelf_fullness = result.big_shelf_fullness
         self._system_fullness = result.system_fullness
@@ -325,7 +319,7 @@ class SingleTaskEnv(Environment):
             if (
                 pre_entry is not None
                 and pre_entry.type == ActionType.WAIT
-                and self._room_has_empty_pallet()
+                and self._empty_staged_at_room()
                 and self._no_pending_retrieve()
             ):
                 success = True
@@ -378,11 +372,18 @@ class SingleTaskEnv(Environment):
     def _any_pallet(self, facility) -> Optional[int]:
         return targeting.any_pallet(facility, self._rng)
 
-    def _room_has_empty_pallet(self) -> bool:
-        """True iff at least one room currently has an empty pallet loaded."""
+    def _empty_staged_at_room(self) -> bool:
+        """True iff some carrier is parked at a room holding an empty pallet —
+        the new "staged room" condition (rooms hold no pallet of their own)."""
         facility = self._ctx.facility  # type: ignore[union-attr]
-        for r in facility.state.rooms.values():
-            if r.load is not None and r.load.is_empty:
+        for cs in facility.state.carriers.values():
+            d = cs.docked_at
+            if (
+                d is not None
+                and d.kind == "room"
+                and cs.load is not None
+                and cs.load.is_empty
+            ):
                 return True
         return False
 

@@ -123,6 +123,9 @@ class CarrierPanel:
     def set_carrier_position(self, x: float) -> None:
         self.icon.set_position(x)
 
+    def set_carrier_reach(self, dy: float) -> None:
+        self.icon.set_reach(dy)
+
     def set_carrier_load(self, p: Optional[Pallet]) -> None:
         self.icon.set_load(p)
 

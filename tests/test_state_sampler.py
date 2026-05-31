@@ -34,8 +34,8 @@ def _caps(fac: SimEngine) -> tuple[int, int]:
 
 def _total_pallets(fac: SimEngine) -> int:
     n = sum(len(ss.stack) for ss in fac.state.shelves.values())
+    # A pallet "staged at a room" now physically sits on its serving carrier.
     n += sum(1 for cs in fac.state.carriers.values() if cs.load is not None)
-    n += sum(1 for rs in fac.state.rooms.values() if rs.load is not None)
     return n
 
 
@@ -124,8 +124,18 @@ def test_room_state_applied():
     ))
     res = sampler.sample(fac, np.random.default_rng(5))
     assert res.room_state == "big_item"
-    loads = [rs.load for rs in fac.state.rooms.values() if rs.load is not None]
-    assert any(p.contents == "big" for p in loads)
+    # Staging a room now means the serving carrier is parked at the room
+    # holding the loaded pallet (rooms hold no pallet of their own).
+    staged = [
+        cs.load
+        for cs in fac.state.carriers.values()
+        if (
+            cs.docked_at is not None
+            and cs.docked_at.kind == "room"
+            and cs.load is not None
+        )
+    ]
+    assert any(p.contents == "big" for p in staged)
 
 
 def test_require_solvable_yields_solvable_layout():

@@ -34,6 +34,7 @@ from oos.env.reward import RewardConfig, RewardEvent
 from oos.env.reward_system import RewardContext, StepEvents, base_system
 from oos.sim.durations import LinearDurations
 from oos.sim.facility import SimEngine, SeedingConfig
+from oos.sim.state import pallet_depth
 from oos.sim.tasks import PoissonTaskStream, Retrieve, Store
 from oos.sim.topology import CarrierId, Topology
 
@@ -98,7 +99,13 @@ class Environment:
 
         self._ctx: Optional[_StepContext] = None
         self._step_count: int = 0
+        # PBRS Φ(s) snapshot, taken in submit_action BEFORE the action mutates
+        # state, so advance() uses Φ of the pre-action state (telescoping).
+        self._phi_before: Optional[float] = None
         self._rng: np.random.Generator = np.random.default_rng(0)
+        # Discount used for PBRS shaping F = γ·Φ(s') − Φ(s); trainers set this to
+        # match their γ. 1.0 → the undiscounted Φ'−Φ form (a fine approximation).
+        self.reward_gamma: float = 1.0
 
     # ------------------------------------------------------------------
     # Reset / Step
@@ -107,9 +114,11 @@ class Environment:
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
+        self._last_reset_seed = seed   # what reproduces this episode (+ the level)
         topo, seeding = self._cached_topology, self._cached_seeding
         durations = LinearDurations(
-            shelf_op_time=self._experiment_cfg.durations.shelf_op_time,
+            op_stroke_mm=self._experiment_cfg.durations.shelf_op_stroke_mm,
+            op_floor=self._experiment_cfg.durations.shelf_op_floor,
             handoff_time=self._experiment_cfg.durations.handoff_time,
         )
         task_cfg = self._experiment_cfg.task_stream
@@ -127,9 +136,7 @@ class Environment:
             gamma_scale = 0.0
         else:
             # Gamma(shape=k, scale=θ): mean = kθ, std = √k·θ.
-            # Solving for the requested mean & std:
-            #   k = (mean/std)²,  θ = std²/mean.
-            # When std == mean, k = 1 → exponential.
+            #   k = (mean/std)²,  θ = std²/mean.  When std == mean, k = 1 → exponential.
             std = max(dwell_std, 1e-6)
             gamma_shape = (dwell_mean / std) ** 2
             gamma_scale = (std ** 2) / dwell_mean
@@ -216,16 +223,23 @@ class Environment:
         assert self._ctx is not None, "must call reset() before submit_action()"
         # Count each submitted action as one "step" — regardless of
         # whether it arrived via gym `.step()` (training) or via the
-        # viz's split-API path (`submit_action` + `advance_until`). This
-        # keeps `max_episode_steps` bounding the number of agent
-        # *decisions*, not the number of internal `advance` calls.
+        # viz's split-API path. This keeps `max_episode_steps` bounding the
+        # number of agent *decisions*, not internal `advance` calls.
         self._step_count += 1
         ctx = self._ctx
         facility = ctx.facility
+        # Snapshot Φ(s) BEFORE this action mutates state — a GOTO clears
+        # docked_at (carrier leaves its dock), a WAIT may serve a store. PBRS
+        # needs Φ of the pre-action state; capturing it after submit would
+        # silently drop those changes and break telescoping (the staging pump).
+        # Only the first submit of an instant captures; advance() consumes it.
+        if self._phi_before is None:
+            self._phi_before = self._potential(facility)
         entry: ActionEntry = ctx.decoder.decode(int(action))
         if entry.type == ActionType.WAIT:
             # WAIT is not a command — hold the carrier until a state change
-            # re-opens its decision (no timer, stays recruitable as a partner).
+            # re-opens its decision. This is also where a store/retrieve serves
+            # when the carrier is docked at a room holding the matching load.
             facility.wait(ctx.querying_carrier)
         else:
             cmd = entry.to_command(ctx.querying_carrier)
@@ -233,9 +247,9 @@ class Environment:
                 facility.submit(cmd)
             except Exception as e:
                 raise IllegalActionError(str(e)) from e
-        # Submitting may have locked another carrier (MultiRelocate locks its
-        # partner) and the carrier we just handled no longer needs a decision.
-        # Keep only carriers that still need one at this instant.
+        # Submitting may have locked another carrier (a handoff Take locks its
+        # waiting partner) or a WAIT-serve may have woken carriers. Keep only
+        # carriers that still need a decision at this instant.
         ctx.pending_idle = [
             c for c in ctx.pending_idle
             if facility.needs_decision(c)
@@ -280,8 +294,6 @@ class Environment:
 
     # ------------------------------------------------------------------
     # Embedding / viz API (the former `oos.facility` wrapper, merged in).
-    # The 3-tuple variants hide gym's term/trunc inside `info`; the viz and
-    # Agent use these, while training uses reset()/step()/advance() directly.
     # ------------------------------------------------------------------
 
     @classmethod
@@ -335,7 +347,7 @@ class Environment:
 
     @property
     def state(self):
-        """Current FacilityState (carriers, shelves, rooms, scheduler)."""
+        """Current FacilityState (carriers, shelves)."""
         return self.engine.state
 
     @property
@@ -352,6 +364,13 @@ class Environment:
     def sim_time(self) -> float:
         """Current simulation time."""
         return self.engine.state.time
+
+    @property
+    def last_reset_seed(self):
+        """The seed passed to the most recent `reset()` (None if none was given).
+        With the level held by the env, this is what reproduces the episode — see
+        `oos.sim.episode_code`."""
+        return getattr(self, "_last_reset_seed", None)
 
     @property
     def querying_carrier(self) -> str:
@@ -381,47 +400,32 @@ class Environment:
         When time_limit is set and reached without a new decision instant,
         the env is in an 'in-flight' state — the returned observation will
         still reference the previous querying_carrier (no new action expected).
-        Callers using time_limit should check `needs_decision()` after.
         """
         assert self._ctx is not None
         ctx = self._ctx
         facility = ctx.facility
 
-        completions = []
-        arrivals = []
-        dropped = []
+        # PBRS Φ(s): the snapshot submit_action took BEFORE this step's action
+        # mutated state (so the shaping telescopes). Falls back to the current
+        # state for a pure advance with no preceding action (viz advance_until).
+        # Φ(s′) is read after the advance, at context-build time.
+        potential_before = (
+            self._phi_before if self._phi_before is not None
+            else self._potential(facility)
+        )
+        self._phi_before = None
+
+        completions: list = []
+        arrivals: list = []
+        dropped: list = []
         total_dt = 0.0
         movement_distance = 0.0
-        n_stage_events = 0
-        n_unstage_events = 0
-        n_wrong_item_events = 0
-        # Ungated, symmetric room-workflow transition counts (used by the
-        # continuous env's room-shaping reward). Unlike n_stage/n_unstage above
-        # (which are gated on `no_retrieve_pending` for the legacy base reward),
-        # these fire regardless of pending tasks and form a potential over the
-        # room's load state {free, empty, filled}, so any pallet round-trip
-        # nets zero. free->empty = stage, empty->free = unstage, filled->free =
-        # evacuate; free->filled (a non-target car) is the existing
-        # n_wrong_item_events. The customer-serve transitions empty<->filled are
-        # NOT counted here — they are paid by SERVE / DELIVER instead.
-        n_room_stage = 0
-        n_room_unstage = 0
-        n_room_evacuate = 0
-        # Whether EVERY carrier has chosen WAIT at this resolved instant —
-        # snapshot BEFORE advancing, because the advance processes the next
-        # event which wakes (clears `waiting` on) all carriers. Only meaningful
-        # on a resolving step (all carriers at this instant have been queried,
-        # i.e. pending_idle is empty); intermediate mid-instant steps leave it
-        # False. Surfaced in info so reward shapers (e.g. ContinuousEnv's
-        # all-waiting penalties) can read the true "all declined to act" state.
+        # Snapshot flags at the decision point (pre-advance): whether every
+        # carrier has chosen WAIT, and whether a Retrieve is pending. Both feed
+        # reward shapers; snapshotted before the advance wakes carriers. Only
+        # meaningful on a resolving step (all carriers at this instant queried).
         all_carriers_waiting = False
-        # SimEngine state AT the decision point (before the advance mutates it),
-        # used by all-waiting reward shapers: was a Retrieve pending, was an
-        # empty pallet staged in a room. Snapshotted pre-advance because the
-        # advance fast-forwards to the next arrival, which can add a Retrieve
-        # or auto-serve away a staged empty.
         retrieve_pending_now = False
-        room_has_staged_empty = False
         if not ctx.pending_idle:
             all_carriers_waiting = all(
                 cs.waiting for cs in facility.state.carriers.values()
@@ -429,28 +433,11 @@ class Environment:
             retrieve_pending_now = any(
                 isinstance(t, Retrieve) for t in facility.queue.pending
             )
-            room_has_staged_empty = any(
-                rs.load is not None and rs.load.is_empty
-                for rs in facility.state.rooms.values()
-            )
-            # Snapshot positions so we can charge a per-slot travel penalty.
-            # Each command moves monotonically in one direction, so summed
-            # |Δposition| over the advance interval equals total slots travelled.
+            # Snapshot positions to charge a per-slot travel penalty: each
+            # command moves monotonically, so summed |Δposition| over the
+            # advance equals total distance travelled.
             positions_before = {
                 cid: cs.position for cid, cs in facility.state.carriers.items()
-            }
-            # Snapshot room loads so we can detect agent (un)stage events
-            # during the advance. We track three states: "free" (load None),
-            # "empty" (empty pallet), "filled" (item pallet). Only None ↔
-            # empty transitions count as agent (un)stages — anything
-            # involving the filled state is a Store / Retrieve auto-serve.
-            def _room_state(load) -> str:
-                if load is None:
-                    return "free"
-                return "empty" if load.is_empty else "filled"
-            room_was = {
-                rid: _room_state(rs.load)
-                for rid, rs in facility.state.rooms.items()
             }
             res = facility.advance_until(time_limit)
             total_dt = res.dt
@@ -461,75 +448,6 @@ class Environment:
                 abs(facility.state.carriers[cid].position - p0)
                 for cid, p0 in positions_before.items()
             )
-            # (Un)stage detection: gated on "no Retrieve currently pending."
-            # Rules, all keyed off room.load transitions during the advance:
-            #   free  → empty                       : +1 stage (visible).
-            #   free  → filled AND Store completed  : +1 stage (Store auto-
-            #                                         served the empty within
-            #                                         the same advance — the
-            #                                         empty state was real but
-            #                                         invisible to our snapshot;
-            #                                         the Store completion is
-            #                                         proof it happened).
-            #   empty → free                        : +1 unstage.
-            # `filled → free` (cleanup of a Store-filled pallet) is a
-            # necessary act for the next storing cycle and carries no penalty.
-            # Retrieve completion (target arriving at room) is handled
-            # separately via Retrieve TaskCompletions in the reward suite.
-            no_retrieve_pending = not any(
-                isinstance(t, Retrieve) for t in facility.queue.pending
-            )
-            store_credits = sum(
-                1 for c in completions if isinstance(c.task, Store)
-            )
-            # A Retrieve delivery nets free->empty (deliver the target, customer
-            # takes the car, the pallet is left empty). That empty is a serve
-            # byproduct paid by DELIVER, NOT a fresh agent stage — so consume one
-            # retrieve credit per such transition instead of counting a room-stage.
-            retrieve_credits = sum(
-                1 for c in completions if isinstance(c.task, Retrieve)
-            )
-            for rid, rs in facility.state.rooms.items():
-                prev = room_was[rid]
-                curr = _room_state(rs.load)
-                if prev == "free" and curr == "empty":
-                    if no_retrieve_pending:
-                        n_stage_events += 1
-                    if retrieve_credits > 0:
-                        retrieve_credits -= 1   # delivery byproduct, paid by DELIVER
-                    else:
-                        n_room_stage += 1
-                elif prev == "free" and curr == "filled":
-                    if store_credits > 0:
-                        store_credits -= 1
-                        if no_retrieve_pending:
-                            n_stage_events += 1
-                        # Path-independent STAGE: the agent brought an empty
-                        # into the room (a real stage) and a pending Store
-                        # consumed it within this same advance, so the
-                        # intermediate `empty` never appears in the endpoint
-                        # diff (free->filled, not free->empty). Credit the stage
-                        # anyway — same total as staging then being served a
-                        # step later. Farm-safe: gated on a real Store
-                        # completion (store_credits > 0), which can't be faked.
-                        n_room_stage += 1
-                    else:
-                        # Agent placed a filled pallet at a free room and
-                        # no Store consumed it. If it had been a target,
-                        # the Retrieve auto-serve would have fired and the
-                        # room would be `empty` now, not `filled`. So this
-                        # is definitively a non-target filled pallet —
-                        # either phase-2 wrong delivery or phase-1
-                        # pointless shuffle.
-                        n_wrong_item_events += 1
-                elif prev == "empty" and curr == "free":
-                    if no_retrieve_pending:
-                        n_unstage_events += 1
-                    n_room_unstage += 1
-                elif prev == "filled" and curr == "free":
-                    # Agent evacuated a filled car out of the room (stowed it
-                    # back to a shelf). Symmetric counterpart of free->filled.
-                    n_room_evacuate += 1
             # If we reached a decision instant, set up the next query.
             if facility.carriers_needing_decision():
                 ctx.pending_idle = self._fresh_pending_idle(facility)
@@ -540,10 +458,8 @@ class Environment:
                     )
                     ctx.decoder = ActionDecoder(entries, self._n_max)
 
-        # Idle-with-retrieve: penalty fires once per env step if a Retrieve
-        # is pending AND no carrier is mid-command. Includes WAITing
-        # carriers as "idle" because the underlying complaint is "nobody's
-        # working on the pending task right now."
+        # Idle-with-retrieve: a Retrieve is pending AND no carrier is mid-command
+        # (WAITing carriers count as idle — nobody is working the pending task).
         retrieve_pending = any(
             isinstance(t, Retrieve) for t in facility.queue.pending
         )
@@ -553,10 +469,9 @@ class Environment:
         )
         idle_with_retrieve = retrieve_pending and no_carrier_working
 
-        # Typed (s → s') diff — the single source every reward context is
-        # built from. `n_free_deliveries` counts Retrieve completions that
-        # finished for an already-parked car (no agent deposit); the base
-        # DeliveryTerm subtracts them so parked-car retrieves don't pay DELIVER.
+        # Typed (s → s') diff — the single source every reward context is built
+        # from. Room-transition fields keep their defaults (rooms are no longer
+        # storage); the suite's room terms go inert until the reward redesign.
         events = StepEvents(
             completions=tuple(completions),
             arrivals=tuple(arrivals),
@@ -568,28 +483,19 @@ class Environment:
             n_free_deliveries=sum(
                 1 for c in completions
                 if isinstance(c.task, Retrieve) and not c.agent_delivered),
+            delivery_depth_weight=sum(
+                c.task.initial_depth + 1 for c in completions
+                if isinstance(c.task, Retrieve) and c.agent_delivered),
             n_stores_served=sum(
                 1 for c in completions if isinstance(c.task, Store)),
-            n_room_stage=n_room_stage,
-            n_room_unstage=n_room_unstage,
-            n_room_evacuate=n_room_evacuate,
-            n_wrong_item=n_wrong_item_events,
-            n_stage_events=n_stage_events,
-            n_unstage_events=n_unstage_events,
             all_carriers_waiting=all_carriers_waiting,
             retrieve_pending_at_decision=retrieve_pending_now,
-            room_has_staged_empty_at_decision=room_has_staged_empty,
             idle_with_retrieve=idle_with_retrieve,
         )
-        rctx = self._reward_context_from_events(events, facility)
+        rctx = self._reward_context_from_events(events, facility, potential_before)
         reward, breakdown = self._reward_system.compute(rctx)
         reward_events = [RewardEvent(k, v) for k, v in breakdown.items()]
 
-        # `_step_count` counts gym-shaped decisions (incremented in
-        # `step()` above), NOT raw advance calls. The viz drives the env
-        # via submit_action + advance_until directly, so the truncation
-        # check here only fires from sim-time exhaustion — matching what
-        # max_episode_steps was meant to bound.
         terminated = False
         truncated = (
             facility.state.time >= self._experiment_cfg.episode.max_sim_time
@@ -598,19 +504,10 @@ class Environment:
         obs, info = self._observation_for_current(
             facility, total_dt, completions, arrivals, dropped
         )
-        # `events` is the typed source of truth; the scalar keys below are a
-        # compatibility view kept for the viz and any external readers.
         info["events"] = events
         info["sim_time"] = facility.state.time
         info["all_carriers_waiting"] = all_carriers_waiting
         info["retrieve_pending_at_decision"] = retrieve_pending_now
-        info["room_has_staged_empty_at_decision"] = room_has_staged_empty
-        info["n_stage_events"] = n_stage_events
-        info["n_unstage_events"] = n_unstage_events
-        info["n_wrong_item_events"] = n_wrong_item_events
-        info["n_room_stage"] = n_room_stage
-        info["n_room_unstage"] = n_room_unstage
-        info["n_room_evacuate"] = n_room_evacuate
         info["idle_with_retrieve"] = idle_with_retrieve
         info["reward_events"] = reward_events
         info["reward_breakdown"] = breakdown
@@ -622,25 +519,91 @@ class Environment:
     # ------------------------------------------------------------------
 
     def _reward_context_from_events(
-        self, events: StepEvents, facility: SimEngine
+        self, events: StepEvents, facility: SimEngine, potential_before: float = 0.0
     ) -> RewardContext:
-        """Base (advance-path) reward context: DELIVER / STAGE / UNSTAGE /
-        WRONG / IDLE / MOVE, built purely from the typed `StepEvents`.
-        Subclasses with their own dense reward suite (ContinuousEnv,
-        SingleTaskEnv) build their own context from `info["events"]`."""
+        """Base (advance-path) reward context built purely from the typed
+        `StepEvents`. Subclasses with their own dense reward suite
+        (ContinuousEnv, SingleTaskEnv) build their own context from
+        `info["events"]`."""
         return RewardContext(
             n_deliveries=events.n_deliveries,
             n_free_deliveries=events.n_free_deliveries,
-            n_stage=events.n_stage_events,        # base uses retrieve-gated counts
-            n_unstage=events.n_unstage_events,
-            n_wrong=events.n_wrong_item,
+            delivery_depth_weight=events.delivery_depth_weight,
+            n_stores_served=events.n_stores_served,
             movement_distance=events.movement_distance,
             idle_with_retrieve=events.idle_with_retrieve,
+            gamma=self.reward_gamma,
+            potential_before=potential_before,
+            potential_after=self._potential(facility),
             completions=events.completions,
             state=facility.state,
             queue=facility.queue,
             topology=facility.topology,
         )
+
+    def _potential(self, facility: SimEngine) -> float:
+        """PBRS potential Φ(s) over three terms (weights from RewardConfig):
+
+            Φ(s) = − w_ret   · Σ_{requested i} (depth_i + 1)
+                   + w_ready · #{carriers docked at a room holding an EMPTY pallet}
+                   − w_wrong · #{carriers docked at a room holding a NON-requested car}
+
+        Digging a requested item shallower raises term 1; staging an empty at a
+        room raises term 2; leaving a room that holds a parked car restores
+        term 3 (the carrier's `docked_at` clears the instant it starts a GOTO
+        away, so the restore is on *leaving*, not on the later GIVE). All-zero
+        weights → 0 (shaping off)."""
+        cfg = self._reward_cfg
+        w_ret = cfg.potential_item_retrieval
+        w_ready = cfg.potential_room_ready
+        w_wrong = cfg.potential_wrong_car
+        w_empty = cfg.potential_shallowest_empty
+        if w_ret == 0.0 and w_ready == 0.0 and w_wrong == 0.0 and w_empty == 0.0:
+            return 0.0
+        state = facility.state
+        requested = {
+            t.pallet for t in facility.queue.pending if isinstance(t, Retrieve)
+        }
+        phi = 0.0
+        if w_ret:
+            for pid in requested:
+                phi -= w_ret * (pallet_depth(state, pid) + 1)
+        if w_ready or w_wrong:
+            for cs in state.carriers.values():
+                d = cs.docked_at
+                if d is None or d.kind != "room" or cs.load is None:
+                    continue
+                if cs.load.is_empty:
+                    phi += w_ready
+                elif cs.load.id not in requested:
+                    phi -= w_wrong
+        if w_empty:
+            phi -= w_empty * self._shallowest_empty_depth(facility)
+        return phi
+
+    def _shallowest_empty_depth(self, facility: SimEngine) -> int:
+        """Burial depth (0 = top, reachable) of the shallowest empty pallet
+        anywhere. A carrier-held empty counts as 0 (immediately usable). If no
+        empty exists, returns the max shelf capacity (strictly worse than any
+        buried empty) — you can't stage any room at all."""
+        state = facility.state
+        for cs in state.carriers.values():
+            if cs.load is not None and cs.load.is_empty:
+                return 0
+        best: int | None = None
+        for ss in state.shelves.values():
+            stack = ss.stack
+            n = len(stack)
+            for i in range(n):                 # i = depth (0 = top)
+                if stack[n - 1 - i].is_empty:
+                    if best is None or i < best:
+                        best = i
+                    break                      # shallowest empty on this shelf
+            if best == 0:
+                return 0
+        if best is not None:
+            return best
+        return max((s.capacity for s in facility.topology.shelves.values()), default=0)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -710,9 +673,7 @@ class Environment:
             "edges_accesses": obs["edges_accesses"],
             "edges_handoff": obs["edges_handoff"],
             "edges_transfer": obs["edges_transfer"],
-            "edges_committed": obs["edges_committed"],
-            "edges_in_flight_src": obs["edges_in_flight_src"],
-            "edges_in_flight_partner": obs["edges_in_flight_partner"],
+            "edges_docked": obs["edges_docked"],
             "dt": dt,
             "completions": completions,
             "arrivals": arrivals,
@@ -737,5 +698,3 @@ class Environment:
             "action_mask": np.zeros(self._n_max, dtype=np.int8),
             "querying_carrier": 0,
         }
-
-

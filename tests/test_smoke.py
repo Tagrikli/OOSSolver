@@ -75,12 +75,9 @@ def test_pallet_count_conserved():
         for ss in fac.state.shelves.values():
             n += len(ss.stack)
         for cs in fac.state.carriers.values():
+            # A pallet being delivered to / staged at a room physically sits on
+            # the carrier now (rooms are no longer storage slots).
             if cs.load is not None:
-                n += 1
-        # Rooms are 1-capacity virtual shelves; a pallet may sit in
-        # `room.load` between a Relocate-into-room and the next out.
-        for rs in fac.state.rooms.values():
-            if rs.load is not None:
                 n += 1
         return n
 

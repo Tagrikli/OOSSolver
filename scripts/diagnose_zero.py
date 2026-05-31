@@ -184,7 +184,7 @@ def main():
         level = build_level(r["level"])
         env = make_env(cfg, level)
         if n_max is None:
-            n_max = env.action_space.n
+            n_max = env.n_actions
         lvl = r["level"]
         print(f"--- level {i}: iter {r['iter']}  logged ret {r['ep_return']:+.2f}  "
               f"{lvl['task']}/{lvl['retrieve_from']}/{lvl['retrieve_route']} "

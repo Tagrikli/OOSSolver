@@ -53,9 +53,6 @@ def _count_bigs_stored(facility: SimEngine) -> int:
     for cs in facility.state.carriers.values():
         if cs.load is not None and cs.load.contents == "big":
             n += 1
-    for rs in facility.state.rooms.values():
-        if rs.load is not None and rs.load.contents == "big":
-            n += 1
     return n
 
 

@@ -7,10 +7,8 @@ from typing import Any
 
 import numpy as np
 
-from oos.sim.actions import MultiRelocate, Relocate
 from oos.sim.facility import SimEngine
-from oos.sim.state import Pallet
-from oos.sim.tasks import Retrieve, TaskQueue
+from oos.sim.tasks import Retrieve, Store, TaskQueue
 from oos.sim.topology import CarrierId
 
 
@@ -21,8 +19,8 @@ class ObservationConfig:
 
 CARRIER_FEATURE_NAMES = (
     "position_norm",
-    "load_empty",
-    "load_pallet_empty",
+    "load_empty",          # carrier holds nothing
+    "load_pallet_empty",   # carrier holds an empty pallet
     "load_pallet_small",
     "load_pallet_big",
     "busy",
@@ -30,15 +28,24 @@ CARRIER_FEATURE_NAMES = (
     "is_querying",
     # 1.0 iff the carrier is currently holding a pallet whose id matches a
     # pending Retrieve. Without this, the policy cannot tell apart "I'm
-    # holding the target" from "I'm holding some other pallet" — it sees
-    # both as the same carrier-load state, and tends to deliver everything
-    # to a room.
+    # holding the target" from "I'm holding some other pallet".
     "load_is_requested",
     # Carrier kind one-hot. Motion profiles (and therefore move durations)
     # differ between lift and shuttle, so the policy needs to see which
     # kind it's planning for.
     "kind_lift",
     "kind_shuttle",
+    # Where the carrier is currently docked (one-hot; "none" = in transit or
+    # never moved). Disambiguates which shelf/room/pose TAKE/GIVE act on.
+    "docked_none",
+    "docked_shelf",
+    "docked_room",
+    "docked_handoff",
+    # 1.0 iff parked at a handoff pose, WAITing, holding an item — i.e. ready
+    # to hand off to its partner (a partner's TAKE will pull the item). This
+    # state never existed under the atomic-handoff macro; it is what lets the
+    # policy learn the receiver-initiated rendezvous.
+    "at_handoff_with_item",
 )
 
 # Global hard cap on shelf capacity. Real systems in this domain never have
@@ -54,17 +61,14 @@ SHELF_BASE_FEATURE_NAMES = (
     "depth_frac",
     "is_transfer",
     # Count of pallets in this shelf whose item ID is the target of a pending
-    # Retrieve, normalized by SHELF_MAX_CAPACITY. Lets the value head see
-    # "this shelf has requested cargo" without summing slot bits.
+    # Retrieve, normalized by SHELF_MAX_CAPACITY.
     "n_pending_retrieves_in_stack_norm",
 )
 
 # Per-slot: 4-way one-hot — slot empty (no pallet) / empty pallet / small item / big item.
 # Slot 0 = LIFO top (the carrier-accessible bottom of the visual stack).
 # Plus `slot_pallet_requested`: 1 iff this slot holds a pallet whose id is
-# the target of some currently-pending Retrieve. This is how the policy
-# learns *which* pallets to dig for — without it, retrieves are invisible
-# past an aggregate count.
+# the target of some currently-pending Retrieve.
 SHELF_PER_SLOT_FEATURE_NAMES = (
     "slot_empty",
     "slot_pallet_empty",
@@ -88,147 +92,18 @@ def shelf_feature_count() -> int:
     return len(SHELF_BASE_FEATURE_NAMES) + SHELF_MAX_CAPACITY * SHELF_PER_SLOT_DIM
 
 
+# Rooms are no longer storage slots. A room node reports the pending demand it
+# could serve, and whether its serving carrier is parked there with a servable
+# load (the "staged" state). All four are derived from the queue + the docked
+# serving carrier — computed explicitly so a 0-GAT-layer net still sees them.
 ROOM_FEATURE_NAMES = (
-    "has_load",     # 1 if any pallet sits in room.load
-    "load_empty",   # 1 if room.load is an empty pallet
-    "load_small",   # 1 if room.load is a small-item pallet
-    "load_big",     # 1 if room.load is a big-item pallet
+    "has_pending_store",     # some Store is pending (any room can serve it)
+    "has_pending_retrieve",  # some Retrieve is pending
+    "empty_staged_here",     # serving carrier docked here holding an empty pallet
+    "target_staged_here",    # serving carrier docked here holding a requested item
 )
 
 GLOBAL_FEATURE_NAMES: tuple[str, ...] = ()
-
-
-def compute_in_flight_overlay(
-    facility: SimEngine,
-) -> tuple[dict[str, Pallet], dict[str, int]]:
-    """Physically-faithful in-flight overlay for mid-Relocate carriers.
-
-    Maps to two command types:
-
-    **Relocate** has four conceptual phases:
-        1. move to src      — carrier travelling toward source
-        2. take_op at src   — picking up (still physically empty until done)
-        3. move to dst      — carrying the pallet toward destination
-        4. place_op at dst  — placing it down
-    The pallet is *physically* on the carrier from phase 3 onward.
-
-    **MultiRelocate** has more phases:
-        1. A: travel to src; B: travel to B's handoff pose (in parallel)
-        2. A: take_op at src
-        3. A: travel src → A's handoff pose (A loaded);
-           B continues if still travelling
-        4. sync wait at handoff poses (A loaded, B at pose empty)
-        5. handoff_op (transfer)
-        6. B: travel handoff pose → dst (B loaded)
-        7. B: give_op at dst (B loaded)
-    During 3-5 the pallet is on A; during 6-7 it's on B.
-
-    The sim itself is atomic at `complete()`, so without this overlay
-    cs.load reads None throughout and src.stack[-1] (or room.load) still
-    shows the pallet. The overlay closes that gap, exposing the
-    physically-correct intermediate state.
-    """
-    state = facility.state
-    topo = facility.topology
-    durs = facility.durations
-    now = state.time
-    carrier_loads: dict[str, Pallet] = {}
-    src_pops: dict[str, int] = {}
-
-    def _peek_src_pallet(src: str) -> "Pallet | None":
-        n = src_pops.get(src, 0)
-        if src in state.shelves:
-            stk = state.shelves[src].stack
-            if len(stk) > n:
-                return stk[-(n + 1)]
-        elif src in state.rooms:
-            if n == 0:
-                return state.rooms[src].load
-        return None
-
-    # Iterate unique pending commands — MultiRelocate sets the same Command
-    # on both A's and B's current_command, so we must dedupe by id().
-    seen_cmds: set[int] = set()
-    for cid, cs in state.carriers.items():
-        cmd = cs.current_command
-        if cmd is None or id(cmd) in seen_cmds:
-            continue
-        seen_cmds.add(id(cmd))
-
-        if isinstance(cmd, Relocate):
-            carrier = topo.carriers[cid]
-            start_pos = (
-                cs.command_start_position
-                if cs.command_start_position is not None
-                else cs.position
-            )
-            if cmd.src in topo.shelves:
-                src_pos = topo.shelves[cmd.src].position_for[cid]
-                take_op = durs.shelf_op("take", topo.shelves[cmd.src])
-            elif cmd.src in topo.rooms:
-                src_pos = topo.rooms[cmd.src].position
-                take_op = 0.0
-            else:
-                continue
-            move1 = durs.move(carrier, start_pos, src_pos)
-            elapsed = now - (cs.command_started_at or 0.0)
-            if elapsed < move1 + take_op:
-                continue
-            pallet = _peek_src_pallet(cmd.src)
-            if pallet is not None:
-                carrier_loads[cid] = pallet
-                src_pops[cmd.src] = src_pops.get(cmd.src, 0) + 1
-
-        elif isinstance(cmd, MultiRelocate):
-            a_cs = state.carriers[cmd.carrier_id]
-            b_cs = state.carriers[cmd.partner_id]
-            a_car = topo.carriers[cmd.carrier_id]
-            b_car = topo.carriers[cmd.partner_id]
-            pair = (cmd.carrier_id, cmd.partner_id)
-            if pair not in topo.handoff_positions:
-                continue
-            a_pose, b_pose = topo.handoff_positions[pair]
-            a_start = (
-                a_cs.command_start_position
-                if a_cs.command_start_position is not None
-                else a_cs.position
-            )
-            b_start = (
-                b_cs.command_start_position
-                if b_cs.command_start_position is not None
-                else b_cs.position
-            )
-            if cmd.src in topo.shelves:
-                src_pos = topo.shelves[cmd.src].position_for[cmd.carrier_id]
-                take_op = durs.shelf_op("take", topo.shelves[cmd.src])
-            elif cmd.src in topo.rooms:
-                src_pos = topo.rooms[cmd.src].position
-                take_op = 0.0
-            else:
-                continue
-            a_pickup_done = (
-                durs.move(a_car, a_start, src_pos) + take_op
-            )
-            a_at_handoff = a_pickup_done + durs.move(a_car, src_pos, a_pose)
-            b_at_handoff = durs.move(b_car, b_start, b_pose)
-            sync_done = max(a_at_handoff, b_at_handoff)
-            handoff_done = sync_done + durs.handoff()
-            elapsed = now - (a_cs.command_started_at or 0.0)
-            if elapsed < a_pickup_done:
-                # Phase 1-2: A still picking up. Pallet still on src.
-                continue
-            pallet = _peek_src_pallet(cmd.src)
-            if pallet is None:
-                continue
-            src_pops[cmd.src] = src_pops.get(cmd.src, 0) + 1
-            if elapsed < handoff_done:
-                # Phases 3-5: A is carrying the pallet.
-                carrier_loads[cmd.carrier_id] = pallet
-            else:
-                # Phases 6-7: B has the pallet.
-                carrier_loads[cmd.partner_id] = pallet
-
-    return carrier_loads, src_pops
 
 
 def build_observation(
@@ -248,52 +123,57 @@ def build_observation(
     shelf_idx = {sid: i for i, sid in enumerate(shelf_ids)}
     room_idx = {rid: i for i, rid in enumerate(room_ids)}
 
-    # Set of pallet IDs being requested by pending Retrieves — shared by
-    # both the carrier-load and per-slot shelf feature builders.
+    # Set of pallet IDs being requested by pending Retrieves.
     requested_pallets = {t.pallet for t in queue.pending if isinstance(t, Retrieve)}
-
-    # In-flight overlay: project Relocate commitments onto carrier loads
-    # and source pops so the observation reflects what the agent should plan
-    # around, not the raw atomic-sim state. See compute_in_flight_overlay.
-    in_flight_loads, src_pops = compute_in_flight_overlay(facility)
+    has_pending_store = any(isinstance(t, Store) for t in queue.pending)
 
     carrier_features = np.zeros((len(carrier_ids), len(CARRIER_FEATURE_NAMES)), dtype=np.float32)
     for i, cid in enumerate(carrier_ids):
         c = topo.carriers[cid]
         cs = state.carriers[cid]
-        # Effective load: in-transit pallet if mid-Relocate, else cs.load.
-        eff_load = in_flight_loads.get(cid, cs.load)
+        load = cs.load
         carrier_features[i, 0] = (cs.position - c.min_pos) / max(c.span, 1)
-        if eff_load is None:
+        if load is None:
             carrier_features[i, 1] = 1.0
-        elif eff_load.is_empty:
+        elif load.is_empty:
             carrier_features[i, 2] = 1.0
-        elif eff_load.contents == "small":
+        elif load.contents == "small":
             carrier_features[i, 3] = 1.0
         else:
             carrier_features[i, 4] = 1.0
-        # A waiting carrier (no command — it chose WAIT or has nothing to do)
-        # is observed as not-busy: WAIT is a no-op hold, re-opened on any
-        # state change, so surfacing it as "busy with ETA" would make the
-        # policy's output depend on whether another carrier happened to wait.
         is_busy_cmd = cs.current_command is not None
         carrier_features[i, 5] = 1.0 if is_busy_cmd else 0.0
         if is_busy_cmd and cs.busy_until is not None:
             eta = max(0.0, cs.busy_until - state.time)
             carrier_features[i, 6] = min(1.0, eta / cfg.horizon_seconds)
         carrier_features[i, 7] = 1.0 if cid == querying_carrier else 0.0
-        # load_is_requested — 1 iff effective load id matches a pending Retrieve.
         if (
-            eff_load is not None
-            and not eff_load.is_empty
-            and eff_load.id in requested_pallets
+            load is not None
+            and not load.is_empty
+            and load.id in requested_pallets
         ):
             carrier_features[i, 8] = 1.0
-        # kind_lift / kind_shuttle one-hot.
         if c.kind == "lift":
             carrier_features[i, 9] = 1.0
         else:
             carrier_features[i, 10] = 1.0
+        # Docked-location one-hot (11..14) + at-handoff-with-item (15).
+        d = cs.docked_at
+        if d is None:
+            carrier_features[i, 11] = 1.0
+        elif d.kind == "shelf":
+            carrier_features[i, 12] = 1.0
+        elif d.kind == "room":
+            carrier_features[i, 13] = 1.0
+        elif d.kind == "handoff":
+            carrier_features[i, 14] = 1.0
+        if (
+            d is not None
+            and d.kind == "handoff"
+            and cs.waiting
+            and load is not None
+        ):
+            carrier_features[i, 15] = 1.0
 
     per_slot_dim = SHELF_PER_SLOT_DIM
     total_shelf_dim = shelf_feature_count()
@@ -302,24 +182,20 @@ def build_observation(
     for i, sid in enumerate(shelf_ids):
         s = topo.shelves[sid]
         ss = state.shelves[sid]
-        # Hide the top N pallets if N in-flight Relocates have logically
-        # popped them. eff_depth and eff_stack are what the agent should see.
-        n_pops = src_pops.get(sid, 0)
-        eff_depth = max(0, ss.depth - n_pops)
-        eff_stack = ss.stack[:-n_pops] if n_pops > 0 else ss.stack
+        depth = ss.depth
+        stack = ss.stack
         shelf_features[i, 0] = 1.0 if s.size_class == "small" else 0.0
         shelf_features[i, 1] = 1.0 if s.size_class == "big" else 0.0
         shelf_features[i, 2] = s.capacity / SHELF_MAX_CAPACITY
-        shelf_features[i, 3] = eff_depth / SHELF_MAX_CAPACITY
-        shelf_features[i, 4] = eff_depth / max(s.capacity, 1)
+        shelf_features[i, 3] = depth / SHELF_MAX_CAPACITY
+        shelf_features[i, 4] = depth / max(s.capacity, 1)
         shelf_features[i, 5] = 1.0 if s.is_transfer else 0.0
         n_requested_in_stack = 0
-        # Per-slot occupancy. Slot index 0 = LIFO top (= eff_stack[-1]).
-        # Slots beyond this shelf's capacity stay all-zero (no signal).
+        # Per-slot occupancy. Slot index 0 = LIFO top (= stack[-1]).
         for slot_i in range(min(SHELF_MAX_CAPACITY, s.capacity)):
             off = base_dim + slot_i * per_slot_dim
-            if slot_i < eff_depth:
-                p = eff_stack[-(slot_i + 1)]
+            if slot_i < depth:
+                p = stack[-(slot_i + 1)]
                 if p.is_empty:
                     shelf_features[i, off + 1] = 1.0      # slot_pallet_empty
                 elif p.contents == "small":
@@ -335,35 +211,30 @@ def build_observation(
 
     room_features = np.zeros((len(room_ids), len(ROOM_FEATURE_NAMES)), dtype=np.float32)
     for i, rid in enumerate(room_ids):
-        rs = state.rooms[rid]
-        # Room as 1-cap virtual shelf: features encode the contents of
-        # `room.load`. Apply the overlay — if a Relocate from this room is
-        # in flight, the pallet is logically already on the carrier.
-        eff_load = None if src_pops.get(rid, 0) > 0 else rs.load
-        if eff_load is not None:
-            room_features[i, 0] = 1.0
-            if eff_load.contents == "empty":
-                room_features[i, 1] = 1.0
-            elif eff_load.contents == "small":
+        room = topo.rooms[rid]
+        scs = state.carriers[room.served_by]
+        docked_here = (
+            scs.docked_at is not None
+            and scs.docked_at.kind == "room"
+            and scs.docked_at.id == rid
+        )
+        room_features[i, 0] = 1.0 if has_pending_store else 0.0
+        room_features[i, 1] = 1.0 if requested_pallets else 0.0
+        if docked_here and scs.load is not None:
+            if scs.load.is_empty:
                 room_features[i, 2] = 1.0
-            elif eff_load.contents == "big":
+            elif scs.load.id in requested_pallets:
                 room_features[i, 3] = 1.0
 
-    # Global features deliberately empty for retrieve-only training — there's
-    # no Store stream so the old aggregates (n_pending_stores / oldest age /
-    # sim time) carry no usable signal. When we re-enable a Store stream we
-    # can re-introduce just the features that actually vary.
     global_features = np.zeros(len(GLOBAL_FEATURE_NAMES), dtype=np.float32)
 
     # ----- edges -----
     edges_accesses: list[tuple[int, int]] = []  # carrier_node_idx -> shelf/room (offset)
     edges_handoff: list[tuple[int, int]] = []
     edges_transfer: list[tuple[int, int]] = []
-    edges_committed: list[tuple[int, int]] = []
-    edges_in_flight_src: list[tuple[int, int]] = []
-    edges_in_flight_partner: list[tuple[int, int]] = []  # carrier <-> partner during MultiRelocate
+    edges_docked: list[tuple[int, int]] = []     # carrier -> the node it is docked at
 
-    # We use a single node-index space: [carriers | shelves | rooms].
+    # Single node-index space: [carriers | shelves | rooms].
     c_off = 0
     s_off = len(carrier_ids)
     r_off = s_off + len(shelf_ids)
@@ -384,37 +255,15 @@ def build_observation(
         edges_handoff.append((c_off + carrier_idx[a], c_off + carrier_idx[b]))
         edges_handoff.append((c_off + carrier_idx[b], c_off + carrier_idx[a]))
 
-    # In-flight edges. Iterate unique pending commands so MultiRelocate
-    # (which is set on both A and B's current_command) is processed once.
-    _seen_cmds: set[int] = set()
+    # Docked edge: each carrier -> the node it is currently docked at (a shelf,
+    # a room, or — for a handoff pose — its partner carrier node).
     for cid, cs in state.carriers.items():
-        cmd = cs.current_command
-        if cmd is None or id(cmd) in _seen_cmds:
+        d = cs.docked_at
+        if d is None:
             continue
-        _seen_cmds.add(id(cmd))
-        # Committed edge: initiating carrier → command's destination.
-        tgt = _target_node(cmd, c_off, s_off, r_off, carrier_idx, shelf_idx, room_idx)
-        if tgt is not None and isinstance(cmd, (Relocate, MultiRelocate)):
-            initiator = cmd.carrier_id if isinstance(cmd, MultiRelocate) else cid
-            edges_committed.append((c_off + carrier_idx[initiator], tgt))
-        # In-flight src edge: initiating carrier → command's source.
-        if isinstance(cmd, (Relocate, MultiRelocate)):
-            src_node = _location_node(
-                cmd.src, s_off, r_off, shelf_idx, room_idx,
-            )
-            if src_node is not None:
-                initiator = cmd.carrier_id if isinstance(cmd, MultiRelocate) else cid
-                edges_in_flight_src.append(
-                    (c_off + carrier_idx[initiator], src_node)
-                )
-        # In-flight partner edge: A ↔ B during a MultiRelocate, both directions
-        # (bidirectional like handoff). Gives the network a structural signal
-        # that these two carriers are committed together.
-        if isinstance(cmd, MultiRelocate):
-            a_node = c_off + carrier_idx[cmd.carrier_id]
-            b_node = c_off + carrier_idx[cmd.partner_id]
-            edges_in_flight_partner.append((a_node, b_node))
-            edges_in_flight_partner.append((b_node, a_node))
+        tgt = _docked_node(d, s_off, r_off, shelf_idx, room_idx, carrier_idx)
+        if tgt is not None:
+            edges_docked.append((c_off + carrier_idx[cid], tgt))
 
     return {
         "carrier_features": carrier_features,
@@ -424,9 +273,7 @@ def build_observation(
         "edges_accesses": _edges_to_array(edges_accesses),
         "edges_handoff": _edges_to_array(edges_handoff),
         "edges_transfer": _edges_to_array(edges_transfer),
-        "edges_committed": _edges_to_array(edges_committed),
-        "edges_in_flight_src": _edges_to_array(edges_in_flight_src),
-        "edges_in_flight_partner": _edges_to_array(edges_in_flight_partner),
+        "edges_docked": _edges_to_array(edges_docked),
         "querying_carrier": int(carrier_idx[querying_carrier]),
     }
 
@@ -438,43 +285,15 @@ def _edges_to_array(edges: list[tuple[int, int]]) -> np.ndarray:
     return arr
 
 
-def _target_node(
-    cmd,
-    c_off: int,
-    s_off: int,
-    r_off: int,
-    carrier_idx: dict,
-    shelf_idx: dict,
-    room_idx: dict,
+def _docked_node(
+    ref, s_off: int, r_off: int, shelf_idx: dict, room_idx: dict, carrier_idx: dict,
 ) -> int | None:
-    """Map an in-flight command to a node index for the 'committed' edge.
-
-    For both Relocate and MultiRelocate the committed edge points at the
-    destination (where the pallet ends up). Move/Wait have no associated
-    node. Carrier identifier args are accepted for signature symmetry but
-    only consulted when the command targets a carrier (none currently).
-    """
-    del c_off, carrier_idx  # reserved for future carrier-targeted commands
-    from oos.sim.actions import (
-        Move,
-        MultiRelocate,
-        Relocate,
-    )
-
-    if isinstance(cmd, (Relocate, MultiRelocate)):
-        return _location_node(cmd.dst, s_off, r_off, shelf_idx, room_idx)
-    if isinstance(cmd, Move):
-        return None
-    return None
-
-
-def _location_node(
-    loc: str, s_off: int, r_off: int,
-    shelf_idx: dict, room_idx: dict,
-) -> int | None:
-    """Node index for a Relocate endpoint (shelf or room). None if unknown."""
-    if loc in shelf_idx:
-        return s_off + shelf_idx[loc]
-    if loc in room_idx:
-        return r_off + room_idx[loc]
+    """Node index for a carrier's dock: a shelf, a room, or (for a handoff
+    pose) the partner carrier node."""
+    if ref.kind == "shelf":
+        return s_off + shelf_idx[ref.id] if ref.id in shelf_idx else None
+    if ref.kind == "room":
+        return r_off + room_idx[ref.id] if ref.id in room_idx else None
+    if ref.kind == "handoff":
+        return carrier_idx[ref.id] if ref.id in carrier_idx else None
     return None

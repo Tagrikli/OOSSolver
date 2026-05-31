@@ -35,9 +35,21 @@ class Retrieve(Task):
 
     The target is the *pallet identity*, not its contents. Whatever the
     pallet has on it at delivery time is what gets handed over.
+
+    `initial_depth` is the pallet's burial depth (0 = top of stack) at the
+    moment the request was created — captured once at creation and carried to
+    completion. The reward scales the delivery bonus by `initial_depth + 1`, so
+    a deeper dig is worth proportionally more than a shallow one.
     """
 
     pallet: PalletId
+    initial_depth: int = 0
+    # True iff, at REQUEST time, the target was already held by a carrier docked
+    # at a room — i.e. the agent was camping with a stored car until it happened
+    # to be asked for, not delivering it. Such a retrieve pays NO DELIVER reward
+    # (the completion is tagged `agent_delivered=False`); you can't farm a free
+    # delivery by parking a just-stored car at a room until its dwell fires.
+    already_staged: bool = False
 
 
 @dataclass

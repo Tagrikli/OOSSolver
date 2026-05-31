@@ -35,6 +35,7 @@ class CarrierIconWidget:
         self.carrier_id = carrier_id
         self.track_y = track_y
         self._x: float = 0.0
+        self._reach_dy: float = 0.0   # vertical fork-reach offset during take/give
         self._load: Optional[Pallet] = None
         self._state: str = "idle"
         self._pulsing_items: frozenset = frozenset()
@@ -42,6 +43,10 @@ class CarrierIconWidget:
 
     def set_position(self, x: float) -> None:
         self._x = x
+
+    def set_reach(self, dy: float) -> None:
+        """Vertical offset toward the docked shelf while reaching (take/give)."""
+        self._reach_dy = dy
 
     def set_load(self, p: Optional[Pallet]) -> None:
         self._load = p
@@ -57,7 +62,8 @@ class CarrierIconWidget:
 
     def draw(self, surface: pygame.Surface, fonts: Fonts) -> pygame.Rect:
         x = int(self._x)
-        rect = pygame.Rect(x - self.W // 2, self.track_y - self.H // 2, self.W, self.H)
+        y = self.track_y + int(self._reach_dy)
+        rect = pygame.Rect(x - self.W // 2, y - self.H // 2, self.W, self.H)
         color = {
             "idle": CARRIER_IDLE,
             "busy": CARRIER_BUSY,

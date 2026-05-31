@@ -9,8 +9,7 @@ import numpy as np
 
 from oos.sim.actions import (
     Command,
-    MultiRelocate,
-    Relocate,
+    Take,
 )
 from oos.sim.durations import DurationModel
 from oos.sim.scheduler import Event, Scheduler
@@ -19,12 +18,12 @@ from oos.sim.state import (
     FacilityState,
     Pallet,
     PalletId,
-    RoomState,
     ShelfState,
     SimTime,
+    pallet_depth,
 )
 from oos.sim.tasks import Retrieve, Store, Task, TaskQueue, TaskStream
-from oos.sim.topology import CarrierId, RoomId, SizeClass, Topology
+from oos.sim.topology import CarrierId, SizeClass, Topology
 
 
 @dataclass
@@ -134,8 +133,7 @@ class SimEngine:
                 self._next_pallet_id += 1
                 stack.append(Pallet(id=pid, contents="empty"))
             shelves[sid].stack = stack
-        rooms = {rid: RoomState() for rid in self.topology.rooms}
-        return FacilityState(time=0.0, carriers=carriers, shelves=shelves, rooms=rooms)
+        return FacilityState(time=0.0, carriers=carriers, shelves=shelves)
 
     def _schedule_next_arrival(self) -> None:
         if self.task_stream is None:
@@ -157,15 +155,19 @@ class SimEngine:
         giver_cs.busy_until = busy_until
         giver_cs.command_started_at = self.state.time
         giver_cs.command_start_position = giver_cs.position
-        if isinstance(cmd, MultiRelocate):
-            # Atomic two-carrier command — lock the partner too, with the
-            # SAME current_command instance so `_pending_commands` can
-            # deduplicate by id().
-            ps = self.state.carriers[cmd.partner_id]
-            ps.current_command = cmd
-            ps.busy_until = busy_until
-            ps.command_started_at = self.state.time
-            ps.command_start_position = ps.position
+        if isinstance(cmd, Take):
+            # A Take docked at a handoff pose with a WAITing partner is the
+            # carrier->carrier transfer: lock the partner too, with the SAME
+            # current_command instance, for the handoff duration only. The
+            # transfer is atomic at completion (no half-committed state).
+            partner_id = cmd.partner_to_receive_from(self.state, self.topology)
+            if partner_id is not None:
+                ps = self.state.carriers[partner_id]
+                ps.current_command = cmd
+                ps.busy_until = busy_until
+                ps.command_started_at = self.state.time
+                ps.command_start_position = ps.position
+                ps.waiting = False
         self.scheduler.push(busy_until, "command_done", cmd.carrier)
 
     def needs_decision(self, carrier_id: CarrierId) -> bool:
@@ -226,8 +228,17 @@ class SimEngine:
     def wait(self, carrier_id: CarrierId) -> None:
         """Carrier chooses WAIT: hold in place until a state change re-opens
         the decision. No timer, no `current_command` — the carrier stays
-        recruitable as a handoff partner but is not re-queried until then."""
-        self.state.carriers[carrier_id].waiting = True
+        recruitable as a handoff partner but is not re-queried until then.
+
+        The WAIT is ALSO the sole store/retrieve serve trigger: if this carrier
+        is now docked+waiting at a room holding the matching load with a pending
+        compatible task, the customer interaction fires here (not on arrival),
+        so the WAIT is always the creditable action. A serve is a state change,
+        so all waiting carriers are re-queried afterwards."""
+        cs = self.state.carriers[carrier_id]
+        cs.waiting = True
+        if self._try_serve_at_room(carrier_id, self._pending_completions):
+            self.wake_waiting_carriers()
 
     # ------------------------------------------------------------------
     # Manual task injection (used by the viz in manual mode; bypasses the
@@ -237,7 +248,9 @@ class SimEngine:
     def enqueue_store(self, size: SizeClass) -> None:
         """Add a Store of the given size to the queue right now."""
         self.queue.add(Store(arrived_at=self.state.time, size=size))
-        self._scan_all_for_auto_serve_rooms(self._pending_completions)
+        # A new task is a state change: re-open every waiting carrier so a
+        # carrier parked at a room re-decides and a re-chosen WAIT serves it.
+        self.wake_waiting_carriers()
 
     def clear_queue(self) -> None:
         """Drop every pending task. In-flight customer interactions continue."""
@@ -261,8 +274,12 @@ class SimEngine:
                 return False
         if not _pallet_exists(self, pallet_id):
             return False
-        self.queue.add(Retrieve(arrived_at=self.state.time, pallet=pallet_id))
-        self._scan_all_for_auto_serve_rooms(self._pending_completions)
+        self.queue.add(Retrieve(
+            arrived_at=self.state.time, pallet=pallet_id,
+            initial_depth=pallet_depth(self.state, pallet_id),
+            already_staged=self._target_already_staged(pallet_id),
+        ))
+        self.wake_waiting_carriers()
         return True
 
     def set_auto_arrivals(self, enabled: bool) -> None:
@@ -381,7 +398,7 @@ class SimEngine:
     ) -> None:
         kind = ev.kind
         if kind == "command_done":
-            self._on_command_done(ev.payload, completions)
+            self._on_command_done(ev.payload)
         elif kind == "task_arrival":
             self._on_task_arrival(arrivals, dropped, completions)
         elif kind == "scheduled_store_arrival":
@@ -392,7 +409,6 @@ class SimEngine:
             task = Store(arrived_at=self.state.time, size=ev.payload["size"])
             self.queue.add(task)
             arrivals.append(task)
-            self._scan_all_for_auto_serve_rooms(completions)
         elif kind == "retrieve_arrival":
             self._on_retrieve_arrival(ev.payload, arrivals, completions)
         else:
@@ -408,50 +424,23 @@ class SimEngine:
         # and "queued, then capacity disappeared as more bigs landed".
         self._sweep_unservable_bigs(dropped)
 
-    def _on_command_done(
-        self, carrier_id: CarrierId, completions: list[TaskCompletion]
-    ) -> None:
+    def _on_command_done(self, carrier_id: CarrierId) -> None:
         cs = self.state.carriers[carrier_id]
         cmd = cs.current_command
         # Idempotent guard: nothing to complete if the carrier holds no
-        # command (e.g. a MultiRelocate already cleared by its partner).
+        # command (e.g. a transfer already cleared via its partner).
         if cmd is None:
             return
         cmd.complete(self.state, self.topology)
-        # Clear initiator state (and partner, if multi-carrier).
-        cs.current_command = None
-        cs.busy_until = None
-        cs.command_started_at = None
-        cs.command_start_position = None
-        if isinstance(cmd, MultiRelocate):
-            ps = self.state.carriers[cmd.partner_id]
-            ps.current_command = None
-            ps.busy_until = None
-            ps.command_started_at = None
-            ps.command_start_position = None
-
-        # Auto-serve trigger: customer interactions fire on `room.load`
-        # changes. Both Relocate (single-carrier) and MultiRelocate (two-
-        # carrier) can deposit into a room when their dst is a room.
-        if isinstance(cmd, (Relocate, MultiRelocate)) and cmd.dst in self.topology.rooms:
-            self._try_auto_serve_room(cmd.dst, completions, agent_deposit=True)
-
-        # "Must cleanup" constraint maintenance — same logic for both
-        # command types: whichever carrier ended up at the room (Relocate's
-        # carrier, or MultiRelocate's partner) gets the cleanup obligation.
-        if isinstance(cmd, Relocate):
-            if cs.must_relocate_from == cmd.src:
-                cs.must_relocate_from = None
-            if cmd.dst in self.topology.rooms:
-                if self.state.rooms[cmd.dst].load is not None:
-                    cs.must_relocate_from = cmd.dst
-        elif isinstance(cmd, MultiRelocate):
-            ps = self.state.carriers[cmd.partner_id]
-            # Partner is the one that ended up at dst — apply the cleanup
-            # check to them.
-            if cmd.dst in self.topology.rooms:
-                if self.state.rooms[cmd.dst].load is not None:
-                    ps.must_relocate_from = cmd.dst
+        # Clear every carrier that shares this command instance — the initiator
+        # and, for a carrier->carrier transfer Take, the locked partner. The
+        # newly-emptied giver is then re-queried via wake_waiting_carriers.
+        for other in self.state.carriers.values():
+            if other.current_command is cmd:
+                other.current_command = None
+                other.busy_until = None
+                other.command_started_at = None
+                other.command_start_position = None
 
     def _on_task_arrival(
         self,
@@ -479,14 +468,17 @@ class SimEngine:
                 dropped.append(task)
                 return
         elif isinstance(task, Retrieve):
-            task = Retrieve(arrived_at=self.state.time, pallet=task.pallet)
+            task = Retrieve(
+                arrived_at=self.state.time, pallet=task.pallet,
+                initial_depth=pallet_depth(self.state, task.pallet),
+                already_staged=self._target_already_staged(task.pallet),
+            )
         self.queue.add(task)
         arrivals.append(task)
         # The post-event sweep in _handle_event will drop this task (and any
         # other pending big Stores) if the facility has no big capacity left.
-        # Any idle carrier already parked at a room they serve with a usable
-        # load state should pick this customer up immediately.
-        self._scan_all_for_auto_serve_rooms(completions)
+        # _handle_event then wakes all waiting carriers so a carrier parked at a
+        # room re-decides and a re-chosen WAIT serves this customer.
 
     def _big_admission_ok(self) -> bool:
         """True iff a big (SUV) Store can be admitted right now: some big
@@ -561,98 +553,91 @@ class SimEngine:
         pallet_id = payload["pallet"]
         if not _pallet_exists(self, pallet_id):
             return
-        task = Retrieve(arrived_at=self.state.time, pallet=pallet_id)
+        task = Retrieve(
+            arrived_at=self.state.time, pallet=pallet_id,
+            initial_depth=pallet_depth(self.state, pallet_id),
+            already_staged=self._target_already_staged(pallet_id),
+        )
         self.queue.add(task)
         arrivals.append(task)
-        # An idle carrier may already be holding this pallet and parked at a
-        # room — let them serve immediately.
-        self._scan_all_for_auto_serve_rooms(completions)
+        # _handle_event wakes all waiting carriers; a carrier already holding
+        # this pallet and parked at a room re-decides and serves on its WAIT.
 
     # ------------------------------------------------------------------
-    # Auto-serve dispatch (room-load-driven)
+    # Customer-interaction serve (carrier-docked, WAIT-triggered)
     # ------------------------------------------------------------------
 
-    def _try_auto_serve_room(
-        self, room_id: RoomId, completions: list[TaskCompletion],
-        agent_deposit: bool = False,
-    ) -> None:
-        """If `room.load` matches a pending task, fire the customer interaction
-        instantly. Retrieve takes priority over Store (when both could apply,
-        the user-requested pallet wins).
+    def _try_serve_at_room(
+        self, carrier_id: CarrierId, completions: list[TaskCompletion]
+    ) -> bool:
+        """Fire a store/retrieve customer interaction against the load a carrier
+        physically holds while docked + WAITing at a room. Returns True iff a
+        task was served.
 
-        `agent_deposit` is True only when called right after a carrier dropped a
-        pallet at this room (`_on_command_done`). A completed Retrieve records
-        it as `agent_delivered` so the reward can tell a real dig from a
-        parked-car free completion (a dwell-retrieve firing on a pallet that was
-        already sitting in the room).
-
-        The carrier that did the deposit is already idle and free to leave —
-        customer interactions are zero-duration in this simplified model.
-        Later, if we want a real "carrier locked during interaction" state,
-        we'll mask the carrier's actions for the duration; the env state will
-        encode the lock explicitly.
+        Exactly one serve per call (retrieve takes priority over store) so each
+        serve is bound to its own WAIT decision. A retrieve consumes the held
+        target (contents → empty, id preserved); a store fills the held empty
+        pallet (contents → size) and schedules its dwell retrieve. Rooms hold no
+        pallet of their own — the result stays on the carrier.
         """
-        rs = self.state.rooms[room_id]
-        if rs.load is None:
-            return
-        # Skip if the pallet at this room is the source of an in-flight
-        # Relocate/MultiRelocate. Engine state keeps the pallet at `rs.load`
-        # until the command completes (the carrier visually "holds" it), and
-        # mutating its contents mid-transit would corrupt the in-flight
-        # delivery — the carrier ends up dropping a filled pallet where it
-        # promised to drop an empty one.
-        from oos.sim.actions import _pending_src_count
-        if _pending_src_count(self.state, room_id) > 0:
-            return
-        pallet = rs.load
-        # A pending Retrieve for THIS pallet (regardless of contents) wins.
+        cs = self.state.carriers[carrier_id]
+        if not cs.waiting or cs.load is None:
+            return False
+        d = cs.docked_at
+        if d is None or d.kind != "room":
+            return False
+        pallet = cs.load
+        # Retrieve: the held pallet is the target of a pending Retrieve (a real
+        # agent delivery — the only way a retrieve can complete now).
         retrieve = self._find_pending_retrieve(pallet.id)
         if retrieve is not None:
             cost = self.state.time - retrieve.arrived_at
             self.queue.remove(retrieve)
             self.queue.completed_costs.append(cost)
-            completions.append(TaskCompletion(task=retrieve, cost=cost))
-            # Instant mutation: contents → empty; id preserved.
-            rs.load = Pallet(id=pallet.id, contents="empty")
-            pallet = rs.load
-            # Fall through to Store check — the post-Retrieve empty pallet
-            # is exactly the condition that should trigger a pending Store
-            # at this room. Without falling through, a Retrieve completion
-            # would leave the leftover empty sitting around even when a
-            # Store could immediately consume it.
-        # If the pallet is empty (either originally or just-emptied by a
-        # Retrieve above), try the oldest pending Store.
+            # `already_staged` (set at request time) marks a camped request — the
+            # target was already at a room when asked for, so this is NOT an agent
+            # delivery and pays no DELIVER reward.
+            completions.append(
+                TaskCompletion(
+                    task=retrieve, cost=cost,
+                    agent_delivered=not retrieve.already_staged,
+                )
+            )
+            cs.load = Pallet(id=pallet.id, contents="empty")
+            return True
+        # Store: the held empty pallet absorbs the oldest pending Store.
         if pallet.is_empty:
             store = self._find_pending_store()
-            if store is None:
-                return
-            cost = self.state.time - store.arrived_at
-            self.queue.remove(store)
-            self.queue.completed_costs.append(cost)
-            completions.append(TaskCompletion(task=store, cost=cost))
-            # Instant mutation: contents → store.size; id preserved.
-            rs.load = Pallet(id=pallet.id, contents=store.size)
-            # Schedule the eventual retrieve for this newly-filled pallet so
-            # the produced item gets requested back later (only matters when
-            # auto-arrivals are enabled).
-            if self.dwell_sampler is not None:
-                delay = self.dwell_sampler(pallet.id, store.size)
-                if delay != float("inf"):
-                    self.scheduler.push(
-                        self.state.time + delay,
-                        "retrieve_arrival",
-                        {"pallet": pallet.id},
-                    )
+            if store is not None:
+                cost = self.state.time - store.arrived_at
+                self.queue.remove(store)
+                self.queue.completed_costs.append(cost)
+                completions.append(TaskCompletion(task=store, cost=cost))
+                cs.load = Pallet(id=pallet.id, contents=store.size)
+                if self.dwell_sampler is not None:
+                    delay = self.dwell_sampler(pallet.id, store.size)
+                    if delay != float("inf"):
+                        self.scheduler.push(
+                            self.state.time + delay,
+                            "retrieve_arrival",
+                            {"pallet": pallet.id},
+                        )
+                return True
+        return False
 
-    def _scan_all_for_auto_serve_rooms(
-        self, completions: list[TaskCompletion],
-    ) -> None:
-        """Try `_try_auto_serve_room` for every room. Used on task arrival,
-        when a newly-pending task may immediately match a pallet already
-        sitting in a room.
-        """
-        for room_id in self.topology.rooms:
-            self._try_auto_serve_room(room_id, completions)
+    def _target_already_staged(self, pallet_id: PalletId) -> bool:
+        """True iff some carrier is currently docked at a room holding pallet
+        `pallet_id`. Used at Retrieve-creation time to tag a *camped* request
+        (the target is already at a room, so completing it is not an agent
+        delivery) — kills the park-a-stored-car-until-it's-asked-for exploit."""
+        for cs in self.state.carriers.values():
+            d = cs.docked_at
+            if (
+                d is not None and d.kind == "room"
+                and cs.load is not None and cs.load.id == pallet_id
+            ):
+                return True
+        return False
 
     def _find_pending_retrieve(self, pallet_id: PalletId) -> "Retrieve | None":
         for t in self.queue.pending:
@@ -676,8 +661,5 @@ def _pallet_exists(facility: "SimEngine", pallet_id: PalletId) -> bool:
                 return True
     for cs in facility.state.carriers.values():
         if cs.load is not None and cs.load.id == pallet_id:
-            return True
-    for rs in facility.state.rooms.values():
-        if rs.load is not None and rs.load.id == pallet_id:
             return True
     return False

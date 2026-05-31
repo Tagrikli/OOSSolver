@@ -19,12 +19,13 @@ import torch.nn.functional as F
 from oos.env.action import ActionType
 from oos.learn.batching import EDGE_TYPES, Batch
 
-# Action types that take node-typed targets. Two heads with different
-# input shapes: RELOCATE scores (carrier, src, dst) and MULTI_RELOCATE
-# scores (carrier, partner, src, dst).
-TARGETED_ACTION_TYPES: tuple[ActionType, ...] = (
-    ActionType.RELOCATE,
-    ActionType.MULTI_RELOCATE,
+# Scalar (targetless) action types — scored from the ego-carrier embedding
+# alone, since they act on the carrier's current dock. GOTO is the one
+# node-targeted action (a single-pointer head over the destination node).
+SCALAR_ACTION_TYPES: tuple[ActionType, ...] = (
+    ActionType.TAKE,
+    ActionType.GIVE,
+    ActionType.WAIT,
 )
 
 
@@ -195,28 +196,24 @@ class PolicyValueNet(nn.Module):
             nn.Linear(cfg.head_hidden, 1),
         )
 
-        # Targeted action heads. Input dim differs by type:
-        #   - RELOCATE        : [h_query ; h_src ; h_dst ; global]              = 3h + Fg
-        #   - MULTI_RELOCATE  : [h_query ; h_partner ; h_src ; h_dst ; global]  = 4h + Fg
-        self.action_heads = nn.ModuleDict(
-            {
-                ActionType.RELOCATE.name: nn.Sequential(
-                    nn.Linear(3 * h + global_feat_dim, cfg.head_hidden),
-                    nn.GELU(),
-                    nn.Linear(cfg.head_hidden, 1),
-                ),
-                ActionType.MULTI_RELOCATE.name: nn.Sequential(
-                    nn.Linear(4 * h + global_feat_dim, cfg.head_hidden),
-                    nn.GELU(),
-                    nn.Linear(cfg.head_hidden, 1),
-                ),
-            }
-        )
-        # WAIT head: no target (voluntary-idle action).
-        self.wait_head = nn.Sequential(
-            nn.Linear(h + global_feat_dim, cfg.head_hidden),
+        # GOTO head: single-pointer over the destination node —
+        #   [h_query ; h_target ; global] = 2h + Fg.
+        self.goto_head = nn.Sequential(
+            nn.Linear(2 * h + global_feat_dim, cfg.head_hidden),
             nn.GELU(),
             nn.Linear(cfg.head_hidden, 1),
+        )
+        # Scalar heads for TAKE / GIVE / WAIT: no node target (they act on the
+        # carrier's current dock) — [h_query ; global] = h + Fg.
+        self.scalar_heads = nn.ModuleDict(
+            {
+                atype.name: nn.Sequential(
+                    nn.Linear(h + global_feat_dim, cfg.head_hidden),
+                    nn.GELU(),
+                    nn.Linear(cfg.head_hidden, 1),
+                )
+                for atype in SCALAR_ACTION_TYPES
+            }
         )
 
     # ------------------------------------------------------------------
@@ -250,45 +247,31 @@ class PolicyValueNet(nn.Module):
 
         valid_mask = batch.action_mask                   # [B, N_max] bool
 
-        # RELOCATE head — input is [h_query ; h_src ; h_dst ; global].
-        sel = valid_mask & (batch.type_per_slot == int(ActionType.RELOCATE))
+        # GOTO head — single pointer over the destination node:
+        # [h_query ; h_target ; global]. (GOTO == 0; padding slots are type 0
+        # too, but valid_mask gates them out, so padding never reaches a head.)
+        sel = valid_mask & (batch.type_per_slot == int(ActionType.GOTO))
         if sel.any():
             bidx, sidx = sel.nonzero(as_tuple=True)
-            src_node = batch.source_per_slot[bidx, sidx]
-            dst_node = batch.target_per_slot[bidx, sidx]
-            h_src = x_per[bidx, src_node]
-            h_dst = x_per[bidx, dst_node]
+            tgt_node = batch.target_per_slot[bidx, sidx]
+            h_t = x_per[bidx, tgt_node]
             h_c = h_query[bidx]
             g = batch.global_x[bidx]
-            scores = self.action_heads[ActionType.RELOCATE.name](
-                torch.cat([h_c, h_src, h_dst, g], dim=-1)
+            scores = self.goto_head(
+                torch.cat([h_c, h_t, g], dim=-1)
             ).squeeze(-1)
             logits[bidx, sidx] = scores
 
-        # MULTI_RELOCATE head — input is [h_query ; h_partner ; h_src ; h_dst ; global].
-        sel = valid_mask & (batch.type_per_slot == int(ActionType.MULTI_RELOCATE))
-        if sel.any():
-            bidx, sidx = sel.nonzero(as_tuple=True)
-            partner_node = batch.partner_per_slot[bidx, sidx]
-            src_node = batch.source_per_slot[bidx, sidx]
-            dst_node = batch.target_per_slot[bidx, sidx]
-            h_p = x_per[bidx, partner_node]
-            h_src = x_per[bidx, src_node]
-            h_dst = x_per[bidx, dst_node]
-            h_c = h_query[bidx]
-            g = batch.global_x[bidx]
-            scores = self.action_heads[ActionType.MULTI_RELOCATE.name](
-                torch.cat([h_c, h_p, h_src, h_dst, g], dim=-1)
-            ).squeeze(-1)
-            logits[bidx, sidx] = scores
-
-        # WAIT head.
-        wait_sel = valid_mask & (batch.type_per_slot == int(ActionType.WAIT))
-        if wait_sel.any():
-            bidx, sidx = wait_sel.nonzero(as_tuple=True)
-            h_c = h_query[bidx]
-            g = batch.global_x[bidx]
-            scores = self.wait_head(torch.cat([h_c, g], dim=-1)).squeeze(-1)
-            logits[bidx, sidx] = scores
+        # TAKE / GIVE / WAIT — scalar heads off the ego-carrier embedding.
+        for atype in SCALAR_ACTION_TYPES:
+            sel = valid_mask & (batch.type_per_slot == int(atype))
+            if sel.any():
+                bidx, sidx = sel.nonzero(as_tuple=True)
+                h_c = h_query[bidx]
+                g = batch.global_x[bidx]
+                scores = self.scalar_heads[atype.name](
+                    torch.cat([h_c, g], dim=-1)
+                ).squeeze(-1)
+                logits[bidx, sidx] = scores
 
         return NetworkOutput(logits=logits, value=value)

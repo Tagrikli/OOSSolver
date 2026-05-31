@@ -20,17 +20,47 @@ command_started_at, busy_until, anim_now)` from `facility.state.carriers`.
 
 from __future__ import annotations
 
+import math
+
 import pygame
 
 from oos.env import Environment
-from oos.sim.actions import MultiRelocate, Relocate
+from oos.sim.actions import Give, Take
 from oos.sim.tasks import Retrieve, Store, TaskQueue
 from oos.sim.topology import Topology
-from oos.viz.animation import (
-    interpolated_position,
-    multi_relocate_visual_position,
-    relocate_visual_state,
-)
+from oos.viz.animation import interpolated_position
+
+# Peak vertical fork-reach (px) the carrier extends toward a shelf during a
+# take/give, eased by the take/give trapezoidal profile (out-and-back).
+_REACH_PX = 14
+
+
+def _shelf_op_reach_dy(sim, cid: str, cmd, anim_now: float) -> float:
+    """Vertical reach offset for a carrier mid take/give at a shelf, following
+    the take/give trapezoidal profile (0 → peak → 0 over the op)."""
+    if not isinstance(cmd, (Take, Give)):
+        return 0.0
+    cs = sim.state.carriers[cid]
+    d = cs.docked_at
+    if (
+        d is None or d.kind != "shelf"
+        or cs.command_started_at is None or cs.busy_until is None
+    ):
+        return 0.0  # handoff takes / not-at-a-shelf: no vertical fork reach
+    op_t = cs.busy_until - cs.command_started_at
+    if op_t <= 0:
+        return 0.0
+    elapsed = min(max(0.0, anim_now - cs.command_started_at), op_t)
+    profile = getattr(sim.durations, "op_profile", None)
+    stroke = getattr(sim.durations, "op_stroke_mm", 0.0)
+    if profile is not None and stroke > 0:
+        prog = profile.traveled_at(elapsed, stroke) / stroke  # trapezoidal 0→1
+    else:
+        prog = elapsed / op_t
+    # Reach toward the shelf: 'up' shelves render above the track (−y).
+    orient = sim.topology.shelves[d.id].orientation_at(cid)
+    direction = -1.0 if orient == "up" else 1.0
+    return direction * _REACH_PX * math.sin(math.pi * prog)
 from oos.viz.components import (
     CYAN_BRIGHT,
     CarrierPanel,
@@ -223,10 +253,8 @@ class FacilityCanvas:
         self._queue_strip.set_now(anim_now)
         self._queue_strip.draw(surface, self.fonts)
 
-        # In-flight overlay (commitment projection — same one the obs
-        # builder uses to decide where a mid-transit pallet visually lives).
-        from oos.env.observation import compute_in_flight_overlay
-        in_flight_loads, pickups_in_flight = compute_in_flight_overlay(sim)
+        # Loads live on carriers now (no in-flight overlay): a carrier's
+        # visual load is just cs.load, and shelf stacks are drawn as-is.
 
         # Reset hit-test caches each frame.
         self.pallet_hit_areas = []
@@ -243,34 +271,35 @@ class FacilityCanvas:
             panel.set_pulsing_items(requested_pallets)
             panel.set_wall_now(wall_now)
 
-            # Shelves.
+            # Shelves — drawn straight from the live stack (no overlay).
             for sid in panel.shelves:
                 ss = sim.state.shelves[sid]
-                panel.update_shelf(
-                    sid, ss.stack, n_hidden=pickups_in_flight.get(sid, 0),
-                )
+                panel.update_shelf(sid, ss.stack, n_hidden=0)
 
-            # Rooms.
+            # Rooms are docking ports now (they hold no pallet of their own —
+            # a docked carrier's pallet is drawn on the carrier icon). Light the
+            # port "busy" while its serving carrier is parked inside it.
             for rid in panel.rooms:
-                rs_room = sim.state.rooms[rid]
-                visual_load = rs_room.load if pickups_in_flight.get(rid, 0) == 0 else None
-                state_name = "ready" if visual_load is None else "idle"
-                panel.update_room(rid, visual_load, state_name)
+                served_by = sim.topology.rooms[rid].served_by
+                scs = sim.state.carriers.get(served_by)
+                docked = (
+                    scs is not None
+                    and scs.docked_at is not None
+                    and scs.docked_at.kind == "room"
+                    and scs.docked_at.id == rid
+                )
+                panel.update_room(rid, None, "busy" if docked else "ready")
 
-            # Carrier icon — interpolated position over the current command.
+            # Carrier icon — interpolated position over the current command
+            # (only GOTO moves; TAKE/GIVE hold). Load is read straight off the
+            # carrier.
             cs = sim.state.carriers[cid]
             cmd = cs.current_command
-            if isinstance(cmd, Relocate) and cs.command_started_at is not None:
-                pos_now, _ = relocate_visual_state(sim, cid, anim_now)
-            elif isinstance(cmd, MultiRelocate) and cs.command_started_at is not None:
-                pos_now = multi_relocate_visual_position(
-                    sim, cid, cmd, anim_now,
-                )
-            else:
-                pos_now = interpolated_position(sim, cid, anim_now)
-            visual_load = in_flight_loads.get(cid, cs.load)
+            pos_now = interpolated_position(sim, cid, anim_now)
+            visual_load = cs.load
 
             panel.set_carrier_position(panel.pos_to_x(pos_now))
+            panel.set_carrier_reach(_shelf_op_reach_dy(sim, cid, cmd, anim_now))
             panel.set_carrier_load(visual_load)
             panel.set_carrier_state("busy" if cmd is not None else "idle")
             panel.set_carrier_action(short_action_label(cmd))

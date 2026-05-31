@@ -102,6 +102,24 @@ class MotionProfile:
 LIFT_PROFILE    = MotionProfile(vmax=2000.0, accel=500.0, decel=500.0)
 SHUTTLE_PROFILE = MotionProfile(vmax=3000.0, accel=500.0, decel=500.0)
 
+# Take/give reach: the fork extension that grabs or places a pallet. Modeled as
+# its own trapezoidal motion — the SAME profile + the SAME fixed stroke for
+# every take and give, so every shelf op takes the same time (floored). vmax
+# only binds for strokes ≥ vmax²/accel = 720 mm; shorter strokes are triangular.
+SHELF_OP_PROFILE   = MotionProfile(vmax=600.0, accel=500.0, decel=500.0)
+SHELF_OP_STROKE_MM = 1000.0   # reach distance into the rack (single fixed stroke)
+SHELF_OP_FLOOR_S   = 0.05     # 50 ms minimum op time, regardless of stroke
+
+
+def shelf_op_time(
+    stroke_mm: float = SHELF_OP_STROKE_MM,
+    profile: MotionProfile = SHELF_OP_PROFILE,
+    floor_s: float = SHELF_OP_FLOOR_S,
+) -> float:
+    """Trapezoidal take/give duration for a reach of `stroke_mm`, floored."""
+    return max(floor_s, profile.travel_time(stroke_mm))
+
+
 # Minimum centre-to-centre spacing between adjacent shelves on a carrier's
 # track, in mm. Layout authoring helper — *not* enforced by the sim.
 LIFT_SHELF_SPACING_MM    = 2300

@@ -13,20 +13,26 @@ Each episode:
     cap. The PPO collector already bootstraps the value at every `done` as a
     truncation, so value targets are correct.
 
-Reward — three sparse, outcome-based terms (see `ContinuousRewardConfig`):
+Reward — two interchangeable styles share this episode structure (selected by
+the config type passed to `__init__`):
 
-  P1 (retrieval): + delivery_bonus per retrieve completion.
-  P2 (serving):   + store_serve_bonus per store served (empty pallet at a
-                    room → car loaded — the observable outcome of staging).
-  P3 (efficiency): − movement_weight · distance_mm.
+  * BASE (default; pass a `RewardConfig`, or nothing) — the SAME reward shape
+    `EpisodeEnv` uses, computed for us by `Environment.advance` via
+    `base_system`: + per retrieve delivered (DELIVER), ± per empty
+    staged/un-staged at a room (STAGE/UNSTAGE, **retrieve-gated** — credited
+    only when no Retrieve is pending), − per wrong car placed at a room
+    (WRONG), − per step a Retrieve is pending and no carrier works (IDLE),
+    − movement. Note the gate: with a seeded retrieve pending, STAGE/UNSTAGE
+    fire mainly *between* digs.
+  * CONTINUOUS (pass a `ContinuousRewardConfig`) — the symmetric-shaping reward
+    recomputed in `step()`: DELIVER, SERVE (+ per store served), the symmetric
+    WRONG/EVAC and STAGE/UNSTAGE pairs (ungated room transitions), a tick-based
+    TIME drip, MOVE, and the all-idle penalties.
 
 **Urgency comes from the discount (gamma), not a wait penalty** — an earlier
 completion has a higher discounted return, so the agent learns "sooner is
-better" without an action-independent per-step drip (which previously created
-a give-up attractor). No store-wait penalty (pending stores aren't
-observable, so penalizing them is non-actionable). No potential-based shaping
-(a blocker-count potential would punish the correct buffer-on-target
-maneuver). PLR oversampling carries the hard cases.
+better" without an action-independent per-step drip. PLR oversampling carries
+the hard cases.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ from oos.env.reward import RewardConfig, RewardEvent
 from oos.env.reward_system import RewardContext, RewardSystem, continuous_system
 from oos.learn import targeting
 from oos.learn.single_task_env import SingleTaskConfig
+from oos.sim.state import pallet_depth
 from oos.sim.state_sampler import InitialStateSampler, InitialStateSamplerConfig
 from oos.sim.tasks import Retrieve
 
@@ -100,9 +107,8 @@ class ContinuousRewardConfig:
 
 
 _ZERO_BASE_REWARD = RewardConfig(
-    reward_retrieve=0.0, reward_stage_room=0.0, penalty_unstage_room=0.0,
-    penalty_wrong_item_to_room=0.0, penalty_idle_with_retrieve=0.0,
-    movement_weight=0.0,
+    reward_deliver=0.0, reward_serve=0.0,
+    potential_item_retrieval=0.0, potential_room_ready=0.0, potential_wrong_car=0.0,
 )
 
 
@@ -111,22 +117,40 @@ class ContinuousEnv(Environment):
         self,
         facility_factory: FacilityFactory,
         level_provider: LevelProvider,
-        reward_config: Optional[ContinuousRewardConfig] = None,
+        reward_config: "Optional[RewardConfig | ContinuousRewardConfig]" = None,
         experiment_config: Optional[ExperimentConfig] = None,
         observation_config: Optional[ObservationConfig] = None,
         reward_system: Optional[RewardSystem] = None,
     ) -> None:
-        # Base env reward is zeroed; we recompute the dense reward in step().
+        # Two reward styles share this env's continuous-episode structure:
+        #   * BASE (default): the same reward shape EpisodeEnv uses — base_system
+        #     over the retrieve-gated RewardContext the base Environment.advance
+        #     builds (DELIVER / STAGE / UNSTAGE / WRONG / IDLE / MOVE). Selected
+        #     by passing a RewardConfig (or nothing). STAGE/UNSTAGE are
+        #     retrieve-gated, so with a seeded retrieve pending they fire mainly
+        #     between digs; the reward is recomputed for us inside advance().
+        #   * CONTINUOUS: the symmetric-shaping reward (DELIVER / SERVE / WRONG /
+        #     EVAC / STAGE / UNSTAGE / TIME / MOVE / all-idle). Selected by
+        #     passing a ContinuousRewardConfig; the dense reward is recomputed in
+        #     step() from an ungated, continuous RewardContext.
+        self._continuous_reward = isinstance(reward_config, ContinuousRewardConfig)
+        # Continuous style zeroes the advance-path reward and recomputes it in
+        # step(); base style lets advance() score it via base_system.
+        base_reward_cfg = (
+            _ZERO_BASE_REWARD if self._continuous_reward
+            else (reward_config if isinstance(reward_config, RewardConfig) else RewardConfig())
+        )
         super().__init__(
             facility_factory=facility_factory,
             experiment_config=experiment_config,
-            reward_config=_ZERO_BASE_REWARD,
+            reward_config=base_reward_cfg,
             observation_config=observation_config,
         )
-        self._cont_reward_cfg = reward_config or ContinuousRewardConfig()
-        # The reward suite: pass an explicit RewardSystem to experiment, else
-        # build the default from the config (identical to the old inline reward).
-        self._reward_system = reward_system or continuous_system(self._cont_reward_cfg)
+        if self._continuous_reward:
+            self._cont_reward_cfg = reward_config or ContinuousRewardConfig()
+            self._reward_system = reward_system or continuous_system(self._cont_reward_cfg)
+        elif reward_system is not None:
+            self._reward_system = reward_system   # base style, explicit override
         self._level_provider = level_provider
         self._route_by_shelf: dict[str, str] = {}
         self._current_level: Optional[SingleTaskConfig] = None
@@ -154,6 +178,13 @@ class ContinuousEnv(Environment):
     def current_level(self) -> Optional[SingleTaskConfig]:
         """The level (hardness spec) this episode was reset into."""
         return self._current_level
+
+    @property
+    def current_target_id(self) -> Optional[int]:
+        """The pallet id of the seeded Retrieve for this episode, or None if no
+        target could be seeded (e.g. an impossible class/route combo). Lets a
+        held-out evaluator drop levels that never installed a dig to solve."""
+        return self._target_id
 
     # ------------------------------------------------------------------
     # Reset
@@ -196,9 +227,10 @@ class ContinuousEnv(Environment):
             )
             if target is not None:
                 self._target_id = target
-                facility.queue.add(
-                    Retrieve(arrived_at=facility.state.time, pallet=target)
-                )
+                facility.queue.add(Retrieve(
+                    arrived_at=facility.state.time, pallet=target,
+                    initial_depth=pallet_depth(facility.state, target),
+                ))
         else:
             # No seeded task — just the diverse hard state + live stream.
             sampler.sample(facility, self._rng)
@@ -211,11 +243,12 @@ class ContinuousEnv(Environment):
     # ------------------------------------------------------------------
 
     def step(self, action: int):
-        obs, _base_reward, terminated, truncated, info = super().step(action)
+        obs, base_reward, terminated, truncated, info = super().step(action)
         facility = self._ctx.facility  # type: ignore[union-attr]
 
         # Typed (s → s') diff produced by Environment.advance — single source.
         events = info["events"]
+        # Per-episode completion bookkeeping (both reward styles).
         self._ep_retrieves += events.n_deliveries
         self._ep_stores += events.n_stores_served
         # TaskCompletion.cost == per-task wait (t_completed − t_arrived).
@@ -229,21 +262,26 @@ class ContinuousEnv(Environment):
             self._ep_retrieve_cost_sum / self._ep_retrieves
             if self._ep_retrieves else 0.0
         )
+        info["level_id"] = self._current_level_id
 
-        # Env-owned escalation counter (the one stateful quantity): reset on
-        # any completion this step, else tick up. Passed into the context so the
-        # TIME term stays a pure function.
+        if not self._continuous_reward:
+            # BASE reward (EpisodeEnv shape): Environment.advance already scored
+            # it via base_system over the retrieve-gated RewardContext and
+            # populated info["reward_breakdown"]/["reward_events"]. Just return.
+            return obs, base_reward, terminated, truncated, info
+
+        # CONTINUOUS reward: the advance-path reward was zeroed; recompute the
+        # dense, symmetric-shaping reward from an ungated context. `_ticks_since_
+        # completion` is the one stateful quantity, kept pure for the TIME term.
         if events.n_deliveries > 0 or events.n_stores_served > 0:
             self._ticks_since_completion = 0
         else:
             self._ticks_since_completion += 1
-
-        # Assemble the (s, a, s') context from the typed StepEvents, then let
-        # the reward suite score it. All term logic lives in the suite.
         # `n_free_deliveries` → DeliveryTerm skips parked-car retrieves.
         ctx = RewardContext(
             n_deliveries=events.n_deliveries,
             n_free_deliveries=events.n_free_deliveries,
+            delivery_depth_weight=events.delivery_depth_weight,
             n_stores_served=events.n_stores_served,
             n_wrong=events.n_wrong_item,
             n_stage=events.n_room_stage,
@@ -264,5 +302,4 @@ class ContinuousEnv(Environment):
         info["reward_breakdown"] = breakdown
         # Keep the (label, amount) event list for the viz toasts / panels.
         info["reward_events"] = [RewardEvent(k, v) for k, v in breakdown.items()]
-        info["level_id"] = self._current_level_id
         return obs, r, terminated, truncated, info

@@ -129,12 +129,12 @@ def _experiment_config(args: argparse.Namespace) -> ExperimentConfig:
 
 def _reward_config(args: argparse.Namespace) -> RewardConfig:
     return RewardConfig(
-        reward_retrieve=args.reward_retrieve,
-        reward_stage_room=args.reward_stage_room,
-        penalty_unstage_room=args.penalty_unstage_room,
-        penalty_wrong_item_to_room=args.penalty_wrong_item_to_room,
-        penalty_idle_with_retrieve=args.penalty_idle_with_retrieve,
-        movement_weight=args.movement_weight,
+        reward_deliver=args.reward_deliver,
+        reward_serve=args.reward_serve,
+        potential_item_retrieval=args.potential_item_retrieval,
+        potential_room_ready=args.potential_room_ready,
+        potential_wrong_car=args.potential_wrong_car,
+        potential_shallowest_empty=args.potential_shallowest_empty,
     )
 
 
@@ -216,27 +216,20 @@ def main() -> None:
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--n-epochs", type=int, default=4)
     p.add_argument("--minibatch-size", type=int, default=256)
-    # Reward
-    p.add_argument("--reward-retrieve", type=float, default=50.0,
-                   help="Per Retrieve completion (target pallet delivered).")
-    p.add_argument("--reward-stage-room", type=float, default=5.0,
-                   help="Per 'empty pallet placed at a free room' event, "
-                        "gated on no Retrieve currently pending.")
-    p.add_argument("--penalty-unstage-room", type=float, default=5.0,
-                   help="Per 'empty pallet removed from a room' event, "
-                        "same gate. Symmetric with --reward-stage-room so "
-                        "place-then-take cycles net to zero.")
-    p.add_argument("--penalty-wrong-item-to-room", type=float, default=5.0,
-                   help="Per 'filled pallet placed at a free room that is "
-                        "not a target retrieve and not a Store-fill' event. "
-                        "Ungated — fires in both phases. Discourages "
-                        "delivering non-target pallets and pointless "
-                        "filled-pallet shuffling.")
-    p.add_argument("--penalty-idle-with-retrieve", type=float, default=1.0,
-                   help="Per-step penalty when a Retrieve is pending AND no "
-                        "carrier is mid-command. Time pressure during the "
-                        "retrieval phase — catches WAIT-spam and stalls.")
-    p.add_argument("--movement-weight", type=float, default=0.01)
+    # Reward — same DELIVER + SERVE over a 4-term PBRS potential as the
+    # continuous trainer (see oos/env/reward.py / Environment._potential).
+    p.add_argument("--reward-deliver", type=float, default=50.0,
+                   help="+ per requested item delivered (flat).")
+    p.add_argument("--reward-serve", type=float, default=20.0,
+                   help="+ per store served onto a staged empty.")
+    p.add_argument("--potential-item-retrieval", type=float, default=1.0,
+                   help="PBRS w_ret: Φ drops by w_ret·(depth+1) per requested item.")
+    p.add_argument("--potential-room-ready", type=float, default=2.0,
+                   help="PBRS w_ready: + per carrier staged at a room with an empty.")
+    p.add_argument("--potential-wrong-car", type=float, default=2.0,
+                   help="PBRS w_wrong: − per carrier at a room with a non-requested car.")
+    p.add_argument("--potential-shallowest-empty", type=float, default=1.0,
+                   help="PBRS w_empty: − w_empty·(depth of the shallowest empty anywhere).")
     # Network
     p.add_argument("--hidden", type=int, default=64)
     p.add_argument("--n-heads", type=int, default=4)

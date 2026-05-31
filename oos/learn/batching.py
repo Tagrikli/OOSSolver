@@ -22,24 +22,20 @@ from oos.sim.topology import Topology
 
 # Canonical edge-type ordering. The network's GAT layer has one weight
 # set per name in this list. Reverse edges are added at collate time for
-# the asymmetric edge families (accesses, transfer, committed) so messages
-# can flow both ways; handoff is already bidirectional in the env obs.
+# the asymmetric edge families (accesses, transfer, docked) so messages can
+# flow both ways; handoff is already bidirectional in the env obs.
 EDGE_TYPES: tuple[str, ...] = (
     "accesses",          # carrier -> shelf or carrier -> room
     "accesses_rev",      # shelf/room -> carrier
     "handoff",           # carrier <-> carrier (bidirectional already in obs)
     "transfer",          # carrier -> transfer-shelf
     "transfer_rev",      # transfer-shelf -> carrier
-    "committed",         # carrier -> currently-committed target (Relocate/MultiRelocate dst)
-    "committed_rev",     # target -> carrier
-    # Source half of the (carrier, src, dst) triplet for in-flight
-    # Relocate/MultiRelocate. Together with `committed`, gives pointer
-    # attention direct access to both ends of the in-flight commitment.
-    "in_flight_src",     # carrier -> Relocate/MultiRelocate src
-    "in_flight_src_rev", # src -> carrier
-    # Partner edge during in-flight MultiRelocate: A <-> B. Bidirectional
-    # in the obs already (we emit both directions), so no _rev mirror.
-    "in_flight_partner", # carrier <-> partner carrier
+    # Where each carrier is currently docked: carrier -> its shelf / room /
+    # (for a handoff pose) partner-carrier node. Lets the trunk fold the
+    # docked location into the carrier embedding (so TAKE/GIVE are scored in
+    # context). Replaces the macro in-flight/committed edges.
+    "docked",            # carrier -> docked node
+    "docked_rev",        # docked node -> carrier
 )
 
 
@@ -57,9 +53,7 @@ class Sample:
     edges_accesses: np.ndarray     # [2, E]
     edges_handoff: np.ndarray
     edges_transfer: np.ndarray
-    edges_committed: np.ndarray
-    edges_in_flight_src: np.ndarray
-    edges_in_flight_partner: np.ndarray
+    edges_docked: np.ndarray
 
     # Action layout.
     action_mask: np.ndarray         # [N_max] int8
@@ -85,9 +79,7 @@ class Batch:
     querying: torch.Tensor       # [B] long, local carrier idx in [0, Nc)
     action_mask: torch.Tensor    # [B, N_max] bool
     type_per_slot: torch.Tensor  # [B, N_max] long (ActionType.value); 0 where invalid
-    target_per_slot: torch.Tensor  # [B, N_max] long. dst node for both RELOCATE and MULTI_RELOCATE; 0 for WAIT or invalid.
-    source_per_slot: torch.Tensor  # [B, N_max] long. src node for both RELOCATE and MULTI_RELOCATE; 0 otherwise.
-    partner_per_slot: torch.Tensor # [B, N_max] long. MULTI_RELOCATE-only — partner carrier node idx; 0 otherwise.
+    target_per_slot: torch.Tensor  # [B, N_max] long. GOTO destination node (shelf / room / partner-carrier); 0 for TAKE/GIVE/WAIT or invalid.
 
     # Constants (handy for the network).
     n_carriers: int
@@ -174,16 +166,13 @@ class GraphCollator:
         # stay zero from the np.zeros init.
         type_np = np.zeros((B, n_max), dtype=np.int64)
         target_np = np.zeros((B, n_max), dtype=np.int64)
-        source_np = np.zeros((B, n_max), dtype=np.int64)
-        partner_np = np.zeros((B, n_max), dtype=np.int64)
 
         # Local rebinds — Python attribute lookups inside the hot loop
         # are not free at 100k+ iterations.
         shelf_node = self._shelf_node
         room_node = self._room_node
         carrier_node = self._carrier_node
-        RELOC = int(ActionType.RELOCATE)
-        MULTI = int(ActionType.MULTI_RELOCATE)
+        GOTO = int(ActionType.GOTO)
 
         for b, s in enumerate(samples):
             entries = s.action_entries
@@ -191,29 +180,21 @@ class GraphCollator:
                 continue
             t_row = type_np[b]
             tg_row = target_np[b]
-            sr_row = source_np[b]
-            pr_row = partner_np[b]
             for i, e in enumerate(entries):
                 tval = int(e.type)
                 t_row[i] = tval
-                if tval == RELOC or tval == MULTI:
-                    dst = e.dst
-                    tg_row[i] = (
-                        shelf_node[dst] if dst in shelf_node else room_node[dst]
-                    )
-                    src = e.src
-                    sr_row[i] = (
-                        shelf_node[src] if src in shelf_node else room_node[src]
-                    )
-                    if tval == MULTI:
-                        pr_row[i] = carrier_node[e.partner]
-                # WAIT: tg/sr/pr stay 0 (matches legacy: _target/_source
-                # return 0 for WAIT, partner is never set).
+                if tval == GOTO:
+                    d = e.target
+                    if d.kind == "shelf":
+                        tg_row[i] = shelf_node[d.id]
+                    elif d.kind == "room":
+                        tg_row[i] = room_node[d.id]
+                    else:  # handoff pose -> partner carrier node
+                        tg_row[i] = carrier_node[d.id]
+                # TAKE/GIVE/WAIT: target stays 0 (acts on the docked location).
 
         type_per_slot = torch.from_numpy(type_np).to(device)
         target_per_slot = torch.from_numpy(target_np).to(device)
-        source_per_slot = torch.from_numpy(source_np).to(device)
-        partner_per_slot = torch.from_numpy(partner_np).to(device)
 
         # ----- edges -----
         # One pass over samples, six edge-type slots per sample, with
@@ -225,17 +206,13 @@ class GraphCollator:
             ("accesses", "accesses_rev"),
             ("handoff", None),
             ("transfer", "transfer_rev"),
-            ("committed", "committed_rev"),
-            ("in_flight_src", "in_flight_src_rev"),
-            ("in_flight_partner", None),
+            ("docked", "docked_rev"),
         )
         _edge_attrs = (
             "edges_accesses",
             "edges_handoff",
             "edges_transfer",
-            "edges_committed",
-            "edges_in_flight_src",
-            "edges_in_flight_partner",
+            "edges_docked",
         )
         for b, s in enumerate(samples):
             off = b * N
@@ -267,8 +244,6 @@ class GraphCollator:
             action_mask=action_mask,
             type_per_slot=type_per_slot,
             target_per_slot=target_per_slot,
-            source_per_slot=source_per_slot,
-            partner_per_slot=partner_per_slot,
             n_carriers=self.n_c,
             n_shelves=self.n_s,
             n_rooms=self.n_r,
@@ -288,9 +263,7 @@ def sample_from_env_step(
         edges_accesses=info["edges_accesses"],
         edges_handoff=info["edges_handoff"],
         edges_transfer=info["edges_transfer"],
-        edges_committed=info["edges_committed"],
-        edges_in_flight_src=info["edges_in_flight_src"],
-        edges_in_flight_partner=info["edges_in_flight_partner"],
+        edges_docked=info["edges_docked"],
         action_mask=np.asarray(obs["action_mask"]),
         action_entries=list(action_entries),
         querying_carrier=int(obs["querying_carrier"]),

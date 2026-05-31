@@ -1,17 +1,26 @@
 """Action enumeration, legality masking, and index decoding for a carrier.
 
-Unified two-action model — the policy chooses from exactly:
+Primitive action model — the policy chooses from exactly:
 
-  - `RELOCATE(carrier, src, dst)` — single-carrier pallet move. Both src
-    and dst are LocationIds (real shelf or 1-cap virtual room).
-  - `MULTI_RELOCATE(carrier, partner, src, dst)` — atomic two-carrier
-    pallet move via synchronized handoff. The querying carrier picks up
-    from src and meets `partner` at their shared handoff pose; partner
-    then delivers to dst. Both carriers lock busy for the full sequence;
-    there is no half-committed state, so no deadlock is possible.
-  - `WAIT(carrier)` — event-driven voluntary idle.
+  - `GOTO(target)` — move the carrier to one of its connected locations: a
+    specific shelf, a room, or a handoff pose (`target` is a `DockRef`). Docks
+    the carrier there. Up/down shelves sharing a track position are distinct
+    targets (distinct shelf ids).
+  - `TAKE` — pick up the top pallet of the docked shelf, OR receive from a
+    partner WAITing at the matching handoff pose. Targetless (acts on the
+    carrier's current dock).
+  - `GIVE` — place the held pallet onto the docked shelf (size/capacity
+    checked). Targetless. Shelves only.
+  - `WAIT` — event-driven voluntary idle. Also the sole store/retrieve serve
+    trigger when the carrier is docked at a room holding the matching load
+    (handled by `Facility.wait`).
 
-Auto-fired (not policy-chosen): customer interactions on rooms.
+The enumeration order is the single authority for the flat action index space:
+all legal GOTO entries (in node iteration order), then TAKE (if legal), then
+GIVE (if legal), then WAIT (always, last). Everything downstream — the mask,
+the per-slot tensors, the network logits, the decoder — is keyed to this order.
+
+Customer interactions on rooms are auto-fired (not policy-chosen).
 """
 
 from __future__ import annotations
@@ -22,19 +31,20 @@ from typing import Optional
 
 from oos.sim.actions import (
     Command,
-    LocationId,
-    MultiRelocate,
-    Relocate,
+    Give,
+    Goto,
+    Take,
 )
-from oos.sim.state import FacilityState
-from oos.sim.tasks import TaskQueue
+from oos.sim.state import DockRef, FacilityState
+from oos.sim.tasks import Retrieve, TaskQueue
 from oos.sim.topology import CarrierId, Topology
 
 
 class ActionType(IntEnum):
-    RELOCATE = 0
-    MULTI_RELOCATE = 1
-    WAIT = 2
+    GOTO = 0
+    TAKE = 1
+    GIVE = 2
+    WAIT = 3
 
 
 @dataclass(frozen=True)
@@ -42,136 +52,26 @@ class ActionEntry:
     """One legal action for the querying carrier.
 
     Field semantics by type:
-      - RELOCATE: src + dst are LocationIds; partner unused
-      - MULTI_RELOCATE: src + dst are LocationIds; partner is the carrier id
-        of the receiving partner (which is locked busy alongside the querying
-        carrier for the full sequence)
-      - WAIT: all fields None. WAIT is not a Command — the env handles it by
-        holding the carrier (see `Facility.wait`), so `to_command` is never
-        called for a WAIT entry.
+      - GOTO: `target` is the destination DockRef (shelf / room / handoff pose).
+      - TAKE / GIVE / WAIT: `target` is None (TAKE/GIVE act on the docked
+        location; WAIT is a hold and is never turned into a Command — the env
+        handles it via `Facility.wait`).
     """
 
     type: ActionType
-    src: Optional[str] = None          # source location id
-    dst: Optional[str] = None          # destination location id
-    partner: Optional[str] = None      # partner carrier id (MULTI_RELOCATE)
+    target: Optional[DockRef] = None
 
     def to_command(self, carrier: CarrierId) -> Command:
-        if self.type == ActionType.RELOCATE:
-            assert self.src is not None and self.dst is not None
-            return Relocate(carrier_id=carrier, src=self.src, dst=self.dst)
-        if self.type == ActionType.MULTI_RELOCATE:
-            assert (
-                self.partner is not None and self.src is not None
-                and self.dst is not None
-            )
-            return MultiRelocate(
-                carrier_id=carrier, partner_id=self.partner,
-                src=self.src, dst=self.dst,
-            )
+        if self.type == ActionType.GOTO:
+            assert self.target is not None
+            return Goto(carrier_id=carrier, target=self.target)
+        if self.type == ActionType.TAKE:
+            return Take(carrier_id=carrier)
+        if self.type == ActionType.GIVE:
+            return Give(carrier_id=carrier)
         raise ValueError(
             f"{self.type} has no Command (WAIT is handled by Facility.wait)"
         )
-
-
-def enumerate_actions(
-    carrier: CarrierId,
-    state: FacilityState,
-    topo: Topology,
-    queue: TaskQueue | None = None,
-) -> list[ActionEntry]:
-    """List every legal action for the given (idle) carrier.
-
-    For RELOCATE we iterate every (src, dst) pair the carrier itself can
-    reach. For MULTI_RELOCATE we additionally iterate every (partner, src,
-    dst) triple where the carrier reaches src, partner reaches dst, and
-    partner is currently idle+empty (so the command can actually lock both).
-
-    The same precondition checks used by the underlying Commands are reused
-    (via `_ok`) so the masker can never surface an action the engine would
-    then reject.
-
-    Customer interactions on rooms remain auto-fired (not policy-chosen).
-    """
-    del queue  # reserved for future task-aware masking; not needed now
-    entries: list[ActionEntry] = []
-    cs = state.carriers[carrier]
-
-    # "Must cleanup" constraint: if the carrier just dropped cargo into a
-    # room that didn't get consumed (junk placement, or store fill awaiting
-    # stow), it is now forced to take that cargo back out. Auto-clears the
-    # field if the room's load vanished for any other reason.
-    forced_src: LocationId | None = None
-    if cs.must_relocate_from is not None:
-        room_id = cs.must_relocate_from
-        if room_id in state.rooms and state.rooms[room_id].load is not None:
-            forced_src = room_id
-        else:
-            cs.must_relocate_from = None
-
-    # RELOCATE: every (src, dst) pair across reachable locations.
-    if cs.load is None:
-        reachable: list[LocationId] = list(topo.accessible_shelves[carrier])
-        reachable.extend(topo.accessible_rooms[carrier])
-        for src in reachable:
-            if forced_src is not None and src != forced_src:
-                continue
-            for dst in reachable:
-                if dst == src:
-                    continue
-                cmd = Relocate(carrier_id=carrier, src=src, dst=dst)
-                if _ok(cmd, state, topo):
-                    entries.append(ActionEntry(
-                        type=ActionType.RELOCATE, src=src, dst=dst,
-                    ))
-
-    # MULTI_RELOCATE: querying carrier picks up from src, partner delivers
-    # to dst. Only enumerable when the partner is free (not executing a
-    # command — a *waiting* partner qualifies and is recruited), empty, and
-    # we're not under the cleanup constraint.
-    if cs.load is None and forced_src is None:
-        my_reachable = list(topo.accessible_shelves[carrier])
-        my_reachable.extend(topo.accessible_rooms[carrier])
-        for partner in topo.handoff_partners[carrier]:
-            ps = state.carriers[partner]
-            if ps.is_busy or ps.load is not None:
-                continue
-            # Partner with an active cleanup obligation (must_relocate_from
-            # pointing at a still-loaded room) cannot be recruited — being
-            # the MultiRelocate partner would let them walk away from the
-            # room without satisfying the constraint. Auto-clear if the room
-            # has been emptied since the flag was set.
-            if ps.must_relocate_from is not None:
-                room_id = ps.must_relocate_from
-                if room_id in state.rooms and state.rooms[room_id].load is not None:
-                    continue
-                ps.must_relocate_from = None
-            partner_reachable: list[LocationId] = list(
-                topo.accessible_shelves[partner]
-            )
-            partner_reachable.extend(topo.accessible_rooms[partner])
-            for src in my_reachable:
-                for dst in partner_reachable:
-                    if dst == src:
-                        continue
-                    cmd = MultiRelocate(
-                        carrier_id=carrier, partner_id=partner,
-                        src=src, dst=dst,
-                    )
-                    if _ok(cmd, state, topo):
-                        entries.append(ActionEntry(
-                            type=ActionType.MULTI_RELOCATE,
-                            partner=partner, src=src, dst=dst,
-                        ))
-
-    # WAIT: always legal. Carrier sits out this decision instant and gets
-    # re-queried after any scheduler event fires. Crucially WAIT is allowed
-    # even when must_relocate_from is active — the carrier may legitimately
-    # want to idle at the room (e.g., parked with an empty pallet waiting
-    # for a Store to arrive and fill it). The constraint only restricts the
-    # carrier's *next Relocate* to src=room, not whether it must act now.
-    entries.append(ActionEntry(type=ActionType.WAIT))
-    return entries
 
 
 def _ok(cmd: Command, state: FacilityState, topo: Topology) -> bool:
@@ -180,6 +80,83 @@ def _ok(cmd: Command, state: FacilityState, topo: Topology) -> bool:
         return True
     except Exception:
         return False
+
+
+def _room_goto_allowed(cs, retrieve_targets: set) -> bool:
+    """A carrier may GOTO a room only while holding something servable there:
+    an empty pallet (to stage / fill a store) or the requested retrieve target
+    (to deliver). Empty-handed and non-requested loaded carriers are masked —
+    a room is not storage, so any other approach just wastes the dock."""
+    load = cs.load
+    if load is None:
+        return False
+    return load.is_empty or load.id in retrieve_targets
+
+
+def _is_immediate_inverse(cs, kind: str) -> bool:
+    """True iff the carrier's last TAKE/GIVE was `kind` at the location it is
+    still docked at — i.e. the candidate would immediately undo it. Cleared by
+    a GOTO (the carrier moved away), so this only fires without an intervening
+    move."""
+    ltg = cs.last_take_give
+    return ltg is not None and ltg[0] == kind and ltg[1] == cs.docked_at
+
+
+def enumerate_actions(
+    carrier: CarrierId,
+    state: FacilityState,
+    topo: Topology,
+    queue: TaskQueue | None = None,
+) -> list[ActionEntry]:
+    """List every legal action for the given (idle) carrier, in canonical order.
+
+    Each candidate primitive is validated against the same `check_preconditions`
+    the engine uses (`_ok`), so the mask can never surface an action the engine
+    would reject. Two policy gates are layered on top of physical legality:
+      - a room GOTO is only offered when the held load is servable there
+        (`_room_goto_allowed`);
+      - a TAKE/GIVE that would immediately undo the carrier's last TAKE/GIVE at
+        the same dock is suppressed (`_is_immediate_inverse`).
+    """
+    entries: list[ActionEntry] = []
+    cs = state.carriers[carrier]
+    retrieve_targets = (
+        {t.pallet for t in queue.pending if isinstance(t, Retrieve)}
+        if queue is not None else set()
+    )
+
+    # GOTO — every reachable location node: shelves, rooms, handoff poses
+    # (a pose is addressed by the partner carrier id).
+    targets: list[DockRef] = []
+    for sid in topo.accessible_shelves[carrier]:
+        targets.append(DockRef("shelf", sid))
+    for rid in topo.accessible_rooms[carrier]:
+        targets.append(DockRef("room", rid))
+    for pid in topo.handoff_partners[carrier]:
+        targets.append(DockRef("handoff", pid))
+    for target in targets:
+        if cs.docked_at is not None and target == cs.docked_at:
+            continue  # already docked there — a no-op move
+        if target.kind == "room" and not _room_goto_allowed(cs, retrieve_targets):
+            continue
+        if _ok(Goto(carrier_id=carrier, target=target), state, topo):
+            entries.append(ActionEntry(type=ActionType.GOTO, target=target))
+
+    # TAKE — 0 or 1, from the docked shelf or a waiting partner.
+    if _ok(Take(carrier_id=carrier), state, topo) and not _is_immediate_inverse(
+        cs, "give"
+    ):
+        entries.append(ActionEntry(type=ActionType.TAKE))
+
+    # GIVE — 0 or 1, onto the docked shelf.
+    if _ok(Give(carrier_id=carrier), state, topo) and not _is_immediate_inverse(
+        cs, "take"
+    ):
+        entries.append(ActionEntry(type=ActionType.GIVE))
+
+    # WAIT — always legal, always last.
+    entries.append(ActionEntry(type=ActionType.WAIT))
+    return entries
 
 
 class ActionDecoder:
@@ -206,30 +183,17 @@ class ActionDecoder:
 
 
 def max_actions_per_carrier(topo: Topology) -> int:
-    """Conservative upper bound on legal actions a carrier could ever have.
+    """Conservative upper bound on legal actions a carrier could ever have:
 
-    Breakdown per querying carrier C:
-      - RELOCATE: |reachable_C|^2 ordered (src, dst) pairs
-      - MULTI_RELOCATE: for each handoff partner P, |reachable_C| × |reachable_P|
-      - WAIT: 1
+      - GOTO: |accessible shelves| + |accessible rooms| + |handoff partners|
+      - TAKE: 1   - GIVE: 1   - WAIT: 1
     """
     max_n = 0
     for cid in topo.carriers:
-        my_reach = (
+        n_goto = (
             len(topo.accessible_shelves[cid])
             + len(topo.accessible_rooms[cid])
+            + len(topo.handoff_partners[cid])
         )
-        multi_relocate = 0
-        for partner in topo.handoff_partners[cid]:
-            p_reach = (
-                len(topo.accessible_shelves[partner])
-                + len(topo.accessible_rooms[partner])
-            )
-            multi_relocate += my_reach * p_reach
-        n = (
-            my_reach * max(0, my_reach - 1)  # single-carrier relocate
-            + multi_relocate                  # multi-carrier via handoff
-            + 1                               # wait
-        )
-        max_n = max(max_n, n)
+        max_n = max(max_n, n_goto + 3)
     return max_n

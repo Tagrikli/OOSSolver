@@ -149,13 +149,49 @@ def generate_single_task(
     )
     agent.facility = new_env
     agent.policy = prev_policy   # keep the loaded policy (was wrongly reset to random_policy)
-    # Fresh seed per Generate — without this every press would produce the
-    # same RNG stream and the same layout.
-    import secrets
-    agent.seed = secrets.randbits(31)
+    # Seed: an explicit `_seed` (e.g. decoded from an episode code) reproduces
+    # that exact layout; otherwise a fresh random seed per Generate — without
+    # which every press would produce the same RNG stream and the same layout.
+    seed = params.get("_seed")
+    if seed is not None:
+        agent.seed = int(seed)
+    else:
+        import secrets
+        agent.seed = secrets.randbits(31)
     agent.reset()
     agent.facility.set_auto_arrivals(preserve_auto)
     toasts.success("GENERATED single-task initial state", lifetime=3.0)
+    return True
+
+
+def load_episode_code(
+    code_text: str,
+    facility_name: str,
+    randomize_content,
+    pending_generate: list,
+    toasts: ToastManager,
+) -> bool:
+    """Decode an episode code (from the training terminal) and queue a Generate
+    that reproduces its EXACT initial layout — the decoded level knobs plus the
+    `_seed` that pins the RNG. Reflects the knobs in the RANDOMIZE panel too.
+    Returns True if queued, False on a malformed or foreign-facility code."""
+    from oos.sim.episode_code import decode_episode
+    try:
+        dec = decode_episode(code_text)
+    except ValueError as e:
+        toasts.error(f"BAD EPISODE CODE: {e}"[:80])
+        return False
+    if dec["facility"] != facility_name:
+        toasts.error(
+            f"CODE IS FOR '{dec['facility']}' — press f to switch facility first"[:80]
+        )
+        return False
+    params = dict(dec["params"])
+    params["_seed"] = dec["seed"]            # honored by generate_single_task
+    if randomize_content is not None:
+        randomize_content.set_values(params)  # reflect the loaded knobs in the panel
+    pending_generate.append(params)
+    toasts.success(f"EPISODE CODE LOADED  (seed {dec['seed']})", lifetime=3.0)
     return True
 
 

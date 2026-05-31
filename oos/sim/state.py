@@ -5,11 +5,27 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-from oos.sim.topology import CarrierId, Position, RoomId, ShelfId, SizeClass
+from oos.sim.topology import CarrierId, Position, ShelfId, SizeClass
 
 SimTime = float
 PalletId = int
 PalletContents = Literal["empty", "small", "big"]
+DockKind = Literal["shelf", "room", "handoff"]
+
+
+@dataclass(frozen=True)
+class DockRef:
+    """Identifies where a carrier is docked, and what a GOTO targets.
+
+    - kind == "shelf"   : `id` is a ShelfId.
+    - kind == "room"    : `id` is a RoomId.
+    - kind == "handoff" : `id` is the PARTNER carrier id. A carrier has exactly
+      one handoff pose per partner, so the partner id names that pose
+      unambiguously (resolve to a position via handoff_positions[(self, id)]).
+    """
+
+    kind: DockKind
+    id: str
 
 
 @dataclass(frozen=True)
@@ -51,28 +67,32 @@ class CarrierState:
     command_started_at: Optional[SimTime] = None
     command_start_position: Optional[Position] = None
     current_command: Optional["object"] = None  # Command; avoid import cycle
-    # When the carrier finishes a Relocate-to-room and the room still holds
-    # cargo (didn't get consumed by the auto-serve), this is set to that
-    # room id. While set, enumerate_actions only emits Relocate entries with
-    # src=must_relocate_from for this carrier — forcing immediate cleanup
-    # and preventing the room from being used as temporary storage. Cleared
-    # when a Relocate-from-that-room completes, or when the room's load
-    # vanishes for any other reason. Wiped on shuffle/reset.
-    must_relocate_from: Optional[str] = None
-    # WAIT state. A carrier is either *busy* (executing a Relocate/
-    # MultiRelocate — `current_command is not None`) or *waiting* (doing
-    # nothing — `current_command is None`). There is no separate "idle"
-    # notion: not-busy == waiting. `waiting` records that the carrier has
-    # *chosen* WAIT and is holding until the next state change re-opens its
-    # decision; a waiting carrier stays recruitable as a handoff partner
-    # (it is not busy) but is not re-queried until something changes. Reset
-    # to False on any state-changing event (see `Facility.wake_waiting_carriers`).
+    # Where the carrier is currently docked. Set when a GOTO completes; None
+    # while in transit (a GOTO submits before it arrives) or before the first
+    # GOTO. This is what TAKE/GIVE act on, and it disambiguates up/down shelves
+    # that share a track position — `position` (mm) alone cannot. Wiped on
+    # shuffle/reset.
+    docked_at: Optional[DockRef] = None
+    # The carrier's most recent TAKE or GIVE, as (kind, where) with kind in
+    # {"take", "give"}. Used by the masker to forbid an *immediate* inverse on
+    # the same target (take-then-give-back / give-then-take-back). Set by
+    # TAKE/GIVE, CLEARED by GOTO (the carrier moved away), left untouched by
+    # WAIT (so a take→wait→give-back loophole stays closed).
+    last_take_give: Optional[tuple[str, "DockRef"]] = None
+    # WAIT state. A carrier is either *busy* (executing a primitive —
+    # `current_command is not None`) or *waiting* (`current_command is None`).
+    # There is no separate "idle" notion: not-busy == waiting. `waiting` records
+    # that the carrier has *chosen* WAIT and is holding until the next state
+    # change re-opens its decision; a waiting carrier stays recruitable as a
+    # handoff partner (it is not busy) but is not re-queried until something
+    # changes. Reset to False on any state-changing event (see
+    # `Facility.wake_waiting_carriers`).
     waiting: bool = False
 
     @property
     def is_busy(self) -> bool:
-        """True iff executing a command (Relocate/MultiRelocate). A waiting
-        carrier is NOT busy — it can be recruited as a handoff partner."""
+        """True iff executing a primitive (GOTO/TAKE/GIVE). A waiting carrier is
+        NOT busy — it can be recruited as a handoff partner."""
         return self.current_command is not None
 
 
@@ -89,23 +109,19 @@ class ShelfState:
 
 
 @dataclass
-class RoomState:
-    """A room is a 1-capacity virtual shelf in the unified-action model.
-
-    A carrier delivers a pallet to a room via Relocate (treating the room as
-    the destination); the pallet sits in `load` until the customer interaction
-    fires (instantly), which either consumes it (retrieve: load → None) or
-    mutates its contents in place (store: empty → size). After the interaction
-    the carrier is free to walk away; another Relocate can take the pallet
-    out of `load` later.
-    """
-
-    load: Optional[Pallet] = None
-
-
-@dataclass
 class FacilityState:
     time: SimTime
     carriers: dict[CarrierId, CarrierState]
     shelves: dict[ShelfId, ShelfState]
-    rooms: dict[RoomId, RoomState]
+
+
+def pallet_depth(state: "FacilityState", pallet_id: PalletId) -> int:
+    """Burial depth of a pallet in its shelf stack — 0 = top of stack (`stack[-1]`),
+    increasing downward. Returns 0 if the pallet is not on a shelf (held by a
+    carrier). Used to capture a Retrieve's `initial_depth` at request time."""
+    for ss in state.shelves.values():
+        n = len(ss.stack)
+        for i, p in enumerate(ss.stack):
+            if p.id == pallet_id:
+                return n - 1 - i
+    return 0

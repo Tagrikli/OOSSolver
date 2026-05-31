@@ -222,13 +222,10 @@ class DistributionContent:
         if 0 <= slot_idx < len(entries):
             entry = entries[slot_idx]
             type_name = entry.type.name if hasattr(entry, "type") else "?"
-            src = getattr(entry, "src", None)
-            dst = getattr(entry, "dst", None)
             target = getattr(entry, "target", None)
-            if src is not None and dst is not None:
-                label = f"{type_name}   {src} → {dst}"
-            elif target is not None:
-                label = f"{type_name}   {target}"
+            if target is not None:
+                # GOTO carries a DockRef target (shelf / room / handoff partner).
+                label = f"{type_name}   {target.kind}:{target.id}"
             else:
                 label = type_name
         else:

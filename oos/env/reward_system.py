@@ -58,6 +58,10 @@ class StepEvents:
     # completion counts, with parked-car tagging (see TaskCompletion.agent_delivered)
     n_deliveries: int = 0          # all Retrieve completions this advance
     n_free_deliveries: int = 0     # of those, a car already parked at the room
+    # Σ (initial_depth + 1) over the *real* (agent-delivered) retrieves — the
+    # depth-scaled delivery weight the DeliveryTerm pays on. Equals the real
+    # delivery count when every target was at depth 0.
+    delivery_depth_weight: int = 0
     n_stores_served: int = 0
     # ungated symmetric room transitions (continuous shaping)
     n_room_stage: int = 0
@@ -93,6 +97,11 @@ class RewardContext:
     # that should only pay for *real* retrievals subtract these. 0 until the
     # sim tags it — keeps current behaviour until the parked-car fix lands.
     n_free_deliveries: int = 0
+    # Σ (initial_depth + 1) over the *real* (agent-delivered) retrievals this
+    # step — the DeliveryTerm pays `bonus · delivery_depth_weight`, so a deeper
+    # dig is worth proportionally more. Equals (n_deliveries − n_free_deliveries)
+    # when every target was at depth 0.
+    delivery_depth_weight: int = 0
     success: bool = False          # single-task: the seeded task finished
 
     # --- action / movement cost ---
@@ -113,8 +122,12 @@ class RewardContext:
     # --- env-owned counters / clock (passed in so terms stay pure) ---
     ticks_since_completion: int = 0
     dt: float = 0.0
-    # Discount, for potential-based shaping F = gamma·Φ(s') − Φ(s).
+    # Potential-based shaping F = gamma·Φ(s') − Φ(s). The env computes Φ at the
+    # start (`potential_before`) and end (`potential_after`) of the step; the
+    # PotentialTerm forms the difference. `gamma` should match the trainer's.
     gamma: float = 1.0
+    potential_before: float = 0.0  # Φ(s)
+    potential_after: float = 0.0   # Φ(s')
 
     # --- escape hatches for bespoke terms (read-only live state) ---
     completions: tuple = ()
@@ -177,15 +190,24 @@ class RewardSystem:
 
 
 class DeliveryTerm(RewardTerm):
-    """+bonus per *real* requested-item delivery (excludes parked-car frees)."""
+    """+bonus per *real* requested-item delivery (excludes parked-car frees).
+
+    `scale_by_depth=True` (legacy): pays `bonus · Σ(initial_depth + 1)` — a
+    depth-2 target pays 3·bonus. `scale_by_depth=False` (the continuous reward):
+    pays a FLAT `bonus` per delivery, because the depth incentive already lives
+    in the retrieval-progress potential, so scaling it here too would
+    double-count."""
     label = "DELIVER"
 
-    def __init__(self, bonus: float) -> None:
+    def __init__(self, bonus: float, scale_by_depth: bool = True) -> None:
         self.bonus = bonus
+        self.scale_by_depth = scale_by_depth
 
     def compute(self, ctx: RewardContext) -> float:
-        real = ctx.n_deliveries - ctx.n_free_deliveries
-        return self.bonus * real if real > 0 else 0.0
+        if self.scale_by_depth:
+            return self.bonus * ctx.delivery_depth_weight if ctx.delivery_depth_weight > 0 else 0.0
+        n = ctx.n_deliveries - ctx.n_free_deliveries
+        return self.bonus * n if n > 0 else 0.0
 
 
 class ServeTerm(RewardTerm):
@@ -329,34 +351,27 @@ class IdleWithRetrieveTerm(RewardTerm):
         return -self.penalty if ctx.idle_with_retrieve else 0.0
 
 
-# Type of a potential function Φ: facility state → scalar.
-Potential = Any  # Callable[[state], float]
-
-
 class PotentialTerm(RewardTerm):
     """Potential-based shaping: `F = gamma·Φ(s') − Φ(s)`.
 
     Policy-invariant (Ng, Harada & Russell 1999): adding this *cannot* change
     the optimal policy, so — unlike a hand-tuned bonus — it can't open a new
-    reward exploit. It only reshapes credit assignment toward states with
-    higher potential. The term is pure: it reads both states + γ from the
-    context and computes the whole difference itself (no remembered Φ).
+    reward exploit. It only reshapes credit assignment toward higher-potential
+    states. Over any trajectory the shaping telescopes to a constant, so it is a
+    *guide*, never the objective — it must sit alongside a real outcome reward
+    (e.g. DELIVER).
 
-    Provide a potential `Φ(state) -> float`. The default returns 0 → a no-op
-    placeholder you can leave plugged in until you design a real Φ. A real Φ
-    requires the env to populate `ctx.state_before`; with the default Φ it's
-    never read, so nothing is snapshotted until you actually use shaping.
+    The env computes Φ(s) and Φ(s') (it owns the state→potential mapping and the
+    pre/post timing across an advance) and passes them as the scalars
+    `ctx.potential_before` / `ctx.potential_after`; this term just forms the
+    discounted difference. Both default to 0 → a no-op until shaping is enabled.
     """
 
-    def __init__(self, potential: Potential = None, label: str = "SHAPE") -> None:
-        self.potential = potential if potential is not None else (lambda _state: 0.0)
+    def __init__(self, label: str = "SHAPE") -> None:
         self.label = label
 
     def compute(self, ctx: RewardContext) -> float:
-        if ctx.state is None or ctx.state_before is None:
-            return 0.0
-        return ctx.gamma * float(self.potential(ctx.state)) \
-            - float(self.potential(ctx.state_before))
+        return ctx.gamma * ctx.potential_after - ctx.potential_before
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -396,13 +411,20 @@ def single_task_system(cfg: Any) -> RewardSystem:
 
 
 def base_system(cfg: Any) -> RewardSystem:
-    """Build the base (advance-path) reward suite from a `RewardConfig`.
-    (DELIVER was labelled RETRIEVE in the old base path — same value.)"""
+    """The continuous-training reward: two pump-safe outcome rewards over the
+    three-term PBRS potential (which `Environment._potential` supplies via
+    `ctx.potential_before/after`).
+
+      - DELIVER (flat) — per requested item delivered; depth is rewarded by the
+        retrieval-progress potential, not here.
+      - SERVE          — per store served onto a staged empty.
+      - SHAPE (PBRS)   — γ·Φ(s′) − Φ(s) over the retrieval / room-ready /
+        wrong-car potential. Pump-safe: staging is a potential (a leave-return
+        telescopes to a net loss under γ), and the flat payouts each consume a
+        queued customer.
+    """
     return RewardSystem([
-        DeliveryTerm(cfg.reward_retrieve),
-        StageTerm(cfg.reward_stage_room),
-        UnstageTerm(cfg.penalty_unstage_room),
-        WrongItemTerm(cfg.penalty_wrong_item_to_room),
-        IdleWithRetrieveTerm(cfg.penalty_idle_with_retrieve),
-        MovementTerm(cfg.movement_weight),
+        DeliveryTerm(cfg.reward_deliver, scale_by_depth=False),
+        ServeTerm(cfg.reward_serve),
+        PotentialTerm(),
     ])

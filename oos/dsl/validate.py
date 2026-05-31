@@ -195,7 +195,7 @@ def validate(fac: "Facility") -> None:
 
     if not fac._seeding:
         raise FacilityValidationError(
-            "no empty pallets seeded; rooms cannot be staged"
+            "no empty pallets seeded; a carrier cannot stage an empty at a room"
         )
 
     # --- handoff chain depth ----------------------------------------------

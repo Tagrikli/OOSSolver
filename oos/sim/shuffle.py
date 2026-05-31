@@ -118,7 +118,7 @@ def _place_pallets(
     Mutates facility.state in place. Idempotent across calls — wipes prior
     state at the top of each invocation.
     """
-    # 2. Wipe dynamic state. Full reset of carriers, rooms, shelves, and the
+    # 2. Wipe dynamic state. Full reset of carriers + shelves and the
     #    scheduler so we don't leave stale in-flight commands or pending
     #    events that would crash on the post-shuffle world.
     for ss in facility.state.shelves.values():
@@ -129,9 +129,9 @@ def _place_pallets(
         cs.busy_until = None
         cs.command_started_at = None
         cs.command_start_position = None
-        cs.must_relocate_from = None
-    for rs in facility.state.rooms.values():
-        rs.load = None
+        cs.docked_at = None
+        cs.last_take_give = None
+        cs.waiting = False
     facility.scheduler = Scheduler()
     if facility.auto_arrivals_enabled:
         facility._schedule_next_arrival()

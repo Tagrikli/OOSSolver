@@ -1,40 +1,38 @@
 """Action primitives. Each command has preconditions and start/complete hooks.
 
-Unified-action model (no more separate Take / Give / MoveToRoom): the only
-"movement of stuff" command is `Relocate`, which atomically pops a pallet
-from a source location and places it at a destination location. Both source
-and destination can be either a real shelf (`ShelfId`) or a room (`RoomId`,
-treated as a 1-capacity virtual shelf via `RoomState.load`).
+Primitive-action model. The policy chooses exactly one short primitive per
+decision for the querying carrier:
+
+  - Goto(carrier, target)  — move to one of the carrier's connected locations:
+    a specific shelf, a room, or a handoff pose (`target` is a `DockRef`). On
+    completion the carrier is *docked* at that location. Up/down shelves sharing
+    a track position are distinct targets (distinct shelf ids).
+  - Take(carrier)          — pick up the top pallet of the docked shelf, OR
+    receive an item from a partner WAITing at the matching handoff pose (the
+    carrier->carrier transfer). Requires the carrier to hold nothing.
+  - Give(carrier)          — place the held pallet onto the docked shelf
+    (size-class + capacity checked). Requires the carrier to hold an item.
+    Shelves only — never rooms, never partners.
+  - WAIT is not a Command. A carrier choosing WAIT holds in place (see
+    `Facility.wait`), which is also where the store/retrieve customer
+    interaction fires when the carrier is docked at a room holding the matching
+    load.
 
 Auto-driven side-effects:
-  - Customer interactions fire from facility when `room.load` matches a
-    pending task (Retrieve: consume the pallet; Store: mutate its contents).
-  - Handoffs fire from facility when two carriers are co-located at matching
-    handoff poses with compatible loads.
-
-Policy-visible Commands:
-  - Relocate(carrier, src, dst)  — the one workhorse
-  - MoveToPartner(carrier, partner)  — positions for an upcoming auto-handoff
-  - (WAIT is not a Command — a carrier choosing WAIT just holds in place;
-     see `Facility.wait` / `CarrierState.waiting`)
-  - (Move is still used internally by the viz for free-form positioning)
-  - (Handoff is constructed by facility, never by the policy)
+  - Customer interactions fire from `Facility.wait` when a carrier is docked at
+    a room, WAITing, and holding the matching load (store fills the held empty;
+    retrieve consumes the held target, leaving an empty pallet on the carrier).
+  - The carrier->carrier transfer's passive give is applied inside
+    `Take.complete`; both carriers are locked for the handoff duration and
+    released together (see `Facility.submit` / `Facility._on_command_done`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Union
 
-from oos.sim.state import FacilityState, Pallet, SimTime
-from oos.sim.topology import CarrierId, Position, RoomId, ShelfId, Topology
-
-if TYPE_CHECKING:
-    from oos.sim.durations import DurationModel
-
-
-# A Relocate endpoint is either a real shelf or a room (room = 1-cap virtual shelf).
-LocationId = Union[ShelfId, RoomId]
+from oos.sim.state import DockRef, FacilityState, SimTime
+from oos.sim.topology import CarrierId, Position, Topology
 
 
 class PreconditionError(ValueError):
@@ -42,114 +40,68 @@ class PreconditionError(ValueError):
 
 
 # ---------------------------------------------------------------------------
-# Location helpers — uniform read/write for the (shelf | room) endpoint space
+# Dock helpers — resolve a DockRef to a position / reachability for a carrier
 # ---------------------------------------------------------------------------
 
 
-def _location_position(loc: LocationId, carrier: CarrierId, topo: Topology) -> Position:
-    """Where the carrier physically sits when interacting with this location."""
-    if loc in topo.shelves:
-        return topo.shelves[loc].position_for[carrier]
-    if loc in topo.rooms:
-        return topo.rooms[loc].position
-    raise PreconditionError(f"unknown location {loc!r}")
+def _dockref_position(ref: DockRef, carrier: CarrierId, topo: Topology) -> Position:
+    """Where the carrier physically sits when docked at `ref`."""
+    if ref.kind == "shelf":
+        return topo.shelves[ref.id].position_for[carrier]
+    if ref.kind == "room":
+        return topo.rooms[ref.id].position
+    if ref.kind == "handoff":
+        # ref.id is the partner carrier id; this carrier's own pose toward it.
+        return topo.handoff_positions[(carrier, ref.id)][0]
+    raise PreconditionError(f"unknown dock kind {ref.kind!r}")
 
 
-def _location_top_pallet(loc: LocationId, state: FacilityState) -> "Pallet | None":
-    """Topmost pallet at this location (room.load or shelf.stack[-1]), or None."""
-    if loc in state.shelves:
-        ss = state.shelves[loc]
-        return ss.stack[-1] if ss.stack else None
-    if loc in state.rooms:
-        return state.rooms[loc].load
-    return None
-
-
-def _location_has_capacity_for(
-    loc: LocationId, pallet: Pallet, state: FacilityState, topo: Topology,
-    pending_dst_count: int,
-) -> bool:
-    """True if `loc` can accept `pallet` after accounting for pending drops."""
-    if loc in topo.shelves:
-        s = topo.shelves[loc]
-        ss = state.shelves[loc]
-        effective_depth = ss.depth + pending_dst_count
-        if effective_depth >= s.capacity:
-            return False
-        return s.accepts(pallet.size_for_shelf)
-    if loc in topo.rooms:
-        # Rooms have capacity exactly 1. Any pending drop fills the room.
-        if state.rooms[loc].load is not None:
-            return False
-        if pending_dst_count > 0:
-            return False
-        return True
+def _carrier_reaches_dock(ref: DockRef, carrier: CarrierId, topo: Topology) -> bool:
+    if ref.kind == "shelf":
+        s = topo.shelves.get(ref.id)
+        return s is not None and carrier in s.access
+    if ref.kind == "room":
+        return ref.id in topo.accessible_rooms[carrier]
+    if ref.kind == "handoff":
+        return ref.id in topo.handoff_partners[carrier]
     return False
 
 
-def _carrier_reaches(loc: LocationId, carrier: CarrierId, topo: Topology) -> bool:
-    if loc in topo.shelves:
-        return carrier in topo.shelves[loc].access
-    if loc in topo.rooms:
-        # The carrier must serve the room (only the served_by carrier can
-        # interact). accessible_rooms[carrier] mirrors this.
-        return loc in topo.accessible_rooms[carrier]
-    return False
-
-
-def _pop_top_pallet(loc: LocationId, state: FacilityState) -> Pallet:
-    """Remove and return the topmost pallet at `loc`. Caller has checked non-empty."""
-    if loc in state.shelves:
-        return state.shelves[loc].stack.pop()
-    rs = state.rooms[loc]
-    p = rs.load
-    assert p is not None
-    rs.load = None
-    return p
-
-
-def _push_pallet(loc: LocationId, pallet: Pallet, state: FacilityState) -> None:
-    """Place `pallet` at the topmost position of `loc`. Caller has checked capacity."""
-    if loc in state.shelves:
-        state.shelves[loc].stack.append(pallet)
-        return
-    rs = state.rooms[loc]
-    assert rs.load is None
-    rs.load = pallet
-
-
 # ---------------------------------------------------------------------------
-# Pending counts — used in precondition checks to handle in-flight commands
+# Pending reservations — a shelf top claimed by an in-flight Take, or a shelf
+# slot reserved by an in-flight Give. Replaces the macro src/dst reservations;
+# prevents two carriers double-booking a shared/transfer shelf.
 # ---------------------------------------------------------------------------
 
 
-def _pending_commands(state: FacilityState):
-    """Iterate every in-flight Command exactly once, regardless of how many
-    carriers reference it. MultiRelocate sets the same Command on both A and
-    B's current_command; without deduplication we'd double-count it."""
-    seen: set[int] = set()
-    for cs in state.carriers.values():
-        cmd = cs.current_command
-        if cmd is None or id(cmd) in seen:
-            continue
-        seen.add(id(cmd))
-        yield cmd
-
-
-def _pending_src_count(state: FacilityState, loc: LocationId) -> int:
-    """Number of in-flight Relocate/MultiRelocate commands that will pop from `loc`."""
+def _pending_take_count(state: FacilityState, shelf_id: str) -> int:
+    """In-flight Takes popping from `shelf_id` (counts the taker docked there)."""
     n = 0
-    for cmd in _pending_commands(state):
-        if isinstance(cmd, (Relocate, MultiRelocate)) and cmd.src == loc:
+    for cid, cs in state.carriers.items():
+        cmd = cs.current_command
+        if (
+            isinstance(cmd, Take)
+            and cmd.carrier_id == cid
+            and cs.docked_at is not None
+            and cs.docked_at.kind == "shelf"
+            and cs.docked_at.id == shelf_id
+        ):
             n += 1
     return n
 
 
-def _pending_dst_count(state: FacilityState, loc: LocationId) -> int:
-    """Number of in-flight Relocate/MultiRelocate commands that will place at `loc`."""
+def _pending_give_count(state: FacilityState, shelf_id: str) -> int:
+    """In-flight Gives pushing onto `shelf_id`."""
     n = 0
-    for cmd in _pending_commands(state):
-        if isinstance(cmd, (Relocate, MultiRelocate)) and cmd.dst == loc:
+    for cid, cs in state.carriers.items():
+        cmd = cs.current_command
+        if (
+            isinstance(cmd, Give)
+            and cmd.carrier_id == cid
+            and cs.docked_at is not None
+            and cs.docked_at.kind == "shelf"
+            and cs.docked_at.id == shelf_id
+        ):
             n += 1
     return n
 
@@ -171,75 +123,23 @@ class Command:
         raise NotImplementedError
 
     def start(
-        self, state: FacilityState, topo: Topology, durations: "DurationModel", now: SimTime
-    ) -> SimTime:
-        raise NotImplementedError
-
-    def complete(self, state: FacilityState, topo: Topology) -> None:
-        raise NotImplementedError
-
-
-# ---------------------------------------------------------------------------
-# Move — free-form positioning, internal/viz use only (not surfaced to policy)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Move(Command):
-    carrier_id: CarrierId
-    target: Position
-
-    @property
-    def carrier(self) -> CarrierId:
-        return self.carrier_id
-
-    def check_preconditions(self, state: FacilityState, topo: Topology) -> None:
-        c = topo.carriers.get(self.carrier_id)
-        if c is None:
-            raise PreconditionError(f"unknown carrier {self.carrier_id}")
-        if not c.valid_position(self.target):
-            raise PreconditionError(
-                f"move target {self.target} out of range for {self.carrier_id}"
-            )
-        cs = state.carriers[self.carrier_id]
-        if cs.is_busy:
-            raise PreconditionError(f"carrier {self.carrier_id} is busy")
-
-    def start(
         self, state: FacilityState, topo: Topology, durations, now: SimTime
     ) -> SimTime:
-        cs = state.carriers[self.carrier_id]
-        dur = durations.move(topo.carriers[self.carrier_id], cs.position, self.target)
-        return now + dur
+        raise NotImplementedError
 
     def complete(self, state: FacilityState, topo: Topology) -> None:
-        state.carriers[self.carrier_id].position = self.target
+        raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
-# Relocate — the one workhorse policy action for moving pallets
+# Goto — move the carrier to a connected location node and dock there
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class Relocate(Command):
-    """Atomically take a pallet from `src` and place it at `dst`.
-
-    Both endpoints can be ShelfId or RoomId. The carrier is busy for the full
-    duration: move_to_src + take_op + move_to_dst + place_op. During execution
-    the pallet conceptually sits on the carrier; in state terms, it remains
-    on `src` (decremented via pending_src_count) and `dst` is reserved (via
-    pending_dst_count). On `complete()` the state mutates atomically — the
-    pallet leaves `src` and lands at `dst`.
-
-    Room semantics: when `dst` is a room, the pallet ends up in `room.load`,
-    which the facility's auto-serve will inspect to decide whether to fire a
-    customer interaction (Retrieve consumes, Store mutates contents).
-    """
-
+class Goto(Command):
     carrier_id: CarrierId
-    src: LocationId
-    dst: LocationId
+    target: DockRef
 
     @property
     def carrier(self) -> CarrierId:
@@ -247,46 +147,11 @@ class Relocate(Command):
 
     def check_preconditions(self, state: FacilityState, topo: Topology) -> None:
         cs = state.carriers[self.carrier_id]
-        if cs.load is not None:
-            raise PreconditionError(
-                f"carrier {self.carrier_id} is loaded; only Relocate-empty supported"
-            )
         if cs.is_busy:
             raise PreconditionError(f"carrier {self.carrier_id} is busy")
-        if self.src == self.dst:
-            raise PreconditionError("relocate src and dst must differ")
-        # Endpoint existence.
-        if self.src not in topo.shelves and self.src not in topo.rooms:
-            raise PreconditionError(f"unknown relocate source {self.src!r}")
-        if self.dst not in topo.shelves and self.dst not in topo.rooms:
-            raise PreconditionError(f"unknown relocate destination {self.dst!r}")
-        # Carrier reaches both endpoints.
-        if not _carrier_reaches(self.src, self.carrier_id, topo):
+        if not _carrier_reaches_dock(self.target, self.carrier_id, topo):
             raise PreconditionError(
-                f"carrier {self.carrier_id} cannot access {self.src}"
-            )
-        if not _carrier_reaches(self.dst, self.carrier_id, topo):
-            raise PreconditionError(
-                f"carrier {self.carrier_id} cannot access {self.dst}"
-            )
-        # Source has a pallet available (after subtracting pending takes).
-        top = _location_top_pallet(self.src, state)
-        if top is None:
-            raise PreconditionError(f"location {self.src} is empty")
-        if self.src in state.shelves:
-            ss = state.shelves[self.src]
-            effective_depth = ss.depth - _pending_src_count(state, self.src)
-            if effective_depth <= 0:
-                raise PreconditionError(f"location {self.src} is empty (effective)")
-        else:
-            # Room as src: a pending Relocate already claimed it.
-            if _pending_src_count(state, self.src) > 0:
-                raise PreconditionError(f"location {self.src} is empty (effective)")
-        # Destination has capacity for `top` (after accounting for pending drops).
-        pdst = _pending_dst_count(state, self.dst)
-        if not _location_has_capacity_for(self.dst, top, state, topo, pdst):
-            raise PreconditionError(
-                f"location {self.dst} cannot accept pallet (size or capacity)"
+                f"carrier {self.carrier_id} cannot reach {self.target}"
             )
 
     def start(
@@ -294,191 +159,162 @@ class Relocate(Command):
     ) -> SimTime:
         cs = state.carriers[self.carrier_id]
         c = topo.carriers[self.carrier_id]
-        src_pos = _location_position(self.src, self.carrier_id, topo)
-        dst_pos = _location_position(self.dst, self.carrier_id, topo)
-        # Time = travel-to-src + take-op + travel-to-dst + place-op.
-        # Shelf op durations use the shelf's row; rooms have no shelf-op cost
-        # (the customer-interaction delay is scheduled separately by facility).
-        take_op = durations.shelf_op("take", topo.shelves[self.src]) if self.src in topo.shelves else 0.0
-        place_op = durations.shelf_op("give", topo.shelves[self.dst]) if self.dst in topo.shelves else 0.0
-        total = (
-            durations.move(c, cs.position, src_pos)
-            + take_op
-            + durations.move(c, src_pos, dst_pos)
-            + place_op
-        )
-        return now + total
+        # In transit: undock and clear the immediate-inverse guard (the carrier
+        # is moving away from wherever it was).
+        cs.docked_at = None
+        cs.last_take_give = None
+        dst = _dockref_position(self.target, self.carrier_id, topo)
+        return now + durations.move(c, cs.position, dst)
 
     def complete(self, state: FacilityState, topo: Topology) -> None:
         cs = state.carriers[self.carrier_id]
-        dst_pos = _location_position(self.dst, self.carrier_id, topo)
-        # Atomic transfer.
-        pallet = _pop_top_pallet(self.src, state)
-        _push_pallet(self.dst, pallet, state)
-        cs.position = dst_pos
-        # No carrier load — pallet went directly from src to dst.
-        cs.load = None
+        cs.position = _dockref_position(self.target, self.carrier_id, topo)
+        cs.docked_at = self.target
 
 
 # ---------------------------------------------------------------------------
-# MultiRelocate — atomic two-carrier relocate via synchronized handoff
+# Take — pick up from the docked shelf, or receive from a waiting partner
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class MultiRelocate(Command):
-    """Atomic two-carrier relocate via a synchronized handoff.
-
-    Carrier A picks up from `src`, travels to its handoff pose with partner B;
-    B travels in parallel to its handoff pose with A; when both arrive, the
-    pallet transfers (instant); B then delivers to `dst`. Both carriers are
-    locked busy for the entire sequence. From the policy's perspective this
-    is a single atomic action — there is no half-committed state where a
-    deadlock could form.
-
-    Wall-clock duration:
-        max(A's pickup+travel, B's travel-to-pose) + handoff_op
-                                  + B's travel-to-dst + give_op
-    """
-
-    carrier_id: CarrierId     # A — picker
-    partner_id: CarrierId     # B — deliverer
-    src: LocationId           # source A reaches
-    dst: LocationId           # destination B reaches
+class Take(Command):
+    carrier_id: CarrierId
 
     @property
     def carrier(self) -> CarrierId:
         return self.carrier_id
 
-    def _handoff_positions(self, topo: Topology) -> tuple[Position, Position] | None:
-        pair = (self.carrier_id, self.partner_id)
-        if pair in topo.handoff_positions:
-            return topo.handoff_positions[pair]
+    def partner_to_receive_from(
+        self, state: FacilityState, topo: Topology
+    ) -> "CarrierId | None":
+        """If docked at a handoff pose whose paired partner is WAITing there
+        holding an item ready to give, return that partner id; else None."""
+        cs = state.carriers[self.carrier_id]
+        d = cs.docked_at
+        if d is None or d.kind != "handoff":
+            return None
+        partner_id = d.id
+        ps = state.carriers.get(partner_id)
+        if ps is None:
+            return None
+        pd = ps.docked_at
+        if (
+            ps.waiting
+            and not ps.is_busy
+            and ps.load is not None
+            and pd is not None
+            and pd.kind == "handoff"
+            and pd.id == self.carrier_id
+        ):
+            return partner_id
         return None
 
     def check_preconditions(self, state: FacilityState, topo: Topology) -> None:
-        if self.carrier_id == self.partner_id:
-            raise PreconditionError("multi-relocate requires two distinct carriers")
-        if (self.carrier_id not in topo.carriers
-                or self.partner_id not in topo.carriers):
-            raise PreconditionError("unknown carrier in multi-relocate")
-        if self.partner_id not in topo.handoff_partners[self.carrier_id]:
-            raise PreconditionError(
-                f"no handoff edge between {self.carrier_id} and {self.partner_id}"
-            )
-        positions = self._handoff_positions(topo)
-        if positions is None:
-            raise PreconditionError("no handoff positions for this pair")
-        if self.src == self.dst:
-            raise PreconditionError("multi-relocate src and dst must differ")
-        # Endpoint existence.
-        if self.src not in topo.shelves and self.src not in topo.rooms:
-            raise PreconditionError(f"unknown source {self.src!r}")
-        if self.dst not in topo.shelves and self.dst not in topo.rooms:
-            raise PreconditionError(f"unknown destination {self.dst!r}")
-        # Both carriers idle and empty.
-        a_cs = state.carriers[self.carrier_id]
-        b_cs = state.carriers[self.partner_id]
-        if a_cs.is_busy:
+        cs = state.carriers[self.carrier_id]
+        if cs.is_busy:
             raise PreconditionError(f"carrier {self.carrier_id} is busy")
-        if b_cs.is_busy:
-            raise PreconditionError(f"partner {self.partner_id} is busy")
-        if a_cs.load is not None:
-            raise PreconditionError(f"carrier {self.carrier_id} is loaded")
-        if b_cs.load is not None:
-            raise PreconditionError(f"partner {self.partner_id} is loaded")
-        # A reaches src; B reaches dst.
-        if not _carrier_reaches(self.src, self.carrier_id, topo):
+        if cs.load is not None:
             raise PreconditionError(
-                f"carrier {self.carrier_id} cannot access source {self.src}"
+                f"carrier {self.carrier_id} is loaded; TAKE requires it empty"
             )
-        if not _carrier_reaches(self.dst, self.partner_id, topo):
-            raise PreconditionError(
-                f"partner {self.partner_id} cannot access destination {self.dst}"
-            )
-        # Source has a pallet, after subtracting other pending pickups.
-        top = _location_top_pallet(self.src, state)
-        if top is None:
-            raise PreconditionError(f"source {self.src} is empty")
-        if self.src in state.shelves:
-            ss = state.shelves[self.src]
-            if ss.depth - _pending_src_count(state, self.src) <= 0:
-                raise PreconditionError(f"source {self.src} is empty (effective)")
-        elif _pending_src_count(state, self.src) > 0:
-            raise PreconditionError(f"source {self.src} is empty (effective)")
-        # Destination has capacity for the pallet.
-        pdst = _pending_dst_count(state, self.dst)
-        if not _location_has_capacity_for(self.dst, top, state, topo, pdst):
-            raise PreconditionError(
-                f"destination {self.dst} cannot accept pallet"
-            )
+        d = cs.docked_at
+        if d is None:
+            raise PreconditionError(f"carrier {self.carrier_id} is not docked")
+        if d.kind == "shelf":
+            ss = state.shelves.get(d.id)
+            if ss is None:
+                raise PreconditionError(f"unknown shelf {d.id!r}")
+            eff = ss.depth - _pending_take_count(state, d.id)
+            if eff <= 0:
+                raise PreconditionError(f"docked shelf {d.id} is empty (effective)")
+        elif d.kind == "handoff":
+            if self.partner_to_receive_from(state, topo) is None:
+                raise PreconditionError(
+                    "no partner WAITing to hand off at this pose"
+                )
+        else:
+            raise PreconditionError("TAKE only from a shelf or a partner carrier")
 
     def start(
         self, state: FacilityState, topo: Topology, durations, now: SimTime
     ) -> SimTime:
-        a_cs = state.carriers[self.carrier_id]
-        b_cs = state.carriers[self.partner_id]
-        a_car = topo.carriers[self.carrier_id]
-        b_car = topo.carriers[self.partner_id]
-        positions = self._handoff_positions(topo)
-        assert positions is not None
-        a_pose, b_pose = positions
-        src_pos = _location_position(self.src, self.carrier_id, topo)
-        dst_pos = _location_position(self.dst, self.partner_id, topo)
-
-        take_op = (
-            durations.shelf_op("take", topo.shelves[self.src])
-            if self.src in topo.shelves else 0.0
-        )
-        give_op = (
-            durations.shelf_op("give", topo.shelves[self.dst])
-            if self.dst in topo.shelves else 0.0
-        )
-
-        a_pre_handoff = (
-            durations.move(a_car, a_cs.position, src_pos)
-            + take_op
-            + durations.move(a_car, src_pos, a_pose)
-        )
-        b_pre_handoff = durations.move(b_car, b_cs.position, b_pose)
-        sync_time = max(a_pre_handoff, b_pre_handoff)
-
-        b_post_handoff = (
-            durations.move(b_car, b_pose, dst_pos)
-            + give_op
-        )
-
-        total = sync_time + durations.handoff() + b_post_handoff
-        return now + total
+        cs = state.carriers[self.carrier_id]
+        d = cs.docked_at
+        assert d is not None  # guaranteed by check_preconditions
+        if d.kind == "shelf":
+            return now + durations.shelf_op("take", topo.shelves[d.id])
+        return now + durations.handoff()
 
     def complete(self, state: FacilityState, topo: Topology) -> None:
-        a_cs = state.carriers[self.carrier_id]
-        b_cs = state.carriers[self.partner_id]
-        positions = self._handoff_positions(topo)
-        assert positions is not None
-        a_pose, _b_pose = positions
-        dst_pos = _location_position(self.dst, self.partner_id, topo)
-
-        # Atomic pallet transfer src → dst (handoff is internal to this command).
-        pallet = _pop_top_pallet(self.src, state)
-        _push_pallet(self.dst, pallet, state)
-
-        # Final positions: A ends at its handoff pose, B ends at dst.
-        a_cs.position = a_pose
-        b_cs.position = dst_pos
-        a_cs.load = None
-        b_cs.load = None
-        # The cleanup-mask "must_relocate_from" applies if B delivered to a
-        # room and the room is still holding cargo — facility's _on_command_done
-        # checks this after auto-serve runs.
+        cs = state.carriers[self.carrier_id]
+        d = cs.docked_at
+        assert d is not None  # guaranteed by check_preconditions
+        if d.kind == "shelf":
+            ss = state.shelves[d.id]
+            cs.load = ss.stack.pop()
+            cs.last_take_give = ("take", d)
+        else:
+            # Handoff transfer: d.id is the partner; pull its load onto us.
+            partner_id = d.id
+            ps = state.carriers[partner_id]
+            cs.load = ps.load
+            ps.load = None
+            cs.last_take_give = ("take", d)
+            ps.last_take_give = ("give", DockRef("handoff", self.carrier_id))
 
 
 # ---------------------------------------------------------------------------
-# WAIT is no longer a Command. A carrier that chooses WAIT simply holds —
-# it sets `CarrierState.waiting` (see `Facility`) and is not given a
-# `current_command`/`busy_until`, so it stays recruitable as a handoff
-# partner and is only re-queried when a state change re-opens its decision.
+# Give — place the held pallet onto the docked shelf (shelves only)
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Give(Command):
+    carrier_id: CarrierId
+
+    @property
+    def carrier(self) -> CarrierId:
+        return self.carrier_id
+
+    def check_preconditions(self, state: FacilityState, topo: Topology) -> None:
+        cs = state.carriers[self.carrier_id]
+        if cs.is_busy:
+            raise PreconditionError(f"carrier {self.carrier_id} is busy")
+        if cs.load is None:
+            raise PreconditionError(
+                f"carrier {self.carrier_id} holds nothing; GIVE requires an item"
+            )
+        d = cs.docked_at
+        if d is None or d.kind != "shelf":
+            raise PreconditionError("GIVE only onto the docked shelf")
+        shelf = topo.shelves.get(d.id)
+        if shelf is None:
+            raise PreconditionError(f"unknown shelf {d.id!r}")
+        ss = state.shelves[d.id]
+        if not shelf.accepts(cs.load.size_for_shelf):
+            raise PreconditionError(
+                f"shelf {d.id} rejects size {cs.load.size_for_shelf!r}"
+            )
+        if ss.depth + _pending_give_count(state, d.id) >= shelf.capacity:
+            raise PreconditionError(f"shelf {d.id} is full")
+
+    def start(
+        self, state: FacilityState, topo: Topology, durations, now: SimTime
+    ) -> SimTime:
+        cs = state.carriers[self.carrier_id]
+        d = cs.docked_at
+        assert d is not None  # guaranteed by check_preconditions
+        return now + durations.shelf_op("give", topo.shelves[d.id])
+
+    def complete(self, state: FacilityState, topo: Topology) -> None:
+        cs = state.carriers[self.carrier_id]
+        d = cs.docked_at
+        pallet = cs.load
+        assert d is not None and pallet is not None  # guaranteed by preconditions
+        state.shelves[d.id].stack.append(pallet)
+        cs.load = None
+        cs.last_take_give = ("give", d)
 
 
 # ---------------------------------------------------------------------------
@@ -491,8 +327,10 @@ def short_action_label(cmd: "Command | None") -> str:
     """Compact human-readable label for a Command (`None` == WAIT)."""
     if cmd is None:
         return "wait"
-    if isinstance(cmd, Relocate):
-        return f"reloc {cmd.src}→{cmd.dst}"
-    if isinstance(cmd, MultiRelocate):
-        return f"multi {cmd.src}→[{cmd.partner_id}]→{cmd.dst}"
+    if isinstance(cmd, Goto):
+        return f"goto {cmd.target.kind}:{cmd.target.id}"
+    if isinstance(cmd, Take):
+        return "take"
+    if isinstance(cmd, Give):
+        return "give"
     return type(cmd).__name__.lower()
