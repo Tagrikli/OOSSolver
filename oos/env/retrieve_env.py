@@ -417,10 +417,24 @@ class RetrieveEnv(Environment):
         self._room_last_content: dict[str, str] = {}
         self._room_was_at: dict[str, bool] = {}
         self._success: bool = False
+        # Forced-layout hook: a callable(env, facility) that builds a SPECIFIC
+        # initial state and seeds its Retrieve(s), bypassing the sampler entirely.
+        # Set via `set_forced_layout`. Used by the hard-case battery and the
+        # curriculum to inject exact, difficulty-controlled configurations. None =
+        # normal sampling.
+        self._forced_layout = None
 
     # ------------------------------------------------------------------
     # Episode setup
     # ------------------------------------------------------------------
+
+    def set_forced_layout(self, builder) -> None:
+        """Install (or clear, with None) a layout builder `builder(env, facility)`
+        that constructs the episode's initial state and seeds its Retrieve(s) via
+        `env._seed_retrieve` (setting `env._task_type`). When set it REPLACES the
+        sampler for every reset — the hard-case battery and curriculum use it to
+        inject exact, difficulty-controlled configurations."""
+        self._forced_layout = builder
 
     def setup_episode(self, facility, seed):
         self._rng = np.random.default_rng(seed)
@@ -445,7 +459,12 @@ class RetrieveEnv(Environment):
             float(self._rng.random()) if self._fullness < 0 else self._fullness
         )
 
-        if self._sampled_mode:
+        if self._forced_layout is not None:
+            # Battery / curriculum: an exact, difficulty-controlled layout. The
+            # builder fills the shelves, sets `_task_type`, and seeds its
+            # Retrieve(s) via `_seed_retrieve`.
+            self._forced_layout(self, facility)
+        elif self._sampled_mode:
             # New model: draw (#room cars, #requests, depths), build the layout,
             # and seed the requests. `_task_type` is set inside from whether any
             # request was seeded.
