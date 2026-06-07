@@ -17,8 +17,9 @@ Primitive action model — the policy chooses from exactly:
 
 The enumeration order is the single authority for the flat action index space:
 all legal GOTO entries (in node iteration order), then TAKE (if legal), then
-GIVE (if legal), then WAIT (always, last). Everything downstream — the mask,
-the per-slot tensors, the network logits, the decoder — is keyed to this order.
+GIVE (if legal), then WAIT (always last — any carrier may rest anywhere).
+Everything downstream — the mask, the per-slot tensors, the network logits, the
+decoder — is keyed to this order.
 
 Customer interactions on rooms are auto-fired (not policy-chosen).
 """
@@ -137,24 +138,40 @@ def enumerate_actions(
     for target in targets:
         if cs.docked_at is not None and target == cs.docked_at:
             continue  # already docked there — a no-op move
+        # Reverse-GOTO guard: don't go straight back to the dock we just left
+        # without having done a TAKE/GIVE there (a pointless A→B→A bounce).
+        # Returning to a room is always allowed (it has its own gate below).
+        if (
+            target.kind != "room"
+            and cs.last_take_give is None
+            and cs.came_from is not None
+            and target == cs.came_from
+        ):
+            continue
         if target.kind == "room" and not _room_goto_allowed(cs, retrieve_targets):
             continue
         if _ok(Goto(carrier_id=carrier, target=target), state, topo):
             entries.append(ActionEntry(type=ActionType.GOTO, target=target))
 
-    # TAKE — 0 or 1, from the docked shelf or a waiting partner.
-    if _ok(Take(carrier_id=carrier), state, topo) and not _is_immediate_inverse(
+    # TAKE / GIVE — 0 or 1, against the docked SHELF only. Carrier↔carrier
+    # handoffs are now AUTOMATIC on rendezvous (see SimEngine._auto_handoffs), so
+    # there is no manual handoff TAKE/GIVE action to enumerate — a carrier just
+    # GOTOs the pose and the transfer fires when its partner is there.
+    at_shelf = cs.docked_at is not None and cs.docked_at.kind == "shelf"
+    if at_shelf and _ok(Take(carrier_id=carrier), state, topo) and not _is_immediate_inverse(
         cs, "give"
     ):
         entries.append(ActionEntry(type=ActionType.TAKE))
 
-    # GIVE — 0 or 1, onto the docked shelf.
-    if _ok(Give(carrier_id=carrier), state, topo) and not _is_immediate_inverse(
+    if at_shelf and _ok(Give(carrier_id=carrier), state, topo) and not _is_immediate_inverse(
         cs, "take"
     ):
         entries.append(ActionEntry(type=ActionType.GIVE))
 
-    # WAIT — always legal, always last.
+    # WAIT — last entry, ALWAYS legal: any carrier may rest anywhere (no
+    # loitering mask). The "all carriers waiting while work remains" stall is
+    # handled by the env's penalty + wake/re-query rescue (see
+    # Environment.advance), not by masking WAIT here.
     entries.append(ActionEntry(type=ActionType.WAIT))
     return entries
 

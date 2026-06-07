@@ -1,8 +1,7 @@
-"""Hot-swap helpers: policy load, MCTS rewrap, facility swap, single-task
-generate.
+"""Hot-swap helpers: policy load, MCTS rewrap, facility swap, layout generate.
 
-These are the "user pressed enter on the picker / 'g' for generate"
-operations. Split out of `app.py` so the main loop reads as dispatch.
+These are the "user pressed enter on the picker / Generate" operations. Split
+out of `app.py` so the main loop reads as dispatch.
 
 All helpers mutate the Agent in place (`agent.policy = ...`, or replace
 the underlying Environment) and emit toasts. The viz-side swap functions
@@ -105,93 +104,61 @@ def rewrap_with_mcts(
 # ─────────────────────────────────────────────────────────────────────────
 
 
-def generate_single_task(
-    params: dict,
+def generate_layout(
+    fullness: float,
     agent: Agent,
-    facility_name: str,
     toasts: ToastManager,
-) -> bool:
-    """Replace the agent's underlying env with a fresh SingleTaskEnv
-    wired to the configured knobs, then reset. Returns True on success,
-    False if params failed validation. The caller should refresh any
-    cached references to `agent.facility.engine` after this returns
-    (the SingleTaskEnv builds its own sim engine)."""
-    from oos.facilities import get_facility
-    from oos.learn.single_task_env import (
-        SingleTaskConfig,
-        SingleTaskEnv,
-        SingleTaskRewardConfig,
+    seed: "int | None" = None,
+) -> int:
+    """Re-roll the CURRENT facility's layout in place from a SEED: shuffle every
+    pallet to a random shelf at the given non-empty `fullness`, clear the queue,
+    wake the carriers. No env swap — the viz stays on whatever Environment is
+    open and keeps running continuously (no episodes).
+
+    `seed` is drawn randomly when None. It's RETURNED so the caller can stash it
+    and `(facility, fullness, seed)` reproduces this exact layout — see
+    `oos.sim.layout_code`."""
+    import secrets
+
+    import numpy as np
+
+    from oos.sim.shuffle import shuffle_state
+
+    if seed is None:
+        seed = secrets.randbits(63)
+    facility = agent.facility
+    shuffle_state(
+        facility.engine, fullness=float(fullness),
+        rng=np.random.default_rng(seed), require_solvable=True,
     )
-    try:
-        task_cfg = SingleTaskConfig(
-            task=str(params["task"]),
-            retrieve_from=str(params["retrieve_from"]),
-            retrieve_route=str(params["retrieve_route"]),
-            target_depth=int(params["target_depth"]),
-            big_shelf_fullness=float(params["big_shelf_fullness"]),
-            system_fullness=float(params["system_fullness"]),
-            big_ratio=float(params["big_ratio"]),
-            big_disorder=float(params["big_disorder"]),
-            small_disorder=float(params["small_disorder"]),
-            room_state=str(params["room_state"]),
-        )
-    except (KeyError, ValueError, TypeError) as e:
-        toasts.error(f"GEN FAILED: {type(e).__name__}: {e}"[:80])
-        return False
-    old_env = agent.facility
-    preserve_auto = agent.facility.auto_arrivals_enabled
-    prev_policy = agent.policy   # preserve the loaded policy across the swap
-    new_env = SingleTaskEnv(
-        facility_factory=get_facility(facility_name),
-        task_config=task_cfg,
-        reward_config=SingleTaskRewardConfig(),
-        experiment_config=old_env._experiment_cfg,  # type: ignore[attr-defined]
-    )
-    agent.facility = new_env
-    agent.policy = prev_policy   # keep the loaded policy (was wrongly reset to random_policy)
-    # Seed: an explicit `_seed` (e.g. decoded from an episode code) reproduces
-    # that exact layout; otherwise a fresh random seed per Generate — without
-    # which every press would produce the same RNG stream and the same layout.
-    seed = params.get("_seed")
-    if seed is not None:
-        agent.seed = int(seed)
-    else:
-        import secrets
-        agent.seed = secrets.randbits(31)
-    agent.reset()
-    agent.facility.set_auto_arrivals(preserve_auto)
-    toasts.success("GENERATED single-task initial state", lifetime=3.0)
-    return True
+    facility.engine.clear_queue()
+    facility.wake_waiting_carriers()
+    toasts.success(f"GENERATED layout  (fullness {fullness:.2f})", lifetime=2.5)
+    return int(seed)
 
 
-def load_episode_code(
+def load_layout_code(
     code_text: str,
     facility_name: str,
-    randomize_content,
     pending_generate: list,
     toasts: ToastManager,
 ) -> bool:
-    """Decode an episode code (from the training terminal) and queue a Generate
-    that reproduces its EXACT initial layout — the decoded level knobs plus the
-    `_seed` that pins the RNG. Reflects the knobs in the RANDOMIZE panel too.
-    Returns True if queued, False on a malformed or foreign-facility code."""
-    from oos.sim.episode_code import decode_episode
+    """Decode a layout code (from the clipboard) and queue a Generate that
+    reproduces its EXACT layout — the `(fullness, seed)` for this facility.
+    Returns True if queued, False on a malformed / foreign-facility code."""
+    from oos.sim.layout_code import decode_layout
     try:
-        dec = decode_episode(code_text)
+        dec = decode_layout(code_text)
     except ValueError as e:
-        toasts.error(f"BAD EPISODE CODE: {e}"[:80])
+        toasts.error(f"BAD LAYOUT CODE: {e}"[:80])
         return False
     if dec["facility"] != facility_name:
         toasts.error(
             f"CODE IS FOR '{dec['facility']}' — press f to switch facility first"[:80]
         )
         return False
-    params = dict(dec["params"])
-    params["_seed"] = dec["seed"]            # honored by generate_single_task
-    if randomize_content is not None:
-        randomize_content.set_values(params)  # reflect the loaded knobs in the panel
-    pending_generate.append(params)
-    toasts.success(f"EPISODE CODE LOADED  (seed {dec['seed']})", lifetime=3.0)
+    pending_generate.append({"fullness": dec["fullness"], "_seed": dec["seed"]})
+    toasts.success(f"LAYOUT CODE LOADED  (seed {dec['seed']})", lifetime=3.0)
     return True
 
 

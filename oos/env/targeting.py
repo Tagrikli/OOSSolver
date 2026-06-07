@@ -1,6 +1,6 @@
 """Shared retrieve-target acquisition for task envs.
 
-Pure helpers (no torch) used by both `SingleTaskEnv` and `ContinuousEnv`:
+Pure helpers (no torch) used by `RetrieveEnv` and `SingleTaskEnv`:
 
   * `route_class_map`      — classify each shelf "direct" | "handoff" by the
     minimum handoffs from its serving carrier to a room (multi-source BFS).

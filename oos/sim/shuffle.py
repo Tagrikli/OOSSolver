@@ -77,12 +77,17 @@ def shuffle_state(
         raise ValueError(f"fullness must be in [0,1], got {fullness}")
 
     # 1. Collect every pallet currently in the facility (shelves + carriers).
+    #    Sort into a canonical (by-id) order so the result depends only on the
+    #    pallet SET + the rng seed, NOT the current arrangement — i.e. the same
+    #    seed reproduces the same layout no matter what state we shuffle from
+    #    (so a `(facility, fullness, seed)` layout code is reproducible).
     pallet_ids: list[int] = []
     for ss in facility.state.shelves.values():
         pallet_ids.extend(p.id for p in ss.stack)
     for cs in facility.state.carriers.values():
         if cs.load is not None:
             pallet_ids.append(cs.load.id)
+    pallet_ids.sort()
 
     n_total = len(pallet_ids)
     if n_total == 0:
@@ -131,6 +136,7 @@ def _place_pallets(
         cs.command_start_position = None
         cs.docked_at = None
         cs.last_take_give = None
+        cs.came_from = None
         cs.waiting = False
     facility.scheduler = Scheduler()
     if facility.auto_arrivals_enabled:

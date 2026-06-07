@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from oos.env.env import Environment
 from oos.env.reward import RewardConfig
-from oos.env.reward_system import PotentialTerm, RewardContext, base_system
+from oos.env.reward_system import PotentialTerm, RewardContext, StepEvents, base_system
 from oos.sim.state import DockRef, Pallet
 from oos.sim.tasks import Retrieve
 
@@ -48,22 +48,39 @@ def test_potential_room_ready_and_wrong_car():
     assert env._potential(sim) == 0.0
 
 
-def test_potential_retrieval_depth():
-    env = _env()
+def test_potential_retrieval_progress():
+    # Isolate the retrieval term (w_ret=1; others off).
+    cfg = RewardConfig(
+        potential_item_retrieval=1.0, potential_room_ready=0.0,
+        potential_wrong_car=0.0, potential_shallowest_empty=0.0,
+    )
+    env = Environment.from_name("tiny_medipol", reward_config=cfg)
+    env.reset(seed=0)
     sim = env.engine
     car = next(iter(sim.topology.carriers))
+    room = next(iter(sim.topology.accessible_rooms[car]))
     shelf = sorted(sim.topology.accessible_shelves[car])[0]
     sim.state.shelves[shelf].stack = [
-        Pallet(id=99, contents="small"),   # the target, buried
+        Pallet(id=99, contents="small"),   # the target, buried at depth 2
         Pallet(id=2, contents="small"),
         Pallet(id=3, contents="small"),    # top
     ]
     sim.queue.add(Retrieve(arrived_at=0.0, pallet=99, initial_depth=2))
-    assert env._potential(sim) == -3.0            # −w_ret·(2+1)
+    assert env._potential(sim) == -5.0            # −(depth 2 + 3)
     sim.state.shelves[shelf].stack.pop()          # dig one blocker → depth 1
-    assert env._potential(sim) == -2.0            # rose by w_ret (positive shaping)
-    # A non-requested item's depth doesn't matter.
-    env2 = _env()
+    assert env._potential(sim) == -4.0            # rose by w_ret
+    # TAKE it (now held, not at a room) → cost 2; dense shaping even though the
+    # target is now at depth 0 (no dig left).
+    cs = sim.state.carriers[car]
+    cs.load = Pallet(id=99, contents="small")
+    sim.state.shelves[shelf].stack = []
+    assert env._potential(sim) == -2.0
+    # Carry it to a room (held at a room) → cost 1.
+    cs.docked_at = DockRef("room", room)
+    assert env._potential(sim) == -1.0
+    # A non-requested layout has Φ = 0.
+    env2 = Environment.from_name("tiny_medipol", reward_config=cfg)
+    env2.reset(seed=0)
     assert env2._potential(env2.engine) == 0.0
 
 
@@ -79,6 +96,40 @@ def test_base_system_flat_deliver_and_serve():
     total, bd = sys.compute(ctx)
     assert bd["DELIVER"] == 100.0     # 2 × 50, NOT depth-scaled
     assert bd["SERVE"] == 20.0
+
+
+def test_idle_while_task_wired_through_base_context():
+    """End-to-end: the StepEvents decision-point flags reach the base reward
+    context, so base_system's IDLE_TASK penalty fires on an all-idle step with
+    work pending. Pins the env→reward wiring (not just the term in isolation)."""
+    cfg = RewardConfig(
+        # isolate the penalty: potential off so SHAPE stays 0.
+        potential_item_retrieval=0.0, potential_room_ready=0.0,
+        potential_wrong_car=0.0, potential_shallowest_empty=0.0,
+        penalty_idle_while_task=2.0,
+    )
+    env = Environment.from_name("tiny_medipol", reward_config=cfg)
+    env.reset(seed=0)
+    # All carriers waiting, a retrieve still pending, no room staged → both
+    # additive charges → −4.0 through the real base_system.
+    events = StepEvents(
+        all_carriers_waiting=True,
+        retrieve_pending_at_decision=True,
+        room_has_staged_empty_at_decision=False,
+    )
+    ctx = env._reward_context_from_events(events, env.engine)
+    assert ctx.all_carriers_waiting and ctx.retrieve_pending
+    assert ctx.room_has_staged_empty is False
+    total, bd = env._reward_system.compute(ctx)
+    assert bd["IDLE_TASK"] == -4.0
+    # A serve on the same instant is productive → no idle charge.
+    served = StepEvents(
+        all_carriers_waiting=True, retrieve_pending_at_decision=True,
+        room_has_staged_empty_at_decision=False, n_deliveries=1,
+    )
+    _, bd2 = env._reward_system.compute(
+        env._reward_context_from_events(served, env.engine))
+    assert "IDLE_TASK" not in bd2
 
 
 # ---------------------------------------------------------------------------

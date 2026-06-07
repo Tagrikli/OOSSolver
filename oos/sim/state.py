@@ -79,6 +79,11 @@ class CarrierState:
     # TAKE/GIVE, CLEARED by GOTO (the carrier moved away), left untouched by
     # WAIT (so a take→wait→give-back loophole stays closed).
     last_take_give: Optional[tuple[str, "DockRef"]] = None
+    # The dock the carrier most recently LEFT (set when a GOTO starts = the
+    # location it departed). Used by the masker to forbid an immediate reverse
+    # GOTO straight back to it with no intervening TAKE/GIVE — a pointless
+    # A→B→A bounce — except a reverse to a room, which is always allowed.
+    came_from: Optional["DockRef"] = None
     # WAIT state. A carrier is either *busy* (executing a primitive —
     # `current_command is not None`) or *waiting* (`current_command is None`).
     # There is no separate "idle" notion: not-busy == waiting. `waiting` records

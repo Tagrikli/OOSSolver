@@ -1,9 +1,9 @@
-"""Read the system clipboard as text — robustly across Wayland and X11.
+"""Read/write the system clipboard as text — robustly across Wayland and X11.
 
 `pygame.scrap` is unreliable on Wayland (and needs an initialised video
 display), so we prefer the standard CLI clipboard tools and fall back to
-`pygame.scrap` only if none are present. Used by the viz to load an episode
-code copied from the training terminal.
+`pygame.scrap` only if none are present. Used by the viz to copy/paste a layout
+code (reproduce an exact generated layout).
 """
 
 from __future__ import annotations
@@ -52,3 +52,40 @@ def read_clipboard_text() -> "str | None":
     except Exception:
         pass
     return None
+
+
+def _cli_write_backends() -> list[list[str]]:
+    """Clipboard-WRITE commands (each reads the text from stdin), session-ordered."""
+    wayland = bool(os.environ.get("WAYLAND_DISPLAY"))
+    cmds = [
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard", "-in"],
+        ["xsel", "--clipboard", "--input"],
+    ]
+    if not wayland:
+        cmds = cmds[1:] + cmds[:1]
+    return cmds
+
+
+def write_clipboard_text(text: str) -> bool:
+    """Copy `text` to the system clipboard. Returns True on success. Never
+    raises (falls back to `pygame.scrap`, then gives up)."""
+    data = text.encode("utf-8")
+    for cmd in _cli_write_backends():
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            res = subprocess.run(cmd, input=data, capture_output=True, timeout=2.0)
+        except (subprocess.SubprocessError, OSError):
+            continue
+        if res.returncode == 0:
+            return True
+    try:
+        import pygame
+
+        if getattr(pygame, "scrap", None) is not None and pygame.scrap.get_init():
+            pygame.scrap.put(pygame.SCRAP_TEXT, data)
+            return True
+    except Exception:
+        pass
+    return False

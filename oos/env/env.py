@@ -73,8 +73,13 @@ class Environment:
         self._facility_factory = facility_factory
         self._experiment_cfg = experiment_config or ExperimentConfig()
         self._reward_cfg = reward_config or RewardConfig()
+        # When True, an all-carriers-WAIT-while-work-remains instant is rescued:
+        # the carriers are woken and re-queried (instead of stalling to
+        # truncation). Subclasses enable it when they also charge the matching
+        # penalty (AllWaitWhileTaskTerm); the viz/base path leaves it off.
+        self._rescue_all_wait_while_task = False
         # Unified reward suite for the base (advance-path) reward. Subclasses
-        # that compute their own dense reward (ContinuousEnv, SingleTaskEnv)
+        # that compute their own dense reward (e.g. RetrieveEnv)
         # override it in step(); this still drives the viz/advance path.
         self._reward_system = base_system(self._reward_cfg)
         self._obs_cfg = observation_config or ObservationConfig()
@@ -93,6 +98,11 @@ class Environment:
         self._n_carriers = len(topo.carriers)
         self._n_shelves = len(topo.shelves)
         self._n_rooms = len(topo.rooms)
+        # Carriers with direct room access ("carriers that have a room") — used
+        # by the staging check in the all-wait-while-task stall condition.
+        self._room_carriers = [
+            cid for cid in topo.carriers if topo.accessible_rooms[cid]
+        ]
 
         # Discrete action count per carrier query (was `action_space.n`).
         self.n_actions = self._n_max
@@ -168,7 +178,7 @@ class Environment:
             raise RuntimeError("no idle carriers after initial advance")
         querying = pending.pop(0)
         entries = enumerate_actions(
-            querying, facility.state, facility.topology, facility.queue
+            querying, facility.state, facility.topology, facility.queue,
         )
         decoder = ActionDecoder(entries, self._n_max)
         self._ctx = _StepContext(
@@ -257,7 +267,7 @@ class Environment:
         if ctx.pending_idle:
             ctx.querying_carrier = ctx.pending_idle.pop(0)
             entries = enumerate_actions(
-                ctx.querying_carrier, facility.state, facility.topology, facility.queue
+                ctx.querying_carrier, facility.state, facility.topology, facility.queue,
             )
             ctx.decoder = ActionDecoder(entries, self._n_max)
             return True
@@ -369,7 +379,7 @@ class Environment:
     def last_reset_seed(self):
         """The seed passed to the most recent `reset()` (None if none was given).
         With the level held by the env, this is what reproduces the episode — see
-        `oos.sim.episode_code`."""
+        `oos.sim.layout_code`."""
         return getattr(self, "_last_reset_seed", None)
 
     @property
@@ -426,12 +436,28 @@ class Environment:
         # meaningful on a resolving step (all carriers at this instant queried).
         all_carriers_waiting = False
         retrieve_pending_now = False
+        room_has_staged_empty_now = False
+        all_rooms_staged_now = True
         if not ctx.pending_idle:
             all_carriers_waiting = all(
                 cs.waiting for cs in facility.state.carriers.values()
             )
             retrieve_pending_now = any(
                 isinstance(t, Retrieve) for t in facility.queue.pending
+            )
+            # "All rooms staged": every room-serving carrier is docked at a room
+            # AND holding a pallet. Vacuously True with no room carriers. Feeds
+            # the all-wait-while-task stall condition (work remains unless every
+            # room is already staged).
+            all_rooms_staged_now = self._all_rooms_staged(facility)
+            # A room is "staged" iff some carrier is docked at a room holding an
+            # empty pallet — the same notion the room-ready potential counts.
+            room_has_staged_empty_now = any(
+                cs.docked_at is not None
+                and cs.docked_at.kind == "room"
+                and cs.load is not None
+                and cs.load.is_empty
+                for cs in facility.state.carriers.values()
             )
             # Snapshot positions to charge a per-slot travel penalty: each
             # command moves monotonically, so summed |Δposition| over the
@@ -454,9 +480,29 @@ class Environment:
                 if ctx.pending_idle:
                     ctx.querying_carrier = ctx.pending_idle.pop(0)
                     entries = enumerate_actions(
-                        ctx.querying_carrier, facility.state, facility.topology, facility.queue
+                        ctx.querying_carrier, facility.state, facility.topology, facility.queue,
                     )
                     ctx.decoder = ActionDecoder(entries, self._n_max)
+
+        # All-wait-while-task stall: every carrier chose WAIT while work remains
+        # (a requested item is pending, OR nothing requested but not every room
+        # is staged). Evaluated from the pre-advance snapshot.
+        all_wait_while_task = all_carriers_waiting and (
+            retrieve_pending_now or not all_rooms_staged_now
+        )
+        # Rescue (when enabled): with no scheduler event to wake them, an
+        # all-WAIT instant would spin at dt=0 to truncation. Wake every carrier
+        # and re-open a decision so the NEXT step re-samples and escapes. The
+        # matching penalty (AllWaitWhileTaskTerm) is charged via the context.
+        if all_wait_while_task and self._rescue_all_wait_while_task:
+            facility.wake_waiting_carriers()
+            ctx.pending_idle = self._fresh_pending_idle(facility)
+            if ctx.pending_idle:
+                ctx.querying_carrier = ctx.pending_idle.pop(0)
+                entries = enumerate_actions(
+                    ctx.querying_carrier, facility.state, facility.topology, facility.queue,
+                )
+                ctx.decoder = ActionDecoder(entries, self._n_max)
 
         # Idle-with-retrieve: a Retrieve is pending AND no carrier is mid-command
         # (WAITing carriers count as idle — nobody is working the pending task).
@@ -490,7 +536,9 @@ class Environment:
                 1 for c in completions if isinstance(c.task, Store)),
             all_carriers_waiting=all_carriers_waiting,
             retrieve_pending_at_decision=retrieve_pending_now,
+            room_has_staged_empty_at_decision=room_has_staged_empty_now,
             idle_with_retrieve=idle_with_retrieve,
+            all_wait_while_task=all_wait_while_task,
         )
         rctx = self._reward_context_from_events(events, facility, potential_before)
         reward, breakdown = self._reward_system.compute(rctx)
@@ -523,7 +571,7 @@ class Environment:
     ) -> RewardContext:
         """Base (advance-path) reward context built purely from the typed
         `StepEvents`. Subclasses with their own dense reward suite
-        (ContinuousEnv, SingleTaskEnv) build their own context from
+        (e.g. RetrieveEnv) build their own context from
         `info["events"]`."""
         return RewardContext(
             n_deliveries=events.n_deliveries,
@@ -531,7 +579,11 @@ class Environment:
             delivery_depth_weight=events.delivery_depth_weight,
             n_stores_served=events.n_stores_served,
             movement_distance=events.movement_distance,
+            all_carriers_waiting=events.all_carriers_waiting,
+            retrieve_pending=events.retrieve_pending_at_decision,
+            room_has_staged_empty=events.room_has_staged_empty_at_decision,
             idle_with_retrieve=events.idle_with_retrieve,
+            all_wait_while_task=events.all_wait_while_task,
             gamma=self.reward_gamma,
             potential_before=potential_before,
             potential_after=self._potential(facility),
@@ -540,6 +592,20 @@ class Environment:
             queue=facility.queue,
             topology=facility.topology,
         )
+
+    def _all_rooms_staged(self, facility: SimEngine) -> bool:
+        """True iff every room-serving carrier ("a carrier that has a room") is
+        docked at a room AND holding a pallet — i.e. every room is staged.
+        Vacuously True when there are no room carriers."""
+        for cid in self._room_carriers:
+            cs = facility.state.carriers[cid]
+            if not (
+                cs.docked_at is not None
+                and cs.docked_at.kind == "room"
+                and cs.load is not None
+            ):
+                return False
+        return True
 
     def _potential(self, facility: SimEngine) -> float:
         """PBRS potential Φ(s) over three terms (weights from RewardConfig):
@@ -567,7 +633,7 @@ class Environment:
         phi = 0.0
         if w_ret:
             for pid in requested:
-                phi -= w_ret * (pallet_depth(state, pid) + 1)
+                phi -= w_ret * self._retrieve_remaining(state, pid)
         if w_ready or w_wrong:
             for cs in state.carriers.values():
                 d = cs.docked_at
@@ -580,6 +646,23 @@ class Environment:
         if w_empty:
             phi -= w_empty * self._shallowest_empty_depth(facility)
         return phi
+
+    def _retrieve_remaining(self, state, pallet_id: int) -> int:
+        """Rough 'steps remaining to deliver' for a requested item, so the
+        retrieval potential shapes the WHOLE delivery (not just the dig):
+
+          - held by a carrier docked at a room : 1  (just WAIT to deliver)
+          - held by a carrier (not at a room)  : 2  (GOTO room, then WAIT)
+          - on a shelf at burial depth d       : d + 3  (dig d, TAKE, GOTO, WAIT)
+
+        So digging the target shallower, TAKE-ing it, and carrying it to a room
+        each raise Φ by w_ret — giving dense progress even for a depth-0 target
+        (which has no dig and would otherwise be sparse)."""
+        for cs in state.carriers.values():
+            if cs.load is not None and cs.load.id == pallet_id:
+                d = cs.docked_at
+                return 1 if (d is not None and d.kind == "room") else 2
+        return pallet_depth(state, pallet_id) + 3
 
     def _shallowest_empty_depth(self, facility: SimEngine) -> int:
         """Burial depth (0 = top, reachable) of the shallowest empty pallet
@@ -618,7 +701,7 @@ class Environment:
         """Decision predicate (injected into the sim): does this carrier have
         at least one action other than WAIT right now?"""
         entries = enumerate_actions(
-            cid, facility.state, facility.topology, facility.queue
+            cid, facility.state, facility.topology, facility.queue,
         )
         return any(e.type != ActionType.WAIT for e in entries)
 
@@ -627,7 +710,7 @@ class Environment:
         if not idle:
             return ActionDecoder([], self._n_max)
         entries = enumerate_actions(
-            idle[0], facility.state, facility.topology, facility.queue
+            idle[0], facility.state, facility.topology, facility.queue,
         )
         return ActionDecoder(entries, self._n_max)
 

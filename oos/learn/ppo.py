@@ -68,8 +68,14 @@ def ppo_update(
         values = np.array(buf.values, dtype=np.float32)
         next_values = np.array(buf.next_values, dtype=np.float32)
         dones = np.array(buf.dones, dtype=bool)
+        # True terminals (env success) drop the value-bootstrap; absent the field
+        # (older buffers) every boundary stays a truncation — the prior behaviour.
+        terminateds = (
+            np.array(buf.terminateds, dtype=bool) if buf.terminateds else None
+        )
         adv, ret = compute_gae(
             rewards, values, next_values, dones, cfg.gamma, cfg.gae_lambda,
+            terminateds=terminateds,
         )
         all_samples.extend(buf.samples)
         all_actions.extend(buf.actions)

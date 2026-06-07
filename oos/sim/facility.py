@@ -9,12 +9,14 @@ import numpy as np
 
 from oos.sim.actions import (
     Command,
+    Give,
     Take,
 )
 from oos.sim.durations import DurationModel
 from oos.sim.scheduler import Event, Scheduler
 from oos.sim.state import (
     CarrierState,
+    DockRef,
     FacilityState,
     Pallet,
     PalletId,
@@ -95,7 +97,7 @@ class SimEngine:
         # slot is free AND hypothetically placing a big there keeps the layout
         # retrievable (`_layout_is_solvable`); otherwise it's dropped. Off by
         # default (preserves the plain saturation-drop behavior for the viz
-        # and the existing envs); ContinuousEnv turns it on.
+        # and the existing envs); no env currently enables it.
         self.gate_big_retrievability = False
         # Completions produced by manual UI actions outside of an `advance_*`
         # call (e.g. `enqueue_store` triggers an auto-serve that completes a
@@ -155,19 +157,23 @@ class SimEngine:
         giver_cs.busy_until = busy_until
         giver_cs.command_started_at = self.state.time
         giver_cs.command_start_position = giver_cs.position
+        # A TAKE or GIVE docked at a handoff pose with a WAITing partner is the
+        # carrier->carrier transfer: lock the partner too, with the SAME
+        # current_command instance, for the handoff duration only. The transfer
+        # is atomic at completion (no half-committed state). TAKE pulls from a
+        # loaded waiting partner; GIVE pushes to an empty waiting partner.
+        partner_id: Optional[CarrierId] = None
         if isinstance(cmd, Take):
-            # A Take docked at a handoff pose with a WAITing partner is the
-            # carrier->carrier transfer: lock the partner too, with the SAME
-            # current_command instance, for the handoff duration only. The
-            # transfer is atomic at completion (no half-committed state).
             partner_id = cmd.partner_to_receive_from(self.state, self.topology)
-            if partner_id is not None:
-                ps = self.state.carriers[partner_id]
-                ps.current_command = cmd
-                ps.busy_until = busy_until
-                ps.command_started_at = self.state.time
-                ps.command_start_position = ps.position
-                ps.waiting = False
+        elif isinstance(cmd, Give):
+            partner_id = cmd.partner_to_give_to(self.state, self.topology)
+        if partner_id is not None:
+            ps = self.state.carriers[partner_id]
+            ps.current_command = cmd
+            ps.busy_until = busy_until
+            ps.command_started_at = self.state.time
+            ps.command_start_position = ps.position
+            ps.waiting = False
         self.scheduler.push(busy_until, "command_done", cmd.carrier)
 
     def needs_decision(self, carrier_id: CarrierId) -> bool:
@@ -327,7 +333,16 @@ class SimEngine:
         if self.carriers_needing_decision() and (peek is None or peek > self.state.time):
             if time_limit is not None and time_limit > self.state.time:
                 self.state.time = time_limit
-            return AdvanceResult(dt=self.state.time - start_time)
+            # Carry any completions already produced this advance (e.g. a
+            # WAIT-serve that fired in submit_action and woke the carriers): this
+            # early return must NOT drop them, or the delivery never surfaces in
+            # info["completions"] — the agent would deliver yet get no reward.
+            return AdvanceResult(
+                dt=self.state.time - start_time,
+                completions=completions,
+                arrivals=arrivals,
+                dropped=dropped,
+            )
 
         while True:
             if len(self.scheduler) == 0:
@@ -419,6 +434,13 @@ class SimEngine:
         # partner that just became free) is re-queried at this instant instead
         # of holding stale.
         self.wake_waiting_carriers()
+        # Serving (both retrieves and stores) happens ONLY on the WAIT customer
+        # interaction (`_try_serve_at_room`), so nothing is served here. But a
+        # handoff fires automatically when two partner carriers rendezvous at a
+        # pose, one loaded + one empty (no GIVE/TAKE needed) — that changes carrier
+        # loads, so re-wake to re-query both if it fired.
+        if self._auto_handoffs():
+            self.wake_waiting_carriers()
         # After every event, sweep big Stores from the queue if the facility
         # currently has no big capacity. This handles both "arrived when full"
         # and "queued, then capacity disappeared as more bigs landed".
@@ -433,8 +455,8 @@ class SimEngine:
             return
         cmd.complete(self.state, self.topology)
         # Clear every carrier that shares this command instance — the initiator
-        # and, for a carrier->carrier transfer Take, the locked partner. The
-        # newly-emptied giver is then re-queried via wake_waiting_carriers.
+        # and, for a carrier->carrier transfer (TAKE or GIVE), the locked
+        # partner. The newly-freed carriers are re-queried via wake_waiting.
         for other in self.state.carriers.values():
             if other.current_command is cmd:
                 other.current_command = None
@@ -591,19 +613,7 @@ class SimEngine:
         # agent delivery — the only way a retrieve can complete now).
         retrieve = self._find_pending_retrieve(pallet.id)
         if retrieve is not None:
-            cost = self.state.time - retrieve.arrived_at
-            self.queue.remove(retrieve)
-            self.queue.completed_costs.append(cost)
-            # `already_staged` (set at request time) marks a camped request — the
-            # target was already at a room when asked for, so this is NOT an agent
-            # delivery and pays no DELIVER reward.
-            completions.append(
-                TaskCompletion(
-                    task=retrieve, cost=cost,
-                    agent_delivered=not retrieve.already_staged,
-                )
-            )
-            cs.load = Pallet(id=pallet.id, contents="empty")
+            self._complete_retrieve(cs, retrieve, completions)
             return True
         # Store: the held empty pallet absorbs the oldest pending Store.
         if pallet.is_empty:
@@ -624,6 +634,76 @@ class SimEngine:
                         )
                 return True
         return False
+
+    def _complete_retrieve(
+        self, cs, retrieve: "Retrieve", completions: list[TaskCompletion]
+    ) -> None:
+        """Complete one Retrieve: drop it from the queue, record its cost, emit
+        the completion, and leave the now-empty pallet on the carrier. Reached via
+        the WAIT customer interaction (`_try_serve_at_room`). `already_staged` (set
+        at request time) marks a camped request — the target was already at a room
+        when asked for, so it is NOT an agent delivery and pays no DELIVER reward."""
+        cost = self.state.time - retrieve.arrived_at
+        self.queue.remove(retrieve)
+        self.queue.completed_costs.append(cost)
+        completions.append(
+            TaskCompletion(
+                task=retrieve, cost=cost,
+                agent_delivered=not retrieve.already_staged,
+            )
+        )
+        cs.load = Pallet(id=cs.load.id, contents="empty")
+
+    def _auto_handoffs(self) -> bool:
+        """A handoff fires AUTOMATICALLY on rendezvous: whenever two partner
+        carriers are both docked at the matching handoff pose (each facing the
+        other), one holding a pallet and the other empty, the pallet moves to the
+        empty partner — no GIVE/TAKE action required. Instant (no in-flight lock).
+        Returns True if any transfer fired so the caller re-queries both carriers.
+
+        Anti-ping-pong: after a transfer the two are still co-located with
+        reversed (still complementary) loads, which would otherwise transfer back
+        on the next event. We stamp `last_take_give` (as a manual handoff would)
+        and skip a pair whose loaded carrier just received here — the stamp holds
+        while parked and clears the moment a carrier GOTOs away."""
+        moved = False
+        seen: set[frozenset[CarrierId]] = set()
+        for cid, cs in self.state.carriers.items():
+            d = cs.docked_at
+            if d is None or d.kind != "handoff" or cs.is_busy:
+                continue
+            partner_id = d.id
+            key = frozenset((cid, partner_id))
+            if key in seen:
+                continue
+            ps = self.state.carriers.get(partner_id)
+            if ps is None or ps.is_busy:
+                continue
+            pd = ps.docked_at
+            # partner must be docked at the matching pose facing THIS carrier
+            if pd is None or pd.kind != "handoff" or pd.id != cid:
+                continue
+            # need exactly one loaded, the other empty
+            if (cs.load is None) == (ps.load is None):
+                continue
+            seen.add(key)
+            if cs.load is not None:
+                loaded, loaded_id, empty, empty_id = cs, cid, ps, partner_id
+            else:
+                loaded, loaded_id, empty, empty_id = ps, partner_id, cs, cid
+            # Don't immediately reverse a transfer just made at this pose.
+            ltg = loaded.last_take_give
+            if (
+                ltg is not None and ltg[0] == "take"
+                and ltg[1].kind == "handoff" and ltg[1].id == empty_id
+            ):
+                continue
+            empty.load = loaded.load
+            loaded.load = None
+            empty.last_take_give = ("take", DockRef("handoff", loaded_id))
+            loaded.last_take_give = ("give", DockRef("handoff", empty_id))
+            moved = True
+        return moved
 
     def _target_already_staged(self, pallet_id: PalletId) -> bool:
         """True iff some carrier is currently docked at a room holding pallet

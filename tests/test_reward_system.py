@@ -9,27 +9,25 @@ from types import SimpleNamespace
 
 from oos.env.reward_system import (
     DeliveryTerm,
+    IdleWhileTaskTerm,
     PotentialTerm,
+    ProgressTerm,
     RewardContext,
-    StageTerm,
-    UnstageTerm,
-    WrongItemTerm,
-    EvacTerm,
-    continuous_system,
+    base_system,
+    delivery_system,
 )
 
 
-def _cont_cfg(**over):
-    """Duck-typed continuous reward config (the factory reads by attr name)."""
+def _base_cfg(**over):
+    """Duck-typed base reward config (base_system reads by attr name)."""
     base = dict(
-        delivery_bonus=50.0,
-        store_serve_bonus=15.0,
-        wrong_item_penalty=5.0,
-        stage_bonus=2.0,
-        time_weight=0.0,
-        movement_weight=0.0,
-        all_idle_retrieve_penalty=0.0,
-        all_idle_no_room_empty_penalty=0.0,
+        reward_deliver=50.0,
+        reward_serve=20.0,
+        potential_item_retrieval=0.0,
+        potential_room_ready=0.0,
+        potential_wrong_car=0.0,
+        potential_shallowest_empty=0.0,
+        penalty_idle_while_task=0.0,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -55,32 +53,72 @@ def test_delivery_term_pays_nothing_for_free_deliveries():
     assert term.compute(RewardContext(delivery_depth_weight=0)) == 0.0
 
 
-def test_continuous_system_skips_parked_car_deliver():
-    sys = continuous_system(_cont_cfg())
-    # Free delivery only → weight 0 → DELIVER contributes 0 to the total.
-    total_free, bd_free = sys.compute(RewardContext(delivery_depth_weight=0))
-    assert bd_free.get("DELIVER", 0.0) == 0.0
-    assert total_free == 0.0
-    # Real depth-0 delivery → DELIVER pays the bonus.
-    total_real, bd_real = sys.compute(RewardContext(delivery_depth_weight=1))
-    assert bd_real["DELIVER"] == 50.0
-    assert total_real == 50.0
+# ── delivery_system: the retrieval spine's one-term reward ──────────────────
+
+def test_delivery_system_is_delivery_only():
+    sys = delivery_system(_base_cfg())
+    assert sys.labels() == ["DELIVER"]
+    # Flat (scale_by_depth=False): a real delivery pays reward_deliver regardless
+    # of depth; a parked-car free delivery pays nothing.
+    total, bd = sys.compute(RewardContext(n_deliveries=1, n_free_deliveries=0))
+    assert bd["DELIVER"] == 50.0 and total == 50.0
+    assert sys.compute(RewardContext(n_deliveries=1, n_free_deliveries=1))[0] == 0.0
+    # A no-op step (nothing delivered) pays exactly 0 — no shaping/idle drip.
+    assert sys.compute(RewardContext(potential_before=-9.0, potential_after=-9.0))[0] == 0.0
 
 
-# ── anti-farm symmetry (round-trips net zero) ───────────────────────────────
+# ── all-idle-while-task penalty (two additive charges) ──────────────────────
 
-def test_stage_unstage_round_trip_nets_zero():
-    stage, unstage = StageTerm(2.0), UnstageTerm(2.0)
-    staged = stage.compute(RewardContext(n_stage=1))
-    unstaged = unstage.compute(RewardContext(n_unstage=1))
-    assert staged + unstaged == 0.0
+def test_idle_while_task_charges_each_condition():
+    term = IdleWhileTaskTerm(penalty=2.0)
+    # Not all idle → never fires, regardless of pending work.
+    assert term.compute(RewardContext(
+        all_carriers_waiting=False, retrieve_pending=True,
+        room_has_staged_empty=False)) == 0.0
+    # All idle + retrieve pending + a room IS staged → one charge.
+    assert term.compute(RewardContext(
+        all_carriers_waiting=True, retrieve_pending=True,
+        room_has_staged_empty=True)) == -2.0
+    # All idle + no retrieve + no staged room → one charge.
+    assert term.compute(RewardContext(
+        all_carriers_waiting=True, retrieve_pending=False,
+        room_has_staged_empty=False)) == -2.0
+    # All idle + BOTH conditions → two additive charges.
+    assert term.compute(RewardContext(
+        all_carriers_waiting=True, retrieve_pending=True,
+        room_has_staged_empty=False)) == -4.0
+    # All idle but no work remains (room staged, nothing pending) → silent.
+    assert term.compute(RewardContext(
+        all_carriers_waiting=True, retrieve_pending=False,
+        room_has_staged_empty=True)) == 0.0
 
 
-def test_wrong_evac_round_trip_nets_zero():
-    wrong, evac = WrongItemTerm(5.0), EvacTerm(5.0)
-    placed = wrong.compute(RewardContext(n_wrong=1))
-    stowed = evac.compute(RewardContext(n_evac=1))
-    assert placed + stowed == 0.0
+def test_idle_while_task_not_charged_on_a_serving_step():
+    """A WAIT at a room that delivered/served this step is productive — even
+    though every carrier is 'waiting' at that instant — so it is not charged."""
+    term = IdleWhileTaskTerm(penalty=2.0)
+    # A delivery fired this advance → no idle charge despite all-waiting.
+    assert term.compute(RewardContext(
+        all_carriers_waiting=True, retrieve_pending=True,
+        room_has_staged_empty=False, n_deliveries=1)) == 0.0
+    # A store served this advance → likewise no charge.
+    assert term.compute(RewardContext(
+        all_carriers_waiting=True, retrieve_pending=True,
+        room_has_staged_empty=False, n_stores_served=1)) == 0.0
+
+
+def test_idle_while_task_off_by_default_in_base_system():
+    sys = base_system(_base_cfg())              # penalty 0 → term silent
+    total, bd = sys.compute(RewardContext(
+        all_carriers_waiting=True, retrieve_pending=True,
+        room_has_staged_empty=False))
+    assert "IDLE_TASK" not in bd and total == 0.0
+    # Enabled → the penalty shows up in the base system's breakdown.
+    sys2 = base_system(_base_cfg(penalty_idle_while_task=2.0))
+    total2, bd2 = sys2.compute(RewardContext(
+        all_carriers_waiting=True, retrieve_pending=True,
+        room_has_staged_empty=False))
+    assert bd2["IDLE_TASK"] == -4.0 and total2 == -4.0
 
 
 # ── PBRS shaping: F = γ·Φ(s') − Φ(s) ─────────────────────────────────────────
@@ -100,3 +138,15 @@ def test_potential_term_forms_discounted_difference():
     # γ scales Φ(s')
     assert term.compute(RewardContext(
         gamma=0.99, potential_before=0.0, potential_after=-10.0)) == -9.9
+
+
+def test_progress_term_is_undiscounted_difference():
+    """ProgressTerm = Φ(s') − Φ(s), with NO γ — so a no-op step (Φ unchanged)
+    pays exactly 0, killing the γ<1 idle-drip that PotentialTerm has."""
+    term = ProgressTerm()
+    # no-op: Φ flat and negative → PROGRESS 0 (PBRS would pay (γ−1)·Φ > 0).
+    assert term.compute(RewardContext(
+        gamma=0.99, potential_before=-10.0, potential_after=-10.0)) == 0.0
+    # real progress: Φ rose by 1 → +1 regardless of γ.
+    assert term.compute(RewardContext(
+        gamma=0.99, potential_before=-10.0, potential_after=-9.0)) == 1.0

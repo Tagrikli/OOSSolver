@@ -58,10 +58,13 @@ def test_action_index_type_alignment():
         for _ in range(30):
             entries = info["action_entries"]
             # Canonical order: all GOTO, then optional TAKE, then optional GIVE,
-            # then exactly one WAIT (last).
+            # then optional WAIT (last). WAIT may be masked for a room carrier
+            # docked at a shelf, so it is at most one and, when present, last.
             types = [e.type for e in entries]
-            assert types[-1] == ActionType.WAIT
-            assert types.count(ActionType.WAIT) == 1
+            n_wait = types.count(ActionType.WAIT)
+            assert n_wait <= 1
+            if n_wait == 1:
+                assert types[-1] == ActionType.WAIT
             # GOTO entries are a contiguous prefix; TAKE/GIVE (if present) come
             # after, before WAIT.
             seen_non_goto = False
@@ -88,51 +91,80 @@ def test_action_index_type_alignment():
 # ---------------------------------------------------------------------------
 
 
-def test_handoff_transfer_moves_item_and_releases_both():
+def test_handoff_auto_transfers_when_empty_receiver_arrives_last():
+    """A handoff is AUTOMATIC on rendezvous: when two partner carriers meet at
+    the matching pose, one loaded + one empty, the pallet moves to the empty
+    partner the instant the second one arrives — no GIVE/TAKE action. Here the
+    loaded giver waits and the empty receiver arrives last."""
     engine = _engine("tiny_medipol")
     topo = engine.topology
     # A lift L1 and a shuttle S1 are handoff partners in tiny_medipol.
     lift, shuttle = "L1", "S1"
     assert shuttle in topo.handoff_partners[lift]
 
-    # Put a known item on one of the shuttle's shelves.
+    # Put a known item on one of the shuttle's shelves; shuttle picks it up.
     shelf = sorted(topo.accessible_shelves[shuttle])[0]
     engine.state.shelves[shelf].stack.append(Pallet(id=4242, contents="small"))
-
-    # Shuttle: GOTO that shelf, TAKE the item.
     engine.submit(Goto(carrier_id=shuttle, target=DockRef("shelf", shelf)))
     _run_to_idle(engine, shuttle)
     engine.submit(Take(carrier_id=shuttle))
     _run_to_idle(engine, shuttle)
-    assert engine.state.carriers[shuttle].load is not None
     assert engine.state.carriers[shuttle].load.id == 4242
 
-    # Shuttle: GOTO its handoff pose toward the lift, then WAIT (the giver).
+    # Loaded shuttle: GOTO its handoff pose toward the lift, then WAIT.
     engine.submit(Goto(carrier_id=shuttle, target=DockRef("handoff", lift)))
     _run_to_idle(engine, shuttle)
     engine.wait(shuttle)
-    assert engine.state.carriers[shuttle].waiting
 
-    # Lift: GOTO its matching handoff pose toward the shuttle, then TAKE — this
-    # is the receiver-initiated transfer; it locks the waiting shuttle.
+    # Empty lift: GOTO the matching pose. Its ARRIVAL auto-fires the transfer —
+    # no TAKE/GIVE is submitted by anyone.
     engine.submit(Goto(carrier_id=lift, target=DockRef("handoff", shuttle)))
     _run_to_idle(engine, lift)
-    # The lift's arrival (a state-change event) woke the waiting shuttle; in the
-    # env loop the shuttle is re-queried and re-chooses WAIT. Model that.
-    engine.wait(shuttle)
-    take = Take(carrier_id=lift)
-    assert take.partner_to_receive_from(engine.state, topo) == shuttle
-    engine.submit(take)
-    # While the transfer is in flight both carriers are locked on the SAME cmd.
-    assert engine.state.carriers[shuttle].is_busy
-    _run_to_idle(engine, lift)
 
-    # Item moved to the lift; both carriers released and empty/loaded correctly.
+    # Item moved to the lift; both released and empty/loaded correctly.
     assert engine.state.carriers[lift].load is not None
     assert engine.state.carriers[lift].load.id == 4242
     assert engine.state.carriers[shuttle].load is None
     assert not engine.state.carriers[lift].is_busy
     assert not engine.state.carriers[shuttle].is_busy
+
+
+def test_handoff_auto_transfers_when_loaded_carrier_arrives_last():
+    """Symmetric: the empty receiver waits and the loaded giver arrives last.
+    The transfer still auto-fires on rendezvous, and there is no manual
+    handoff GIVE/TAKE action enumerated at a handoff pose."""
+    engine = _engine("tiny_medipol")
+    topo = engine.topology
+    lift, shuttle = "L1", "S1"
+
+    shelf = sorted(topo.accessible_shelves[shuttle])[0]
+    engine.state.shelves[shelf].stack.append(Pallet(id=4242, contents="small"))
+    engine.submit(Goto(carrier_id=shuttle, target=DockRef("shelf", shelf)))
+    _run_to_idle(engine, shuttle)
+    engine.submit(Take(carrier_id=shuttle))
+    _run_to_idle(engine, shuttle)
+    assert engine.state.carriers[shuttle].load.id == 4242
+
+    # Empty lift (the receiver): GOTO its pose, then WAIT.
+    engine.submit(Goto(carrier_id=lift, target=DockRef("handoff", shuttle)))
+    _run_to_idle(engine, lift)
+    engine.wait(lift)
+    assert engine.state.carriers[lift].load is None
+
+    # Loaded shuttle arrives last at the matching pose. Handoffs are automatic,
+    # so even before the transfer there is NO manual GIVE action to enumerate.
+    engine.submit(Goto(carrier_id=shuttle, target=DockRef("handoff", lift)))
+    _run_to_idle(engine, shuttle)
+
+    # Transfer fired on arrival.
+    assert engine.state.carriers[lift].load is not None
+    assert engine.state.carriers[lift].load.id == 4242
+    assert engine.state.carriers[shuttle].load is None
+    assert not engine.state.carriers[lift].is_busy
+    assert not engine.state.carriers[shuttle].is_busy
+    # No manual handoff action is offered at a handoff pose (auto only).
+    entries = enumerate_actions(lift, engine.state, topo, engine.queue)
+    assert all(e.type not in (ActionType.TAKE, ActionType.GIVE) for e in entries)
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +232,77 @@ def test_wait_serves_retrieve_from_held_target():
 # ---------------------------------------------------------------------------
 # 4. No-immediate-inverse masking guard
 # ---------------------------------------------------------------------------
+
+
+def test_no_immediate_reverse_goto():
+    """After GOTOing to a shelf/handoff, going straight back to where it came
+    from (no TAKE/GIVE in between) is masked — except returning to a room."""
+    engine = _engine("tiny_medipol")
+    carrier = "L1"
+    topo = engine.topology
+    room = next(iter(topo.accessible_rooms[carrier]))
+    shelf_a = sorted(topo.accessible_shelves[carrier])[0]
+    shelf_b = sorted(topo.accessible_shelves[carrier])[1]
+    cs = engine.state.carriers[carrier]
+
+    def goto_targets():
+        return {
+            e.target
+            for e in enumerate_actions(carrier, engine.state, topo, engine.queue)
+            if e.type == ActionType.GOTO
+        }
+
+    # --- shelf reverse is masked ---
+    engine.submit(Goto(carrier_id=carrier, target=DockRef("shelf", shelf_a)))
+    _run_to_idle(engine, carrier)
+    engine.submit(Goto(carrier_id=carrier, target=DockRef("shelf", shelf_b)))
+    _run_to_idle(engine, carrier)
+    assert DockRef("shelf", shelf_a) not in goto_targets()   # reverse masked
+    assert any(t.kind == "shelf" for t in goto_targets())    # others reachable
+
+    # A TAKE at shelf_b lifts the guard → reverse to shelf_a allowed again.
+    engine.state.shelves[shelf_b].stack = [Pallet(id=7, contents="small")]
+    engine.submit(Take(carrier_id=carrier))
+    _run_to_idle(engine, carrier)
+    assert DockRef("shelf", shelf_a) in goto_targets()
+
+    # --- reverse to a ROOM is always allowed ---
+    cs.load = Pallet(id=8, contents="empty")     # so GOTO(room) passes its own gate
+    cs.docked_at = DockRef("room", room)
+    cs.came_from = None
+    cs.last_take_give = None
+    engine.submit(Goto(carrier_id=carrier, target=DockRef("shelf", shelf_a)))
+    _run_to_idle(engine, carrier)                # came_from is now the room
+    assert DockRef("room", room) in goto_targets()
+
+
+def test_wait_is_legal_anywhere_for_every_carrier():
+    """WAIT is now unconditionally legal: any carrier may rest anywhere — at a
+    shelf, at a room, at a handoff pose, or undocked. The loiter mask is gone;
+    the all-wait stall is handled by the env's penalty + re-query rescue."""
+    engine = _engine("tiny_medipol")
+    topo = engine.topology
+
+    def has_wait(c):
+        return any(
+            e.type == ActionType.WAIT
+            for e in enumerate_actions(c, engine.state, topo, engine.queue)
+        )
+
+    for carrier in topo.carriers:
+        cs = engine.state.carriers[carrier]
+        # At a shelf — previously masked for room-serving carriers.
+        shelf = sorted(topo.accessible_shelves[carrier])[0]
+        cs.docked_at = DockRef("shelf", shelf)
+        assert has_wait(carrier), f"{carrier} should be able to WAIT at a shelf"
+        # At a room (room carriers only).
+        rooms = sorted(topo.accessible_rooms[carrier])
+        if rooms:
+            cs.docked_at = DockRef("room", rooms[0])
+            assert has_wait(carrier)
+        # Undocked.
+        cs.docked_at = None
+        assert has_wait(carrier)
 
 
 def test_no_immediate_give_back_after_take():

@@ -159,8 +159,9 @@ class Goto(Command):
     ) -> SimTime:
         cs = state.carriers[self.carrier_id]
         c = topo.carriers[self.carrier_id]
-        # In transit: undock and clear the immediate-inverse guard (the carrier
-        # is moving away from wherever it was).
+        # In transit: remember the dock we're leaving (for the reverse-GOTO
+        # guard), then undock and clear the immediate-inverse guard.
+        cs.came_from = cs.docked_at
         cs.docked_at = None
         cs.last_take_give = None
         dst = _dockref_position(self.target, self.carrier_id, topo)
@@ -277,6 +278,34 @@ class Give(Command):
     def carrier(self) -> CarrierId:
         return self.carrier_id
 
+    def partner_to_give_to(
+        self, state: FacilityState, topo: Topology
+    ) -> "CarrierId | None":
+        """If docked at a handoff pose whose paired partner is WAITing there
+        EMPTY and ready to receive, return that partner id; else None. Mirror of
+        `Take.partner_to_receive_from`: there the partner is the loaded giver,
+        here it is the empty receiver — the transfer is loaded→empty either way,
+        only the initiator differs (the holder pushes vs. the empty one pulls)."""
+        cs = state.carriers[self.carrier_id]
+        d = cs.docked_at
+        if d is None or d.kind != "handoff":
+            return None
+        partner_id = d.id
+        ps = state.carriers.get(partner_id)
+        if ps is None:
+            return None
+        pd = ps.docked_at
+        if (
+            ps.waiting
+            and not ps.is_busy
+            and ps.load is None
+            and pd is not None
+            and pd.kind == "handoff"
+            and pd.id == self.carrier_id
+        ):
+            return partner_id
+        return None
+
     def check_preconditions(self, state: FacilityState, topo: Topology) -> None:
         cs = state.carriers[self.carrier_id]
         if cs.is_busy:
@@ -286,18 +315,26 @@ class Give(Command):
                 f"carrier {self.carrier_id} holds nothing; GIVE requires an item"
             )
         d = cs.docked_at
-        if d is None or d.kind != "shelf":
-            raise PreconditionError("GIVE only onto the docked shelf")
-        shelf = topo.shelves.get(d.id)
-        if shelf is None:
-            raise PreconditionError(f"unknown shelf {d.id!r}")
-        ss = state.shelves[d.id]
-        if not shelf.accepts(cs.load.size_for_shelf):
-            raise PreconditionError(
-                f"shelf {d.id} rejects size {cs.load.size_for_shelf!r}"
-            )
-        if ss.depth + _pending_give_count(state, d.id) >= shelf.capacity:
-            raise PreconditionError(f"shelf {d.id} is full")
+        if d is None:
+            raise PreconditionError(f"carrier {self.carrier_id} is not docked")
+        if d.kind == "shelf":
+            shelf = topo.shelves.get(d.id)
+            if shelf is None:
+                raise PreconditionError(f"unknown shelf {d.id!r}")
+            ss = state.shelves[d.id]
+            if not shelf.accepts(cs.load.size_for_shelf):
+                raise PreconditionError(
+                    f"shelf {d.id} rejects size {cs.load.size_for_shelf!r}"
+                )
+            if ss.depth + _pending_give_count(state, d.id) >= shelf.capacity:
+                raise PreconditionError(f"shelf {d.id} is full")
+        elif d.kind == "handoff":
+            if self.partner_to_give_to(state, topo) is None:
+                raise PreconditionError(
+                    "no partner WAITing empty to receive at this pose"
+                )
+        else:
+            raise PreconditionError("GIVE only onto a shelf or to a partner carrier")
 
     def start(
         self, state: FacilityState, topo: Topology, durations, now: SimTime
@@ -305,16 +342,28 @@ class Give(Command):
         cs = state.carriers[self.carrier_id]
         d = cs.docked_at
         assert d is not None  # guaranteed by check_preconditions
-        return now + durations.shelf_op("give", topo.shelves[d.id])
+        if d.kind == "shelf":
+            return now + durations.shelf_op("give", topo.shelves[d.id])
+        return now + durations.handoff()
 
     def complete(self, state: FacilityState, topo: Topology) -> None:
         cs = state.carriers[self.carrier_id]
         d = cs.docked_at
         pallet = cs.load
         assert d is not None and pallet is not None  # guaranteed by preconditions
-        state.shelves[d.id].stack.append(pallet)
-        cs.load = None
-        cs.last_take_give = ("give", d)
+        if d.kind == "shelf":
+            state.shelves[d.id].stack.append(pallet)
+            cs.load = None
+            cs.last_take_give = ("give", d)
+        else:
+            # Handoff push: hand our load to the empty WAITing partner. Mirror of
+            # Take.complete's pull; the partner is stamped as having taken.
+            partner_id = d.id
+            ps = state.carriers[partner_id]
+            ps.load = pallet
+            cs.load = None
+            cs.last_take_give = ("give", d)
+            ps.last_take_give = ("take", DockRef("handoff", self.carrier_id))
 
 
 # ---------------------------------------------------------------------------

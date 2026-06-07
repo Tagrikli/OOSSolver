@@ -1,6 +1,6 @@
 """Unified, pluggable reward suite.
 
-One mechanism for every env (base Environment, ContinuousEnv, SingleTaskEnv). No
+One mechanism for every env (base Environment, RetrieveEnv, SingleTaskEnv). No
 more three parallel reward configs with duplicated logic.
 
 The model:
@@ -21,8 +21,8 @@ The model:
 Build a system from a config with the factories at the bottom (keeps the CLI
 knobs working) or compose terms by hand to experiment:
 
-    sys = RewardSystem([DeliveryTerm(50), ServeTerm(15), MovementTerm(1e-4)])
-    total, breakdown = sys.compute(ctx)        # e.g. (49.99, {"DELIVER": 50, "MOVE": -0.01})
+    sys = RewardSystem([DeliveryTerm(50, scale_by_depth=False), ServeTerm(15)])
+    total, breakdown = sys.compute(ctx)        # e.g. (50.0, {"DELIVER": 50})
 
 Design rule (the thing that prevents the reward exploits): every term is a
 pure function of `(s, a, s')`. If a term needs to know *how* a state was
@@ -63,19 +63,15 @@ class StepEvents:
     # delivery count when every target was at depth 0.
     delivery_depth_weight: int = 0
     n_stores_served: int = 0
-    # ungated symmetric room transitions (continuous shaping)
-    n_room_stage: int = 0
-    n_room_unstage: int = 0
-    n_room_evacuate: int = 0
-    n_wrong_item: int = 0
-    # retrieve-gated transitions (base reward)
-    n_stage_events: int = 0
-    n_unstage_events: int = 0
     # decision-point snapshot flags (pre-advance)
     all_carriers_waiting: bool = False
     retrieve_pending_at_decision: bool = False
     room_has_staged_empty_at_decision: bool = False
     idle_with_retrieve: bool = False
+    # Every carrier chose WAIT while work still remains: a requested item is
+    # pending, OR (nothing requested) not every room is staged. The env both
+    # charges this (AllWaitWhileTaskTerm) and breaks the stall (wake + re-query).
+    all_wait_while_task: bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -107,17 +103,28 @@ class RewardContext:
     # --- action / movement cost ---
     movement_distance: float = 0.0
 
-    # --- room-load transitions (free / empty / filled) ---
-    n_stage: int = 0               # free → empty   (an empty staged at a room)
-    n_unstage: int = 0             # empty → free   (a staged empty removed)
-    n_evac: int = 0                # filled → free  (a car stowed back out)
-    n_wrong: int = 0               # free → filled non-target (a wrong car in)
-
     # --- decision-point snapshot flags (pre-advance) ---
     all_carriers_waiting: bool = False
     retrieve_pending: bool = False
     room_has_staged_empty: bool = False
     idle_with_retrieve: bool = False   # a retrieve pending AND no carrier acting
+    # Every carrier WAITing while work remains (see StepEvents.all_wait_while_task).
+    all_wait_while_task: bool = False
+
+    # --- staging events (RetrieveEnv): per-room-carrier (s, a, s') transitions ---
+    # "staged" = a room carrier docked at its room holding an EMPTY pallet. The env
+    # computes these counts from the pre-action snapshot (s) and the post-advance
+    # state (s'); the StagingEventTerm scores them, staying a pure function.
+    n_arrived_staged: int = 0       # not-staged(s) → staged(s')           (a GOTO-room landed)
+    n_left_staged: int = 0          # staged(s) → not-staged(s')           (GOTO'd away staged)
+    n_wait_while_staged: int = 0    # staged(s) ∧ acting carrier WAITs ∧ staged(s')
+    # REQUESTED-item events, the mirror of the staging trio over the "requested
+    # pallet docked at a room" delivery pose (observable because the serve is a
+    # later WAIT). leave is gated on the carrier leaving the room, so the serving
+    # WAIT is not double-counted as a leave.
+    n_requested_arrived: int = 0    # not-pose(s) → pose(s')              (brought it in)
+    n_requested_wait: int = 0       # pose(s) ∧ acting carrier WAITs      (serves it)
+    n_requested_left: int = 0       # pose(s) ∧ carrier left the room     (carried away)
 
     # --- env-owned counters / clock (passed in so terms stay pure) ---
     ticks_since_completion: int = 0
@@ -221,134 +228,165 @@ class ServeTerm(RewardTerm):
         return self.bonus * ctx.n_stores_served if ctx.n_stores_served > 0 else 0.0
 
 
-class SuccessTerm(RewardTerm):
-    """+bonus once when a single-task episode reaches its goal."""
-    label = "SUCCESS"
+class IdleWhileTaskTerm(RewardTerm):
+    """−penalty per unmet 'work remains' condition on an instant where EVERY
+    carrier chose to WAIT. Two additive charges of the same magnitude:
 
-    def __init__(self, bonus: float) -> None:
-        self.bonus = bonus
+      · a Retrieve is still pending           → −penalty
+      · no room has a staged empty yet        → −penalty
+
+    so an all-idle instant with both pending pays −2·penalty. This is the
+    countermeasure to the unrecoverable all-idle rollout: once both carriers
+    park with the task untouched, nothing wakes them and the episode drains out,
+    so we make global idle-while-work strictly costly.
+
+    Guard: a step that actually served a customer this advance (a delivery or a
+    store) is productive — a WAIT at a room IS the serve trigger — so it is
+    never charged, even though `all_carriers_waiting` is true at that instant.
+    """
+    label = "IDLE_TASK"
+
+    def __init__(self, penalty: float) -> None:
+        self.penalty = penalty
 
     def compute(self, ctx: RewardContext) -> float:
-        return self.bonus if ctx.success else 0.0
+        if self.penalty <= 0 or not ctx.all_carriers_waiting:
+            return 0.0
+        # A WAIT that delivered/served this step is productive, not idle.
+        if ctx.n_deliveries > 0 or ctx.n_stores_served > 0:
+            return 0.0
+        charges = 0
+        if ctx.retrieve_pending:
+            charges += 1
+        if not ctx.room_has_staged_empty:
+            charges += 1
+        return -self.penalty * charges
+
+
+class AllWaitWhileTaskTerm(RewardTerm):
+    """−penalty (a single flat charge) on an instant where EVERY carrier chose
+    WAIT while work still remains:
+
+      · a requested item is still pending,                       OR
+      · nothing is requested but not every room is staged.
+
+    The env evaluates that condition once (`ctx.all_wait_while_task`) and, when
+    it holds, ALSO wakes the carriers and re-opens a decision — so this term and
+    the rescue fire together: it discourages the all-idle stall *and* breaks it
+    (a re-sampled action escapes). Unlike `IdleWhileTaskTerm` this is one charge,
+    not additive per unmet condition. `penalty` is a positive magnitude; the
+    contribution is its negation. 0 = off."""
+    label = "ALL_WAIT"
+
+    def __init__(self, penalty: float) -> None:
+        self.penalty = penalty
+
+    def compute(self, ctx: RewardContext) -> float:
+        if self.penalty <= 0:
+            return 0.0
+        return -self.penalty if ctx.all_wait_while_task else 0.0
+
+
+class StagingEventTerm(RewardTerm):
+    """Pure (s, a, s') staging rewards for room carriers, scored from the event
+    counts the env puts on the context. With "staged" = a room carrier docked at
+    its room holding an empty pallet:
+
+        arrive : not-staged(s) → staged(s')        +reward_arrive · n_arrived_staged
+        wait   : staged(s) ∧ a=WAIT ∧ staged(s')   +reward_wait   · n_wait_while_staged
+        leave  : staged(s) → not-staged(s')        −penalty_leave · n_left_staged
+
+    A car carrier leaving to STORE its car holds a car (not an empty) so it was
+    never staged → no leave penalty (the store maneuver stays free). An
+    initially-staged carrier fails the `not-staged(s)` half of arrive, so the
+    start state never pays out.
+
+    The env owns the pre-action `s` snapshot — a carrier's dock/load mutates in
+    place the instant an action is submitted (a GOTO clears `docked_at`), exactly
+    like the PBRS Φ snapshot — but the *scoring* is this pure term. Keep
+    reward_arrive < penalty_leave so a leave→return loop nets negative."""
+    label = "STAGE"
+
+    def __init__(self, reward_arrive: float, reward_wait: float, penalty_leave: float) -> None:
+        self.reward_arrive = float(reward_arrive)
+        self.reward_wait = float(reward_wait)
+        self.penalty_leave = float(penalty_leave)
+
+    def compute(self, ctx: RewardContext) -> float:
+        return (
+            self.reward_arrive * ctx.n_arrived_staged
+            + self.reward_wait * ctx.n_wait_while_staged
+            - self.penalty_leave * ctx.n_left_staged
+        )
+
+
+class RequestedEventTerm(RewardTerm):
+    """Pure (s, a, s') rewards for delivering a REQUESTED item — the mirror of
+    StagingEventTerm over the "requested pallet docked at a room" delivery pose:
+
+        arrive : not-pose(s) → pose(s')          +reward_arrive · n_requested_arrived
+        wait   : pose(s) ∧ a=WAIT (serves it)    +reward_wait   · n_requested_wait
+        leave  : pose(s) ∧ carrier left the room −penalty_leave · n_requested_left
+
+    leave is gated on the carrier actually leaving the room (not on the pose
+    ending), so the serving WAIT — which turns the car into an empty and ends the
+    pose — is NOT charged as a leave; only carrying the car away unserved is. Keep
+    reward_arrive < penalty_leave so a bring→leave bounce nets negative. The env
+    computes the counts; this stays a pure function."""
+    label = "REQ"
+
+    def __init__(self, reward_arrive: float, reward_wait: float, penalty_leave: float) -> None:
+        self.reward_arrive = float(reward_arrive)
+        self.reward_wait = float(reward_wait)
+        self.penalty_leave = float(penalty_leave)
+
+    def compute(self, ctx: RewardContext) -> float:
+        return (
+            self.reward_arrive * ctx.n_requested_arrived
+            + self.reward_wait * ctx.n_requested_wait
+            - self.penalty_leave * ctx.n_requested_left
+        )
 
 
 class MovementTerm(RewardTerm):
-    """−weight · distance travelled this step (efficiency pressure)."""
+    """−cost · total carrier travel this step (Σ |Δposition| in mm over all
+    carriers, from `ctx.movement_distance`).
+
+    A tiny per-mm charge so a move is only worth making when it earns more than
+    its distance: relevant carriers still move (their pickup / handoff / delivery
+    reward dominates the cost), irrelevant carriers learn to stay put, and paths
+    get shorter. This is NOT a potential — it genuinely shifts the optimum toward
+    stillness, which is the point, but it can reintroduce WAIT-collapse if too
+    large. Keep it small (a full solve's travel × cost ≪ the delivery reward) and
+    watch the greedy curve. 0 = off."""
     label = "MOVE"
 
-    def __init__(self, weight: float) -> None:
-        self.weight = weight
+    def __init__(self, cost: float) -> None:
+        self.cost = cost
 
     def compute(self, ctx: RewardContext) -> float:
-        return -self.weight * ctx.movement_distance if ctx.movement_distance > 0 else 0.0
-
-
-class WrongItemTerm(RewardTerm):
-    """−penalty per non-requested car placed at a room (free → filled)."""
-    label = "WRONG"
-
-    def __init__(self, penalty: float) -> None:
-        self.penalty = penalty
-
-    def compute(self, ctx: RewardContext) -> float:
-        return -self.penalty * ctx.n_wrong if ctx.n_wrong > 0 else 0.0
-
-
-class EvacTerm(RewardTerm):
-    """+weight per car stowed out of a room (filled → free). Symmetric partner
-    of WrongItemTerm: pass the same magnitude so a car in-and-out nets zero."""
-    label = "EVAC"
-
-    def __init__(self, weight: float) -> None:
-        self.weight = weight
-
-    def compute(self, ctx: RewardContext) -> float:
-        return self.weight * ctx.n_evac if ctx.n_evac > 0 else 0.0
-
-
-class StageTerm(RewardTerm):
-    """+weight per empty staged into a room (free → empty)."""
-    label = "STAGE"
-
-    def __init__(self, weight: float) -> None:
-        self.weight = weight
-
-    def compute(self, ctx: RewardContext) -> float:
-        return self.weight * ctx.n_stage if ctx.n_stage > 0 else 0.0
-
-
-class UnstageTerm(RewardTerm):
-    """−weight per staged empty removed (empty → free). Symmetric partner of
-    StageTerm: same magnitude → stage/unstage round-trip nets zero."""
-    label = "UNSTAGE"
-
-    def __init__(self, weight: float) -> None:
-        self.weight = weight
-
-    def compute(self, ctx: RewardContext) -> float:
-        return -self.weight * ctx.n_unstage if ctx.n_unstage > 0 else 0.0
-
-
-class TimeTerm(RewardTerm):
-    """−weight · (steps since the last completion). Escalating throughput
-    pressure, reset on any completion (the counter is env-owned)."""
-    label = "TIME"
-
-    def __init__(self, weight: float) -> None:
-        self.weight = weight
-
-    def compute(self, ctx: RewardContext) -> float:
-        t = ctx.ticks_since_completion
-        return -self.weight * t if (self.weight > 0 and t > 0) else 0.0
-
-
-class DtTimeTerm(RewardTerm):
-    """−weight · dt (sim-seconds elapsed this step), but NOT on a success step.
-    A goal-reaching WAIT can skip a huge dt; charging it would swamp the
-    success bonus. Used by the single-task env (vs `TimeTerm`'s tick drip)."""
-    label = "TIME"
-
-    def __init__(self, weight: float) -> None:
-        self.weight = weight
-
-    def compute(self, ctx: RewardContext) -> float:
-        if ctx.success or self.weight <= 0 or ctx.dt <= 0:
+        if self.cost <= 0 or ctx.movement_distance <= 0:
             return 0.0
-        return -self.weight * ctx.dt
+        return -self.cost * ctx.movement_distance
 
 
-class AllIdleRetrieveTerm(RewardTerm):
-    """−penalty once when every carrier WAITs while a retrieve is pending."""
-    label = "IDLE_RETR"
+class ProgressTerm(RewardTerm):
+    """Dense progress shaping: `Φ(s') − Φ(s)` — the un-discounted sibling of
+    `PotentialTerm`.
 
-    def __init__(self, penalty: float) -> None:
-        self.penalty = penalty
+    Drops the γ that makes PBRS policy-invariant. That trade is deliberate: with
+    γ<1 and Φ negative (our Φ is dominated by `−steps_to_deliver`), PBRS pays a
+    do-nothing step `(γ−1)·Φ > 0` — the idle-drip that rewards parking and lets
+    the policy collapse to WAIT. Here a no-op step pays exactly `Φ'−Φ = 0`, so
+    the only way to earn shaping is to actually raise Φ (dig the target shallower,
+    TAKE it, carry it roomward). Same per-step density as PBRS, no drip — at the
+    cost of policy-invariance (which is the point: we WANT a progress bias)."""
 
-    def compute(self, ctx: RewardContext) -> float:
-        return -self.penalty if (ctx.all_carriers_waiting and ctx.retrieve_pending) else 0.0
-
-
-class AllIdleNoRoomEmptyTerm(RewardTerm):
-    """−penalty once when every carrier WAITs and no room has a staged empty."""
-    label = "IDLE_ROOM"
-
-    def __init__(self, penalty: float) -> None:
-        self.penalty = penalty
+    def __init__(self, label: str = "PROGRESS") -> None:
+        self.label = label
 
     def compute(self, ctx: RewardContext) -> float:
-        return -self.penalty if (ctx.all_carriers_waiting and not ctx.room_has_staged_empty) else 0.0
-
-
-class IdleWithRetrieveTerm(RewardTerm):
-    """−penalty when a retrieve is pending and no carrier is mid-command (the
-    base Environment's idle penalty — fires per step, not gated on all-waiting)."""
-    label = "IDLE"
-
-    def __init__(self, penalty: float) -> None:
-        self.penalty = penalty
-
-    def compute(self, ctx: RewardContext) -> float:
-        return -self.penalty if ctx.idle_with_retrieve else 0.0
+        return ctx.potential_after - ctx.potential_before
 
 
 class PotentialTerm(RewardTerm):
@@ -381,32 +419,21 @@ class PotentialTerm(RewardTerm):
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def continuous_system(cfg: Any) -> RewardSystem:
-    """Reproduce `ContinuousRewardConfig` exactly as a RewardSystem. EVAC reuses
-    `wrong_item_penalty` and STAGE/UNSTAGE share `stage_bonus` (symmetric)."""
-    return RewardSystem([
-        DeliveryTerm(cfg.delivery_bonus),
-        ServeTerm(cfg.store_serve_bonus),
-        WrongItemTerm(cfg.wrong_item_penalty),
-        EvacTerm(cfg.wrong_item_penalty),
-        StageTerm(cfg.stage_bonus),
-        UnstageTerm(cfg.stage_bonus),
-        TimeTerm(cfg.time_weight),
-        MovementTerm(cfg.movement_weight),
-        AllIdleRetrieveTerm(cfg.all_idle_retrieve_penalty),
-        AllIdleNoRoomEmptyTerm(cfg.all_idle_no_room_empty_penalty),
-    ])
+def delivery_system(cfg: Any) -> RewardSystem:
+    """The minimal retrieve reward: ONE term, nothing else.
 
+      - DELIVER (flat) — +cfg.reward_deliver each time a requested item is
+        actually delivered to a room (the agent's dig → TAKE → carry → dock →
+        WAIT chain; parked-car frees are excluded by DeliveryTerm).
 
-def single_task_system(cfg: Any) -> RewardSystem:
-    """Reproduce `SingleTaskRewardConfig` as a RewardSystem. Time is dt-based
-    and skipped on the success step (`DtTimeTerm`)."""
+    No potential, no movement/time penalty, no idle penalty. The delivery IS the
+    whole objective and the episode ends on it, so the reward is sparse by
+    design. DELIVER is flat (`scale_by_depth=False`): a depth-2 dig pays the same
+    as a depth-0 — there is no shaping for depth-scaling to double-count, so the
+    signal stays a clean "did you deliver the requested item." Pair with
+    `RetrieveEnv`."""
     return RewardSystem([
-        SuccessTerm(cfg.reward_success),
-        WrongItemTerm(cfg.penalty_wrong_item_to_room),
-        IdleWithRetrieveTerm(cfg.penalty_idle_with_retrieve),
-        MovementTerm(cfg.movement_weight),
-        DtTimeTerm(cfg.time_weight),
+        DeliveryTerm(cfg.reward_deliver, scale_by_depth=False),
     ])
 
 
@@ -418,13 +445,22 @@ def base_system(cfg: Any) -> RewardSystem:
       - DELIVER (flat) — per requested item delivered; depth is rewarded by the
         retrieval-progress potential, not here.
       - SERVE          — per store served onto a staged empty.
-      - SHAPE (PBRS)   — γ·Φ(s′) − Φ(s) over the retrieval / room-ready /
-        wrong-car potential. Pump-safe: staging is a potential (a leave-return
-        telescopes to a net loss under γ), and the flat payouts each consume a
-        queued customer.
+      - SHAPE / PROGRESS — the per-step shaping over the retrieval / room-ready /
+        wrong-car potential. Two flavours, picked by `cfg.dense_progress`:
+          · False (default) → SHAPE = γ·Φ(s′) − Φ(s), the policy-invariant PBRS.
+            Pump-safe: staging is a potential (a leave-return telescopes to a net
+            loss under γ), and the flat payouts each consume a queued customer.
+          · True             → PROGRESS = Φ(s′) − Φ(s), the un-discounted dense
+            form. Drops policy-invariance to kill the γ<1 idle-drip (a do-nothing
+            step pays 0 instead of (γ−1)·Φ > 0). Same progress signal, no drip.
+      - IDLE_TASK      — −penalty per unmet 'work remains' condition (retrieve
+        pending / no room staged) on an all-carriers-WAIT instant. Off (0) by
+        default; breaks the unrecoverable all-idle rollout when enabled.
     """
+    shaping = ProgressTerm() if getattr(cfg, "dense_progress", False) else PotentialTerm()
     return RewardSystem([
         DeliveryTerm(cfg.reward_deliver, scale_by_depth=False),
         ServeTerm(cfg.reward_serve),
-        PotentialTerm(),
+        shaping,
+        IdleWhileTaskTerm(cfg.penalty_idle_while_task),
     ])

@@ -5,12 +5,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from oos.env.reward import RewardConfig
 from oos.facilities import get_facility
-from oos.learn.single_task_env import (
-    SingleTaskConfig,
-    SingleTaskEnv,
-    SingleTaskRewardConfig,
-)
+from oos.env.single_task_env import SingleTaskConfig, SingleTaskEnv
 from oos.sim.durations import LinearDurations
 from oos.sim.facility import SimEngine
 from oos.sim.shuffle import _layout_is_solvable
@@ -215,7 +212,7 @@ def test_retrieve_route_targets_handoff_shelves():
     )
     env = SingleTaskEnv(
         facility_factory=get_facility("tiny"), task_config=cfg,
-        reward_config=SingleTaskRewardConfig(),
+        reward_config=RewardConfig(),
     )
     for seed in range(8):
         env.reset(seed=seed)
@@ -238,7 +235,7 @@ def test_target_depth_steps_down_when_unreachable():
     )
     env = SingleTaskEnv(
         facility_factory=get_facility("stacker"), task_config=cfg,
-        reward_config=SingleTaskRewardConfig(),
+        reward_config=RewardConfig(),
     )
     for seed in range(5):
         _obs, info = env.reset(seed=seed)
@@ -271,7 +268,7 @@ def test_single_task_retrieve_from_class_and_depth():
     )
     env = SingleTaskEnv(
         facility_factory=get_facility("stacker"), task_config=cfg,
-        reward_config=SingleTaskRewardConfig(),
+        reward_config=RewardConfig(),
     )
     for seed in range(10):
         env.reset(seed=seed)

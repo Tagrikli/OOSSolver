@@ -116,8 +116,9 @@ class SimDriver:
         agent.total_actions += 1
         agent.record_policy_query(querying)   # surface to viz dist panel
 
-        # Belt-and-suspenders: out-of-range action_idx → fall back to WAIT
-        # (always the last legal entry per enumerate_actions).
+        # Belt-and-suspenders: out-of-range action_idx → fall back to the last
+        # legal entry (WAIT when present; otherwise whatever is last — a room
+        # carrier at a shelf has no WAIT, so this is then a GOTO/TAKE/GIVE).
         live_n_legal = len(fac._ctx.decoder.entries)  # type: ignore[attr-defined]
         if not (0 <= action_idx < live_n_legal):
             action_idx = live_n_legal - 1

@@ -45,7 +45,7 @@ from oos.viz.pickers import (
 )
 from oos.viz.policy_swap import (
     apply_auto_queue,
-    generate_single_task,
+    generate_layout,
     load_policy,
     rewrap_with_mcts,
     swap_facility,
@@ -67,7 +67,7 @@ class _RunState:
     Grouped so every handler can read/mutate without needing closures.
     Layer hint per field:
 
-      sim    — `agent` (owns its Environment), `anim_time`, `original_env`
+      sim    — `agent` (owns its Environment), `anim_time`
       ui     — `renderer`, `picker`, `facility_picker`, `mode`, `paused`,
                `speed`, `zoom`, `dragging_fullness`, `active_policy_label`
       runtime— `surface`, `driver`, `toasts`, `running`, `pending_generate`,
@@ -89,7 +89,6 @@ class _RunState:
 
     # Sim
     anim_time: float
-    original_env: Environment
 
     # Viz / window
     renderer: Renderer
@@ -107,6 +106,10 @@ class _RunState:
 
     # Queues
     pending_generate: list = field(default_factory=list)
+    # Last generated layout's (fullness, seed) — `(facility, fullness, seed)`
+    # reproduces it; the C hotkey copies that as a layout code.
+    last_fullness: float = 0.5
+    last_seed: int = 0
 
     @property
     def facility(self) -> Environment:
@@ -236,7 +239,6 @@ class VizApp:
             help_modal=help_modal,
             wall_now_fn=wall_now,
             anim_time=facility.sim_time,
-            original_env=facility,
             renderer=renderer,
             zoom=zoom,
             window_w=self.window_w,
@@ -257,17 +259,17 @@ class VizApp:
     # ─────────────────────────────────────────────────────────────────────
 
     def _apply_pending_generate(self, s: _RunState) -> None:
-        """Apply any queued Generate before processing events. Done here
-        (not inside the event handler) because the env swap inside
-        generate_single_task re-wires the agent's Environment and we need to
-        resync anim_time."""
+        """Apply any queued Generate before processing events. Re-rolls the
+        current facility's layout in place (no env swap), then resyncs
+        anim_time."""
         while s.pending_generate:
             params = s.pending_generate.pop(0)
-            ok = generate_single_task(
-                params, s.agent, self.facility_name, s.toasts,
+            fullness = float(params.get("fullness", 0.5))
+            used_seed = generate_layout(
+                fullness, s.agent, s.toasts, seed=params.get("_seed"),
             )
-            if ok:
-                s.anim_time = s.agent.facility.sim_time
+            s.last_fullness, s.last_seed = fullness, used_seed
+            s.anim_time = s.agent.facility.sim_time
 
     def _tick_sim(self, s: _RunState, dt_wall: float) -> None:
         if s.mode == "anim" and not s.paused and not s.agent.done:
@@ -501,7 +503,9 @@ class VizApp:
         elif event.key == pygame.K_r:
             self._reset_env(s)
         elif event.key == pygame.K_v:
-            self._load_episode_from_clipboard(s)
+            self._load_layout_from_clipboard(s)
+        elif event.key == pygame.K_c:
+            self._copy_layout_code(s)
         elif event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
             target = {pygame.K_1: "empty", pygame.K_2: "small",
                       pygame.K_3: "big"}[event.key]
@@ -531,8 +535,6 @@ class VizApp:
                     new_renderer, pending_generate=s.pending_generate,
                     toasts=s.toasts, state=s,
                 )
-                # New facility → new R-revert baseline.
-                s.original_env = s.agent.facility
                 s.anim_time = s.agent.facility.sim_time
                 s.facility_picker.active = name
                 self.facility_name = name
@@ -561,39 +563,36 @@ class VizApp:
                     save_viz_state(self.runs_dir, policy_path=entry.path)
             s.picker.close()
 
-    def _load_episode_from_clipboard(self, s: _RunState) -> None:
-        """V-key / LOAD CODE button: read an episode code off the system
-        clipboard and regenerate its exact layout."""
+    def _copy_layout_code(self, s: _RunState) -> None:
+        """C-key: copy the LAST generated layout's code (facility + fullness +
+        seed) to the clipboard, so it can be pasted back (V) to reproduce it."""
+        from oos.sim.layout_code import encode_layout
+        from oos.viz.clipboard import write_clipboard_text
+        code = encode_layout(self.facility_name, s.last_fullness, s.last_seed)
+        if write_clipboard_text(code):
+            s.toasts.success(f"LAYOUT CODE COPIED  (seed {s.last_seed})", lifetime=3.0)
+        else:
+            s.toasts.error("CLIPBOARD WRITE UNAVAILABLE", lifetime=3.0)
+
+    def _load_layout_from_clipboard(self, s: _RunState) -> None:
+        """V-key: read a layout code off the clipboard and queue a Generate that
+        reproduces its exact layout on this facility."""
         from oos.viz.clipboard import read_clipboard_text
-        from oos.viz.policy_swap import load_episode_code
+        from oos.viz.policy_swap import load_layout_code
         text = read_clipboard_text()
         if not text:
-            s.toasts.error("CLIPBOARD EMPTY — copy an OOS1- code first", lifetime=3.0)
+            s.toasts.error("CLIPBOARD EMPTY — copy a layout code first", lifetime=3.0)
             return
-        load_episode_code(
-            text, self.facility_name, s.renderer.randomize_content,
-            s.pending_generate, s.toasts,
-        )
+        load_layout_code(text, self.facility_name, s.pending_generate, s.toasts)
 
     def _reset_env(self, s: _RunState) -> None:
-        """R-key handler. If we're on a Generate-spawned SingleTaskEnv,
-        revert to the original Environment on this facility instead of
-        re-rolling another single-task state."""
-        from oos.learn.single_task_env import SingleTaskEnv
+        """R-key handler: reset the current Environment (fresh layout from its
+        seeding), preserving the manual/auto-arrivals mode."""
         preserve_auto = s.agent.facility.auto_arrivals_enabled
-        reverted = False
-        if isinstance(s.agent.facility, SingleTaskEnv):
-            # Swap the agent back to the original base Environment.
-            s.agent.facility = s.original_env
-            s.agent.seed = self.seed
-            reverted = True
         s.agent.reset()
         s.agent.facility.set_auto_arrivals(preserve_auto)
         s.anim_time = s.agent.facility.sim_time
-        if reverted:
-            s.toasts.accent("ENV RESET (reverted from generated)", lifetime=3.0)
-        else:
-            s.toasts.accent("ENV RESET", lifetime=2.0)
+        s.toasts.accent("ENV RESET", lifetime=2.0)
 
     # ─────────────────────────────────────────────────────────────────────
     # Renderer construction / wiring
@@ -632,10 +631,6 @@ class VizApp:
             save_viz_state(self.runs_dir, randomize=self._randomize_cfg)
             pending_generate.append(params)
         r.randomize_content.on_generate = fire_generate
-        if state is not None:
-            r.randomize_content.on_load_code = (
-                lambda st=state: self._load_episode_from_clipboard(st)
-            )
         if getattr(self, "_randomize_cfg", None):
             r.randomize_content.set_values(self._randomize_cfg)
 

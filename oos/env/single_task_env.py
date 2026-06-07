@@ -1,7 +1,6 @@
 """Single-task episodic env: each episode is exactly one atomic goal.
 
-The task type is an EXPLICIT config knob (`SingleTaskConfig.task`), not a
-per-episode draw:
+Two task types:
 
   * **retrieve**: a specific pallet (could be empty / small / big) is marked
     as the Retrieve target. The agent succeeds when that pallet is
@@ -11,6 +10,11 @@ per-episode draw:
     action is WAIT. Rewarding only the wait — rather than the moment an
     empty first lands in the room — forces the agent to explicitly
     recognise the satisfied state instead of moving pallets forever.
+
+The env fixes the task / depth / route / room from `SingleTaskConfig`. Training
+and the viz both use the leaner `oos.env.retrieve_env.RetrieveEnv`; this env is
+now exercised only by the state-sampler / targeting tests. The per-episode
+selection hooks (`_choose_task`, `_choose_depth`, …) read the fixed config here.
 
 Episode termination:
   * On success → terminated=True, success reward paid.
@@ -32,20 +36,19 @@ Edge cases:
   * task=retrieve but no pallets exist at all → fall back to bring_empty if
     an empty exists, else raise (pathological topology).
 
-Reward:
-  * +reward_success on goal complete (then terminate).
-  * -penalty_wrong_item_to_room per non-target filled pallet placed at
-    the room (any phase).
-  * -penalty_idle_with_retrieve per step where a Retrieve is pending and
-    no carrier is mid-command (catches WAIT-spam during retrieve).
-  * -movement_weight × total carrier travel distance per step.
-
-The legacy stage/unstage/retrieve reward terms are unified into
-`reward_success` here. See SINGLE_TASK_ENV.md for the design rationale.
+Reward — the base env default, `base_system` (a `RewardConfig`): DELIVER
+(+ per requested item delivered) and SERVE (+ per store served) over the
+four-term shaping potential Φ (retrieval-progress / room-ready / wrong-car /
+shallowest-empty) plus the all-idle-while-work penalty, with the shaped term
+γ·Φ(s′) − Φ(s) supplied by `Environment._potential`. The retrieve task is paid
+by DELIVER on completion; the bring_empty (staging) task is rewarded by the
+room-ready potential (Φ rises when a carrier is staged with an empty). A
+completed task TERMINATES the episode. Set `env.reward_gamma` to the training γ.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -56,12 +59,8 @@ from oos.env.action import ActionType
 from oos.env.env import FacilityFactory, Environment
 from oos.env.observation import ObservationConfig
 from oos.env.reward import RewardConfig
-from oos.env.reward_system import (
-    RewardContext,
-    RewardSystem,
-    single_task_system,
-)
-from oos.learn import targeting
+from oos.env.reward_system import RewardSystem
+from oos.env import targeting
 from oos.sim.state import pallet_depth
 from oos.sim.state_sampler import (
     InitialStateSampler,
@@ -121,75 +120,47 @@ class SingleTaskConfig:
     max_solvable_retries: int = 50
 
 
-@dataclass(frozen=True)
-class SingleTaskRewardConfig:
-    """Reward shape for SingleTaskEnv.
-
-    `reward_success` unifies what used to be three separate event rewards
-    (retrieve completion, stage-empty-to-room, plus a generic 'task done'
-    bonus). Anything that ends the episode positively pays this once.
-    """
-
-    reward_success: float = 10.0
-    penalty_wrong_item_to_room: float = 5.0
-    penalty_idle_with_retrieve: float = 1.0
-    movement_weight: float = 0.01
-    # Per-sim-second penalty applied on every step EXCEPT the success
-    # step. Intent: punish idling/stalling directly instead of relying on
-    # `movement_weight`, which only fires when the carrier moves and so
-    # rewards the agent for parking forever. The success step is exempt
-    # so that a long-dt WAIT command (which can skip ahead until the
-    # next scheduler event) doesn't drown out `reward_success`.
-    time_weight: float = 0.0
-
-
 class SingleTaskEnv(Environment):
     """One-goal-per-episode env. Subclasses Environment to inherit the
-    observation, action, decoder, and step-time event bookkeeping; the
-    reward is recomputed from scratch in `step()` against
-    `SingleTaskRewardConfig`. The base class's RewardConfig is set to
-    all-zeros so its base reward suite produces 0 and we don't double-pay
-    anything.
+    observation, action, decoder, and step-time event bookkeeping.
+
+    Reward is the base env default, `base_system`: DELIVER + SERVE over the
+    four-term shaping potential + idle penalty, supplied a real `RewardConfig`
+    and computed by `Environment.advance` / `_potential`. The single-task layer
+    adds only success-detection and episode TERMINATION on top (the base env
+    truncates; here a completed task ends the episode). Set `env.reward_gamma`
+    to the training γ so the PBRS shaping telescopes.
     """
 
     def __init__(
         self,
         facility_factory: FacilityFactory,
         task_config: SingleTaskConfig | None = None,
-        reward_config: SingleTaskRewardConfig | None = None,
+        reward_config: RewardConfig | None = None,
         experiment_config: Optional[ExperimentConfig] = None,
         observation_config: Optional[ObservationConfig] = None,
         reward_system: Optional[RewardSystem] = None,
     ) -> None:
-        self._task_reward_cfg = reward_config or SingleTaskRewardConfig()
         super().__init__(
             facility_factory=facility_factory,
             experiment_config=experiment_config,
-            # The base reward suite is unused — SingleTaskEnv scores every step
-            # itself via `single_task_system` (set below). A default RewardConfig
-            # is fine; the base path is overridden.
-            reward_config=RewardConfig(),
+            # Reward path: base_system(reward_config) + Environment._potential.
+            # The single task only adds success-termination on top.
+            reward_config=reward_config or RewardConfig(),
             observation_config=observation_config,
         )
-        # Override the base reward suite with the single-task (success-based)
-        # one. Set AFTER super().__init__ so Environment.__init__'s
-        # `self._reward_system = base_system(...)` doesn't clobber it.
-        self._reward_system = reward_system or single_task_system(self._task_reward_cfg)
+        if reward_system is not None:
+            self._reward_system = reward_system
         self._task_cfg = task_config or SingleTaskConfig()
+        # Per-episode layout difficulty (fullness / big_ratio / disorder), taken
+        # from the fixed config. Set before the first _make_sampler call.
+        self._cur_difficulty: dict = self._config_difficulty()
         # Standalone initial-state sampler. SingleTaskEnv only owns the
         # task layer (task selection + retrieve target picking + reward
-        # shape); the world's random initial state is built by the
-        # generic sampler so other envs can reuse it.
-        self._sampler = InitialStateSampler(InitialStateSamplerConfig(
-            big_shelf_fullness=self._task_cfg.big_shelf_fullness,
-            system_fullness=self._task_cfg.system_fullness,
-            big_ratio=self._task_cfg.big_ratio,
-            big_disorder=self._task_cfg.big_disorder,
-            small_disorder=self._task_cfg.small_disorder,
-            room_state=self._task_cfg.room_state,
-            require_solvable=self._task_cfg.require_solvable,
-            max_solvable_retries=self._task_cfg.max_solvable_retries,
-        ))
+        # shape); the world's random initial state is built by the generic
+        # sampler so other envs can reuse it. Rebuilt per-episode in
+        # setup_episode (cheap) so subclasses can vary room_state / difficulty.
+        self._sampler = self._make_sampler(self._task_cfg.room_state)
         self._task: str = "retrieve"           # set in reset()
         self._target_id: Optional[int] = None  # set in reset() for retrieve
         self._success: bool = False
@@ -201,10 +172,16 @@ class SingleTaskEnv(Environment):
         self._target_depth: int = 0
         # One of {"empty", "small_item", "big_item"}.
         self._room_state: str = "empty"
+        # Per-episode retrieve axes (from / route), from the fixed config.
+        self._cur_from: str = self._task_cfg.retrieve_from
+        self._cur_route: str = self._task_cfg.retrieve_route
         self._rng: np.random.Generator = np.random.default_rng()
         # shelf_id -> "direct" | "handoff" (min handoffs from the shelf's
         # carrier to a room). Topology-derived; cached on first reset.
         self._route_by_shelf: dict[str, str] = {}
+        # Per-episode setup briefs (one per reset), so a trainer can print what
+        # was sampled this rollout. Bounded so eval/long runs can't grow it.
+        self._episode_log: deque = deque(maxlen=2048)
 
     # ------------------------------------------------------------------
     # Reset
@@ -216,9 +193,20 @@ class SingleTaskEnv(Environment):
         if not self._route_by_shelf:
             self._route_by_shelf = self._route_class_map(facility.topology)
 
-        self._task = self._task_cfg.task
+        # Per-episode task + initial-state selection. The `_choose_*` hooks
+        # return the fixed values from `SingleTaskConfig`.
+        self._task = self._choose_task(self._rng)
+        self._cur_difficulty = self._choose_difficulty(self._rng)
+        self._sampler = self._make_sampler(
+            self._choose_room_state(self._rng, self._task)
+        )
+        # Per-episode retrieve axes. `_target_depth` holds the REQUESTED depth
+        # here; the retrieve branch overwrites it with the realised depth that
+        # targeting actually found (it may step down).
+        self._cur_from = self._choose_from(self._rng)
+        self._cur_route = self._choose_route(self._rng)
         self._target_id = None
-        self._target_depth = int(self._task_cfg.target_depth)
+        self._target_depth = int(self._choose_depth(self._rng))
         self._success = False
 
         if self._task == "retrieve":
@@ -272,6 +260,79 @@ class SingleTaskEnv(Environment):
 
     def finalize_reset(self, obs, info):
         self._populate_task_info(info)
+        # Record this episode's realised setup for per-iteration logging.
+        self._episode_log.append({
+            "task": self._task,
+            "depth": self._target_depth,
+            "route": self._cur_route,
+            "from": self._cur_from,
+            "room": self._room_state,
+            "bsf": self._big_shelf_fullness,
+            "sys": self._system_fullness,
+        })
+
+    def drain_episode_log(self) -> list[dict]:
+        """Return the per-episode setup briefs since the last drain, and clear."""
+        out = list(self._episode_log)
+        self._episode_log.clear()
+        return out
+
+    # ------------------------------------------------------------------
+    # Per-episode selection hooks (return the fixed SingleTaskConfig values)
+    # ------------------------------------------------------------------
+
+    def _choose_task(self, rng: np.random.Generator) -> str:
+        """The task for this episode. Base env: the fixed config task."""
+        return self._task_cfg.task
+
+    def _choose_room_state(self, rng: np.random.Generator, task: str) -> RoomState:
+        """The initial room load for this episode. Base env: the fixed config
+        room_state (ignores `task`)."""
+        return self._task_cfg.room_state
+
+    def _choose_depth(self, rng: np.random.Generator) -> int:
+        """The REQUESTED retrieve depth for this episode. Base env: the fixed
+        config target_depth."""
+        return int(self._task_cfg.target_depth)
+
+    def _choose_route(self, rng: np.random.Generator) -> str:
+        """The retrieve route for this episode. Base env: the fixed config."""
+        return self._task_cfg.retrieve_route
+
+    def _choose_from(self, rng: np.random.Generator) -> str:
+        """The retrieve shelf class for this episode. Base env: fixed config."""
+        return self._task_cfg.retrieve_from
+
+    def _config_difficulty(self) -> dict:
+        """The fixed layout-difficulty knobs from the task config."""
+        c = self._task_cfg
+        return {
+            "big_shelf_fullness": c.big_shelf_fullness,
+            "system_fullness": c.system_fullness,
+            "big_ratio": c.big_ratio,
+            "big_disorder": c.big_disorder,
+            "small_disorder": c.small_disorder,
+        }
+
+    def _choose_difficulty(self, rng: np.random.Generator) -> dict:
+        """The layout-difficulty knobs for this episode (the fixed config)."""
+        return self._config_difficulty()
+
+    def _make_sampler(self, room_state: RoomState) -> InitialStateSampler:
+        """An InitialStateSampler for this episode's room_state + difficulty
+        (`self._cur_difficulty`). Cheap to rebuild per reset."""
+        cfg = self._task_cfg
+        d = self._cur_difficulty
+        return InitialStateSampler(InitialStateSamplerConfig(
+            big_shelf_fullness=d["big_shelf_fullness"],
+            system_fullness=d["system_fullness"],
+            big_ratio=d["big_ratio"],
+            big_disorder=d["big_disorder"],
+            small_disorder=d["small_disorder"],
+            room_state=room_state,
+            require_solvable=cfg.require_solvable,
+            max_solvable_retries=cfg.max_solvable_retries,
+        ))
 
     # ------------------------------------------------------------------
     # Step
@@ -289,7 +350,9 @@ class SingleTaskEnv(Environment):
             except Exception:
                 pre_entry = None
 
-        obs, _base_reward, terminated, truncated, info = super().step(action)
+        # The base reward (DELIVER + SERVE + PBRS potential + idle) is the
+        # single source. We only add success-termination below.
+        obs, reward, terminated, truncated, info = super().step(action)
 
         # Success detection per task.
         success = False
@@ -324,30 +387,13 @@ class SingleTaskEnv(Environment):
             ):
                 success = True
 
-        # Success terminates the episode (the reward suite reads `success`).
+        # A completed atomic task ENDS the episode (the base env only truncates).
         if success:
             terminated = True
             self._success = True
 
-        # Score the (s, a, s') with the reward suite. The base class's reward
-        # (from super().step()) is discarded — the suite is the single source.
-        # Built from the typed StepEvents Environment.advance produced.
-        from oos.env.reward import RewardEvent
-        events = info["events"]
-        ctx = RewardContext(
-            success=success,
-            n_wrong=events.n_wrong_item,
-            idle_with_retrieve=events.idle_with_retrieve,
-            movement_distance=events.movement_distance,
-            dt=events.dt,
-            completions=events.completions,
-        )
-        r, breakdown = self._reward_system.compute(ctx)
-        info["reward_breakdown"] = breakdown
-        info["reward_events"] = [RewardEvent(k, v) for k, v in breakdown.items()]
-
         self._populate_task_info(info)
-        return obs, float(r), terminated, truncated, info
+        return obs, float(reward), terminated, truncated, info
 
     # ------------------------------------------------------------------
     # Task-layer helpers (initial-state sampling lives in
@@ -355,18 +401,19 @@ class SingleTaskEnv(Environment):
     # selection + target picking here)
     # ------------------------------------------------------------------
 
-    # Retrieve-target acquisition is shared with ContinuousEnv — see
-    # oos.learn.targeting. These thin wrappers keep the call sites readable.
+    # Retrieve-target acquisition helpers live in `oos.env.targeting`; these
+    # thin wrappers keep the call sites readable.
 
     @staticmethod
     def _route_class_map(topo) -> dict:
         return targeting.route_class_map(topo)
 
     def _sample_retrieve_layout(self, facility):
+        # Uses the per-episode axes set in setup_episode (`_target_depth` holds
+        # the requested depth at this point); targeting may step the depth down.
         return targeting.sample_retrieve_layout(
             self._sampler, facility, self._rng, self._route_by_shelf,
-            self._task_cfg.retrieve_from, self._task_cfg.retrieve_route,
-            self._task_cfg.target_depth,
+            self._cur_from, self._cur_route, self._target_depth,
         )
 
     def _any_pallet(self, facility) -> Optional[int]:
@@ -405,8 +452,8 @@ class SingleTaskEnv(Environment):
         info["episode_system_fullness"] = self._system_fullness
         info["episode_big_ratio"] = self._big_ratio
         info["episode_target_depth"] = self._target_depth
-        info["episode_retrieve_from"] = self._task_cfg.retrieve_from
-        info["episode_retrieve_route"] = self._task_cfg.retrieve_route
+        info["episode_retrieve_from"] = self._cur_from
+        info["episode_retrieve_route"] = self._cur_route
         info["episode_room_state"] = self._room_state
         # Compatibility with rollout.py / train.py success-rate logic, which
         # reads retrieves_completed/total. SingleTaskEnv has exactly one goal
