@@ -40,10 +40,12 @@ from oos.learn.rollout import collect_rollout_vec, make_collector
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 FACILITY = "tiny_medipol"
-RUN_NAME = "curric_v2"
+RUN_NAME = "curric_v4"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 0
-INIT_WEIGHTS = "runs/_rescue/omni2_full_OLD_iter250.pt"   # warm-start; None = scratch
+INIT_WEIGHTS = "runs/curric_v3/ckpt_latest.pt"   # warm-start from v3 (solves ALL tiers incl. put-back)
+# Warm brain masters every tier; open them all and just tighten efficiency.
+START_OPEN = 8
 
 # Anti-forgetting rehearsal: this fraction of envs run STORE/PARK episodes (a car
 # preloaded on a room carrier -> store it + re-stage + settle) from the proven
@@ -54,6 +56,11 @@ STORE_PARK_FRAC = 0.4
 
 REWARD_SUCCESS = 15.0          # the ONLY anchor (clean-rest terminal). Everything else 0.
 PENALTY_ALL_WAIT = 1.0         # small stall-breaker + wake/re-query rescue (not a gradient)
+# Efficiency: a small per-mm total-carrier-travel cost so the agent stops moving
+# irrelevant carriers and finds tighter/faster solutions. SAFE now (the +15 anchor
+# dominates and the warm brain already solves everything, so it only tightens). 0
+# in v1-v3; turned on here for the efficiency-polish run. Watch greedy stays ~100%.
+MOVE_COST = 1e-5
 
 TOTAL_ITERS = 4000
 STEPS_PER_ITER = 1024 * 16
@@ -85,7 +92,7 @@ def make_env(curric, max_steps):
         fullness=-1, omni=True, target_any_shelf=True,
         require_noroom_empty=True, require_all_waiting=True,
         reward_deliver=0.0, reward_success=REWARD_SUCCESS,
-        penalty_all_wait_while_task=PENALTY_ALL_WAIT, reward_gamma=GAMMA,
+        penalty_all_wait_while_task=PENALTY_ALL_WAIT, move_cost=MOVE_COST, reward_gamma=GAMMA,
         experiment_config=ExperimentConfig(
             task_stream=TaskStreamConfig(store_rate=0.0),
             episode=EpisodeConfig(max_steps=max_steps, max_sim_time=360000.0)),
@@ -103,7 +110,7 @@ def make_storepark_env(max_steps):
         fullness=-1, omni=True, target_any_shelf=True,
         require_noroom_empty=True, require_all_waiting=True,
         reward_deliver=0.0, reward_success=REWARD_SUCCESS,
-        penalty_all_wait_while_task=PENALTY_ALL_WAIT, reward_gamma=GAMMA,
+        penalty_all_wait_while_task=PENALTY_ALL_WAIT, move_cost=MOVE_COST, reward_gamma=GAMMA,
         experiment_config=ExperimentConfig(
             task_stream=TaskStreamConfig(store_rate=0.0),
             episode=EpisodeConfig(max_steps=max_steps, max_sim_time=360000.0)),
@@ -148,7 +155,7 @@ def main():
     run_dir = Path("runs") / RUN_NAME; run_dir.mkdir(parents=True, exist_ok=True)
     metrics_f = open(run_dir / "metrics.jsonl", "w")
 
-    curric = Curriculum(default_tiers())
+    curric = Curriculum(default_tiers(), n_open=START_OPEN)
     collator = GraphCollator(get_facility(FACILITY)()[0])
     eval_env = make_env(curric, MAX_EP_STEPS)        # strict; eval_on_battery overrides its layout
     n_max = eval_env.n_actions

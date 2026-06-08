@@ -48,8 +48,25 @@ def _band(depths, ks, frees, routes, fills) -> tuple[CaseSpec, ...]:
     return tuple(out)
 
 
+def _band_pb(depths, ks, frees, routes, fills) -> tuple[CaseSpec, ...]:
+    """PUT-BACK band: like _band but ALLOWS free_big < K (slack < 0) — the cases
+    where a big blocker has NO free big slot, so it must be temporarily buffered on
+    a carrier (the put-back maneuver). No solvability filter: most are solvable via
+    carrier-buffering; a few of the tightest may not be (mastery will cap there)."""
+    out = []
+    for r in routes:
+        for d in depths:
+            for k in ks:
+                if k > d:
+                    continue
+                for f in frees:
+                    for bf in fills:
+                        out.append(CaseSpec(d, k, f, r, big_fill=bf))
+    return tuple(out)
+
+
 def default_tiers() -> list[Tier]:
-    """The ladder, easy -> the packed buffer-on-target needle."""
+    """The ladder, easy -> the packed buffer-on-target needle -> the put-back."""
     return [
         Tier("T0-trivial",  _band([0],     [0],       [1, 2, 3], ["direct"],            [0])),
         Tier("T1-shallow",  _band([0, 1],  [0, 1],    [2, 3],    ["direct"],            [0, 4])),
@@ -59,6 +76,11 @@ def default_tiers() -> list[Tier]:
         # slack-0 means free_big == K. K=2 => free_big in {2,3}; K=1 => {1,2,3}.
         Tier("T4-buffer",   _band([2],     [2],       [2, 3],    ["direct", "handoff"], [8, 12])),
         Tier("T5-packed",   _band([2],     [1, 2],    [1, 2, 3], ["handoff"],           [14, 18])),
+        # PUT-BACK tiers (slack < 0): a big blocker with no free big slot -> it must
+        # be parked on a carrier while the target is dug out, then put back. The
+        # genuinely-hard combinatorial core; the easy tiers never required it.
+        Tier("T6-putback1", _band_pb([2], [1],    [0],    ["direct", "handoff"], [8, 12])),   # slack -1
+        Tier("T7-putback2", _band_pb([2], [2],    [0, 1], ["direct", "handoff"], [8, 12])),   # slack -2/-1
     ]
 
 
