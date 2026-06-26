@@ -37,6 +37,19 @@ def load_policy(
     """Swap `agent.policy` to the entry's policy. Returns the display
     label on success, or None if loading failed (a toast is emitted either
     way)."""
+    if entry.path == "__planner__":
+        # The heuristic-search planner (oos.plan). Not a checkpoint — it solves
+        # the current state on demand (press S) and plays the frozen plan.
+        from oos.plan.policy import PlannerPolicy
+        agent.policy = PlannerPolicy(agent.facility)
+        toasts.info("POLICY → ▶ PLANNER — press S to solve, SPACE to play", lifetime=4.0)
+        return "▶ PLANNER (search)"
+    # Learned / random policies keep the RL action guards on (the planner turns
+    # them off in its own ctor).
+    try:
+        agent.facility._policy_guards = True
+    except Exception:
+        pass
     if entry.path == "":
         agent.policy = random_policy
         toasts.info("POLICY → random", lifetime=3.0)
@@ -176,7 +189,8 @@ def apply_auto_queue(
     (`mean_dwell`/`std_dwell`). `TaskStreamConfig`/`ExperimentConfig` are
     frozen, so we build a fresh `ExperimentConfig` (keeping durations +
     episode caps) and swap it onto the inner env; the next `reset()` rebuilds
-    the stream. Policy + auto_arrivals toggle are preserved.
+    the stream. The running state comes from `params["enabled"]` (the tab's
+    toggle) when present, else the env's current auto-arrival state is kept.
     """
     from oos.config.schema import ExperimentConfig, TaskStreamConfig
     try:
@@ -196,9 +210,11 @@ def apply_auto_queue(
         durations=old.durations, task_stream=ts, episode=old.episode,
     )
     if do_reset:
-        preserve_auto = agent.facility.auto_arrivals_enabled
+        # The tab's "running" checkbox is authoritative when supplied; else keep
+        # whatever the stream was doing (so a bare rate-apply doesn't start it).
+        enabled = bool(params.get("enabled", agent.facility.auto_arrivals_enabled))
         agent.reset()
-        agent.facility.set_auto_arrivals(preserve_auto)
+        agent.facility.set_auto_arrivals(enabled)
     toasts.success("AUTO-QUEUE config applied", lifetime=2.5)
     return True
 

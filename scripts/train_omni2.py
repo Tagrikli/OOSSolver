@@ -55,9 +55,9 @@ SEED = 0
 # (ROOM_CAR_AMOUNT, REQUEST_CAR_AMOUNT) is re-drawn until at least one is non-zero
 # (never an empty no-op episode). Layouts are re-rolled until the preload + the q
 # requests are feasible and solvable.
-ROOM_CAR_AMOUNT = (0,1,2)
-REQUEST_CAR_AMOUNT = (0,1,2)
-DEPTH = (0,1,2)
+ROOM_CAR_AMOUNT = (0,1)
+REQUEST_CAR_AMOUNT = (0,1)
+DEPTH = (0,1)
 FULLNESS = -1                  # shuffle_state non-empty fraction; -1 = fresh U[0,1] each episode
 REQUIRE_SOLVABLE = True        # re-roll layouts until the preload + requests are feasible
 TARGET_ANY_SHELF = True        # requests on any shelf (handoff-route ok); else direct only
@@ -102,8 +102,8 @@ P_PALLET2PALLET = 0#1.0
 #   room_carrier_holds   : +w when a room carrier holds the target.
 #   noroom_carrier_holds : +w (smaller) when a shuttle holds it (< room → the
 #                          shuttle→room auto-handoff is a positive Φ step).
-SHAPE_ROOM_CARRIER_HOLDS = 0#1.0
-SHAPE_NOROOM_CARRIER_HOLDS = 0#0.5
+SHAPE_ROOM_CARRIER_HOLDS = 0
+SHAPE_NOROOM_CARRIER_HOLDS = 0
 #   --- staging ladder (car → nothing → empty → at the room), per room carrier ---
 #   A monotone Φ staircase that pulls a room carrier through the STORE→re-stage
 #   maneuver — its ONLY gradient (the store half had none; see store skill gap).
@@ -114,9 +114,9 @@ SHAPE_NOROOM_CARRIER_HOLDS = 0#0.5
 #     EMPTY docked at room Φ += empty_holds + empty_at_room (staged = goal)
 #   empty_handed and empty_holds are mutually exclusive per carrier, so the rungs
 #   compose to 0 → 0.5 → 1.0 → 1.5 (uniform +0.5 steps). Counted per room.
-SHAPE_ROOM_CARRIER_EMPTY_HANDED = 0#0.5
-SHAPE_ROOM_CARRIER_EMPTY_HOLDS = 0#1.0
-SHAPE_ROOM_CARRIER_EMPTY_AT_ROOM = 0#0.5
+SHAPE_ROOM_CARRIER_EMPTY_HANDED = 0
+SHAPE_ROOM_CARRIER_EMPTY_HOLDS = 0
+SHAPE_ROOM_CARRIER_EMPTY_AT_ROOM = 0
 # Store reward: ONE-TIME bonus the first time each PRELOADED car lands on a shelf,
 # then that car is forgotten (credited once). A plain event reward (not PBRS):
 # storing the blocking car is always on the critical path to staging its room, so
@@ -141,9 +141,9 @@ MOVE_COST = 1e-7
 # never staged → no leave penalty (the store maneuver stays free). The arrive
 # event is not-staged(s)→staged(s'), so an initially-staged carrier never fires it
 # for the start state. Keep ARRIVE < LEAVE so a leave→return loop nets negative.
-REWARD_STAGE_ARRIVE = 0.5
+REWARD_STAGE_ARRIVE = 2
 REWARD_STAGE_WAIT = 0.0
-PENALTY_STAGE_LEAVE = 1.5
+PENALTY_STAGE_LEAVE = 6
 # REQUESTED-ITEM event rewards — the mirror of the STAGING trio, over the
 # "carrier docked at its room holding a REQUESTED pallet" delivery pose (observable
 # because delivery is WAIT-triggered). Dormant on park (q==0) episodes.
@@ -152,9 +152,9 @@ PENALTY_STAGE_LEAVE = 1.5
 #   PENALTY_REQUESTED_LEAVE : carried it away unserved (pose ∧ left the room) → −
 # leave fires only when the carrier actually leaves the room, so the serving WAIT
 # is NOT charged as a leave. Keep ARRIVE < LEAVE so a bring→leave bounce nets neg.
-REWARD_REQUESTED_ARRIVE = 1
+REWARD_REQUESTED_ARRIVE = 3
 REWARD_REQUESTED_WAIT = 0
-PENALTY_REQUESTED_LEAVE = 3
+PENALTY_REQUESTED_LEAVE = 9
 # TERMINAL OBJECTIVE reward — the goal itself, paid ONCE the step the episode is
 # actually solved (omni: every request delivered AND every room staged — the exact
 # condition that ends the episode). Everything above is shaping that only guides
@@ -163,17 +163,17 @@ PENALTY_REQUESTED_LEAVE = 3
 # larger than any single shaping event) so the policy chases the real objective,
 # not the proxies. The trainer now also zeroes the value-bootstrap on this terminal
 # step (a true win has no future), so the bonus lands undiluted. 0 = off.
-REWARD_SUCCESS = 10.0
+REWARD_SUCCESS = 15.0
 # ============================================================================
 
 # --- episode / rollout ---
 TOTAL_ITERATIONS = 10000
-STEPS_PER_ITER = 1024*16          # transitions collected per PPO iteration
-N_ENVS = 64                       # parallel envs stepped in lockstep; their policy
+STEPS_PER_ITER = 1024*2          # transitions collected per PPO iteration
+N_ENVS = 8                       # parallel envs stepped in lockstep; their policy
                                  # forwards are batched into one net() call per step
                                  # (the big CPU collect speedup). Each env collects
                                  # STEPS_PER_ITER // N_ENVS transitions per iteration.
-MAX_EPISODE_STEPS = 200#128         # truncate an unfinished task after this many decisions.
+MAX_EPISODE_STEPS = 1024#128         # truncate an unfinished task after this many decisions.
                                # KEEP SMALL: a failed attempt wastes this many steps, and an
                                # iteration collects STEPS_PER_ITER total, so episodes/iter ≈
                                # STEPS_PER_ITER / this. Too large → ~1–2 episodes/iter → the
@@ -182,7 +182,7 @@ MAX_SIM_TIME = 360000.0
 
 # --- deterministic greedy eval (argmax, fixed layouts) — split per task type ---
 EVAL_EVERY = 10                # run the greedy eval every N iters
-EVAL_RETRIEVE_DEPTH = 2        # the fixed depth the RETRIEVE eval always tests
+EVAL_RETRIEVE_DEPTH = 1        # the fixed depth the RETRIEVE eval always tests
 EVAL_EPISODES_RETRIEVE = 10    # fixed-seed retrieve layouts per eval
 EVAL_EPISODES_BRING_EMPTY = 10 # fixed-seed park (bring-empty) layouts per eval
 EVAL_MAX_STEPS = 128           # greedy rollout cap per layout
@@ -191,22 +191,22 @@ EVAL_SEED = 12345              # eval layout seeds (retrieve: EVAL_SEED+i; park:
 # --- PPO ---
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-LR = 3e-4
+LR = 5e-4
 CLIP_RANGE = 0.2
 VF_COEF = 0.5
-ENT_COEF = 0.05
+ENT_COEF = 0.01
 MAX_GRAD_NORM = 0.5
-N_EPOCHS = 6                   # keep >= 2 ...
-MINIBATCH_SIZE = 512            # ... and < STEPS_PER_ITER, else PPO does one dead micro-step/iter
+N_EPOCHS = 6                    # 6×(16384/1024)=96 grad steps/iter. >~6 over-trains the batch
+MINIBATCH_SIZE = 512           # (KL drift, clip saturates): slower AND not better. keep < STEPS_PER_ITER
 
 # --- network ---
 HIDDEN = 64
 N_HEADS = 4
-N_GAT_LAYERS = 2
+N_GAT_LAYERS = 3
 
 # --- checkpoints ---
 CKPT_EVERY = 25                # numbered-archive cadence (iters); 0 = none
-RESUME = 'runs/omni2_full/ckpt_latest.pt'                  # full resume (net + optimizer + iter counter + RNG).
+RESUME = None#'runs/omni2_full/ckpt_latest.pt'                  # full resume (net + optimizer + iter counter + RNG).
                                # Keep None here: the park task changed, so we start
                                # a FRESH run/counter but inherit the cooked brain via
                                # INIT_WEIGHTS below.

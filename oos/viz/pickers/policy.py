@@ -20,6 +20,13 @@ from typing import Optional
 import pygame
 
 from oos.learn.policy import CheckpointEntry, discover_checkpoints
+
+# Synthetic, always-present entry for the heuristic-search planner (oos.plan).
+# Loaded by `policy_swap.load_policy` via its "__planner__" sentinel path.
+PLANNER_ENTRY = CheckpointEntry("▶ PLANNER (search, no-heuristic)", "__planner__")
+# The complete deterministic planner (oos.solver). Drives the facility directly
+# via a SolverDriver (handled specially in the app, not via load_policy).
+OOSSOLVER_ENTRY = CheckpointEntry("★ OOSSolver (complete planner)", "__oossolver__")
 from oos.viz.components import (
     Fonts,
     TEXT_DIM,
@@ -51,12 +58,12 @@ class PolicyPickerWidget:
 
     def __post_init__(self) -> None:
         if not self.entries:
-            self.entries = discover_checkpoints(self.runs_dir)
+            self.entries = [OOSSOLVER_ENTRY, PLANNER_ENTRY, *discover_checkpoints(self.runs_dir)]
 
     # ---- state -------------------------------------------------------------
 
     def rescan(self) -> None:
-        self.entries = discover_checkpoints(self.runs_dir)
+        self.entries = [OOSSOLVER_ENTRY, PLANNER_ENTRY, *discover_checkpoints(self.runs_dir)]
         self.selected_idx = min(self.selected_idx, max(0, len(self.entries) - 1))
 
     def toggle(self) -> None:

@@ -108,6 +108,11 @@ class Environment:
         self.n_actions = self._n_max
 
         self._ctx: Optional[_StepContext] = None
+        # When False, the RL-only action guards (reverse-GOTO / immediate-inverse)
+        # are dropped from `enumerate_actions`, so a search planner that produced
+        # a physically-legal plan never has one of its moves masked away. The
+        # PlannerPolicy flips this off; learned policies keep it True.
+        self._policy_guards: bool = True
         self._step_count: int = 0
         # PBRS Φ(s) snapshot, taken in submit_action BEFORE the action mutates
         # state, so advance() uses Φ of the pre-action state (telescoping).
@@ -178,7 +183,7 @@ class Environment:
             raise RuntimeError("no idle carriers after initial advance")
         querying = pending.pop(0)
         entries = enumerate_actions(
-            querying, facility.state, facility.topology, facility.queue,
+            querying, facility.state, facility.topology, facility.queue, policy_guards=self._policy_guards,
         )
         decoder = ActionDecoder(entries, self._n_max)
         self._ctx = _StepContext(
@@ -267,7 +272,7 @@ class Environment:
         if ctx.pending_idle:
             ctx.querying_carrier = ctx.pending_idle.pop(0)
             entries = enumerate_actions(
-                ctx.querying_carrier, facility.state, facility.topology, facility.queue,
+                ctx.querying_carrier, facility.state, facility.topology, facility.queue, policy_guards=self._policy_guards,
             )
             ctx.decoder = ActionDecoder(entries, self._n_max)
             return True
@@ -290,6 +295,7 @@ class Environment:
                 facility.state,
                 facility.topology,
                 facility.queue,
+                policy_guards=self._policy_guards,
             )
             self._ctx.decoder = ActionDecoder(entries, self._n_max)
         else:
@@ -480,7 +486,7 @@ class Environment:
                 if ctx.pending_idle:
                     ctx.querying_carrier = ctx.pending_idle.pop(0)
                     entries = enumerate_actions(
-                        ctx.querying_carrier, facility.state, facility.topology, facility.queue,
+                        ctx.querying_carrier, facility.state, facility.topology, facility.queue, policy_guards=self._policy_guards,
                     )
                     ctx.decoder = ActionDecoder(entries, self._n_max)
 
@@ -500,7 +506,7 @@ class Environment:
             if ctx.pending_idle:
                 ctx.querying_carrier = ctx.pending_idle.pop(0)
                 entries = enumerate_actions(
-                    ctx.querying_carrier, facility.state, facility.topology, facility.queue,
+                    ctx.querying_carrier, facility.state, facility.topology, facility.queue, policy_guards=self._policy_guards,
                 )
                 ctx.decoder = ActionDecoder(entries, self._n_max)
 
@@ -701,7 +707,7 @@ class Environment:
         """Decision predicate (injected into the sim): does this carrier have
         at least one action other than WAIT right now?"""
         entries = enumerate_actions(
-            cid, facility.state, facility.topology, facility.queue,
+            cid, facility.state, facility.topology, facility.queue, policy_guards=self._policy_guards,
         )
         return any(e.type != ActionType.WAIT for e in entries)
 
@@ -710,7 +716,7 @@ class Environment:
         if not idle:
             return ActionDecoder([], self._n_max)
         entries = enumerate_actions(
-            idle[0], facility.state, facility.topology, facility.queue,
+            idle[0], facility.state, facility.topology, facility.queue, policy_guards=self._policy_guards,
         )
         return ActionDecoder(entries, self._n_max)
 

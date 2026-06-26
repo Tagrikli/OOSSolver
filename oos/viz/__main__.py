@@ -34,9 +34,14 @@ if __name__ == "__main__":
     # tab. Schema dwell defaults are 30 s mean / 10 s std.
     cfg = ExperimentConfig(
         task_stream=TaskStreamConfig(
-            store_rate=0.30,        # ~one store arrival every 3 sim-seconds
+            # ~one store every 20 sim-sec — near a 2-carrier facility's service
+            # capacity, so a competent policy keeps the queue bounded and the
+            # continuous env is watchable. Crank it up live in the AUTO-QUEUE tab.
+            store_rate=0.05,
         ),
-        episode=EpisodeConfig(max_sim_time=2000.0, max_steps=20_000),
+        # Viz never auto-terminates: no sim-time limit, no action cap. Run until
+        # the user closes it. (env truncates only on time/steps >= these.)
+        episode=EpisodeConfig(max_sim_time=float("inf"), max_steps=float("inf")),
     )
     env = Environment(facility_factory=get_facility(args.facility), experiment_config=cfg)
     run_app(env, policy=random_policy, seed=args.seed, facility_name=args.facility)

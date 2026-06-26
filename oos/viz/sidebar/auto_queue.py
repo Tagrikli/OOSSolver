@@ -1,19 +1,22 @@
 """AutoQueueContent — panel body for the AUTO-QUEUE tab.
 
-The "auto-queue" is the task generator: a Poisson store-arrival stream plus
-per-item dwell retrievals that get queued automatically (toggled on/off with
-the M key). It is NOT a separate environment — it just creates Store/Retrieve
-tasks on a schedule. This tab exposes its knobs so you can tune the incoming
-load live:
+The "auto-queue" is the continuous-environment task generator: a Poisson
+store-arrival stream plus per-item dwell retrievals (the customer "requests")
+that get queued automatically. It is NOT a separate environment — it just
+creates Store/Retrieve tasks on a schedule. This tab both RUNS and tunes that
+stream live:
 
+  * running     — master on/off for the stream (same switch as the M key)
   * store_rate  — Poisson store-arrival rate (tasks / sim-second)
   * big_prob    — P(an incoming store is a big item); the rest are small
-  * mean_dwell  — mean per-item dwell before its retrieval fires (s)
+  * mean_dwell  — mean per-item dwell before its retrieval/request fires (s)
   * std_dwell   — dwell standard deviation (s)
 
-An APPLY button rebuilds the stream config and resets the scenario so the new
-rates take effect; `self.on_apply(values)` is wired by the app. Values are
-numeric-only (no radios) — a strict subset of RandomizeContent's machinery.
+The "running" checkbox toggles the stream immediately (no reset) via
+`self.on_toggle_enabled(checked)`; an APPLY button rebuilds the rate config,
+resets the scenario, and (re)applies the running state via `self.on_apply`.
+Both callbacks are wired by the app. Numeric values are drag-to-scrub /
+click-to-type — a strict subset of RandomizeContent's machinery.
 
 Mouse/keyboard routing mirrors RandomizeContent (driven by app.py):
   * MOUSEBUTTONDOWN → handle_mouse_down(pos)  (field drag-start / APPLY)
@@ -32,6 +35,7 @@ import pygame
 from oos.viz.components.button import Button
 from oos.viz.components.palette import BASE_MUTED, CYAN_MID, Fonts, blit_text
 from oos.viz.components.widgets import NumericField
+from oos.viz.components.widgets.checkbox import Checkbox
 
 
 @dataclass(frozen=True)
@@ -47,10 +51,10 @@ class _FieldSpec:
 
 
 # Auto-queue knobs → TaskStreamConfig. Defaults match the boot env
-# (__main__.py store_rate 0.30; schema dwell defaults 30s / 10s; big_prob
+# (__main__.py store_rate 0.05; schema dwell defaults 30s / 10s; big_prob
 # 0.15 from the default size_mix).
 FIELD_SPECS: list[_FieldSpec] = [
-    _FieldSpec("store_rate", "store rate /s", "float", 0.0, 2.0,   0.01, 0.30),
+    _FieldSpec("store_rate", "store rate /s", "float", 0.0, 2.0,   0.01, 0.05),
     _FieldSpec("big_prob",   "big-item prob", "float", 0.0, 1.0,   0.05, 0.15),
     _FieldSpec("mean_dwell", "dwell mean (s)", "float", 0.0, 600.0, 5.0,  30.0),
     _FieldSpec("std_dwell",  "dwell std (s)",  "float", 0.0, 300.0, 5.0,  10.0),
@@ -64,6 +68,8 @@ class AutoQueueContent:
     ROW_H = 26
     ROW_GAP = 4
     FIELD_H = NumericField.H
+    TOGGLE_H = 22
+    TOGGLE_GAP = 12
     BUTTON_H = 26
     BUTTON_TOP_GAP = 12
     HINT_H = 14
@@ -82,6 +88,10 @@ class AutoQueueContent:
             self._labels[spec.key] = spec.label
         self._field_order = [s.key for s in FIELD_SPECS]
 
+        # Master on/off for the continuous stream (mirrors the M key). Toggling
+        # it fires on_toggle_enabled immediately — no scenario reset needed.
+        self._enabled_box = Checkbox(value=0, label="▶ stream running", checked=False)
+
         # Restore persisted knob values (from viz_state), if any.
         if initial:
             self.set_values(initial)
@@ -93,11 +103,18 @@ class AutoQueueContent:
         # Set by the app; called when the user fires APPLY.
         # Signature: on_apply(params: dict) -> None
         self.on_apply: Optional[Callable[[dict], None]] = None
+        # Set by the app; called when the running checkbox is clicked.
+        # Signature: on_toggle_enabled(enabled: bool) -> None
+        self.on_toggle_enabled: Optional[Callable[[bool], None]] = None
 
     # ---- per-frame state setters ------------------------------------------
 
-    def update(self, wall_now: float) -> None:
+    def update(self, wall_now: float, auto_enabled: Optional[bool] = None) -> None:
         self._wall_now = wall_now
+        # Mirror the live stream state so the checkbox tracks the M key (and any
+        # reset/swap that flips auto-arrivals) without the user touching it.
+        if auto_enabled is not None:
+            self._enabled_box.checked = auto_enabled
 
     # ---- focus -------------------------------------------------------------
 
@@ -118,6 +135,12 @@ class AutoQueueContent:
 
     def handle_mouse_down(self, pos) -> bool:
         """Returns True if the click was inside an interactive element."""
+        if self._enabled_box.hit_test(pos):
+            self._focus(None)
+            self._enabled_box.toggle()
+            if self.on_toggle_enabled is not None:
+                self.on_toggle_enabled(bool(self._enabled_box.checked))
+            return True
         if self._apply_btn.hit_test(pos):
             self._focus(None)
             self._fire_apply()
@@ -180,6 +203,7 @@ class AutoQueueContent:
             "big_prob":   self._fields["big_prob"].value,
             "mean_dwell": self._fields["mean_dwell"].value,
             "std_dwell":  self._fields["std_dwell"].value,
+            "enabled":    bool(self._enabled_box.checked),
         }
 
     def set_values(self, values: dict) -> None:
@@ -191,6 +215,8 @@ class AutoQueueContent:
                     field.set_value(float(values[key]))
                 except (TypeError, ValueError):
                     pass
+        if "enabled" in values:
+            self._enabled_box.checked = bool(values["enabled"])
 
     # ---- parse + dispatch --------------------------------------------------
 
@@ -207,7 +233,9 @@ class AutoQueueContent:
               body: pygame.Rect, panel) -> None:
         n_rows = len(self._field_order)
         rows_h = n_rows * self.ROW_H + (n_rows - 1) * self.ROW_GAP
-        total_h = rows_h + self.BUTTON_TOP_GAP + self.BUTTON_H + self.HINT_H + 4
+        toggle_h = self.TOGGLE_H + self.TOGGLE_GAP
+        total_h = (toggle_h + rows_h + self.BUTTON_TOP_GAP
+                   + self.BUTTON_H + self.HINT_H + 4)
 
         panel.draw_scrollbar(surface, fonts, body, total_h, 1)
         scroll_px = panel.scroll_offset
@@ -219,6 +247,13 @@ class AutoQueueContent:
         y = body.top - scroll_px
         field_left = x + self.LABEL_W
         field_w = body.right - field_left - 12   # leave gutter for scrollbar
+
+        # Master on/off toggle for the continuous stream, above the rate rows.
+        self._enabled_box.set_rect(pygame.Rect(
+            x, y, body.right - x - 12, self.TOGGLE_H,
+        ))
+        self._enabled_box.draw(surface, fonts)
+        y += toggle_h
 
         for key in self._field_order:
             row_top = y
@@ -244,7 +279,7 @@ class AutoQueueContent:
         self._apply_btn.draw(surface, fonts)
 
         y += self.BUTTON_H + 2
-        hint = "drag to scrub  ·  click to type  ·  enter/apply: restart stream"
+        hint = "✓ running: toggle stream (=M)  ·  drag/type rates  ·  apply: restart"
         blit_text(surface, hint, (x, y), fonts.tiny, BASE_MUTED)
 
         surface.set_clip(old_clip)

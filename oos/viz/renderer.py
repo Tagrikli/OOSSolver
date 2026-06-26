@@ -324,7 +324,9 @@ class Renderer:
             mouse_pos=rs.mouse_pos,
         )
         self._randomize_panel.content.update(wall_now=rs.wall_now)  # type: ignore[attr-defined]
-        self._auto_queue_panel.content.update(wall_now=rs.wall_now)  # type: ignore[attr-defined]
+        self._auto_queue_panel.content.update(  # type: ignore[attr-defined]
+            wall_now=rs.wall_now, auto_enabled=not manual_mode,
+        )
 
         # Persistent Status panel at the top (visible on every tab).
         self._stats_panel.draw(surface, self.fonts)

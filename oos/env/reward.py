@@ -79,6 +79,12 @@ class RewardConfig:
     # magnitude; applied as its negation. 0 = off.
     penalty_all_wait_while_task: float = 0.0
 
+    # − cost · movement_distance this step. A tiny anti-wander pressure for the
+    # continuous stream: discourages GOTO→GOTO repositioning that never acts
+    # (the shelf1→shelf2-without-doing-anything pathology). MUST stay small — a
+    # large move cost makes do-nothing optimal (the WAIT-collapse trap). 0 = off.
+    penalty_move: float = 0.0
+
 
 @dataclass(frozen=True)
 class RewardEvent:

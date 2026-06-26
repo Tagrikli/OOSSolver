@@ -21,6 +21,7 @@ The heavy lifting is delegated:
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -130,6 +131,8 @@ class VizApp:
     initial_speed: float = 1.0
     runs_dir: str = "runs"
     facility_name: str = "dev"
+    use_solver: bool = False   # start driven by the OOSSolver (no policy picker)
+    solver_auto: bool = True   # in solver mode, run a continuous auto store stream
 
     # ─────────────────────────────────────────────────────────────────────
     # Lifecycle
@@ -152,6 +155,7 @@ class VizApp:
             for event in pygame.event.get():
                 self._dispatch_event(state, event)
 
+            self._poll_solve(state)
             self._tick_sim(state, dt_wall)
             self._render(state)
             pygame.display.flip()
@@ -160,6 +164,12 @@ class VizApp:
 
     def _init_state(self) -> _RunState:
         """Build the boot-time state bag from `self.*` config."""
+        # PlannerPolicy solve-thread state (S = solve, X = stop). Solving runs
+        # off-thread so a hang can be stopped and the UI stays responsive.
+        self._solving: bool = False
+        self._solve_thread: Optional[threading.Thread] = None
+        self._solve_cancel: Optional[threading.Event] = None
+
         surface = pygame.display.set_mode(
             (self.window_w, self.window_h), pygame.RESIZABLE,
         )
@@ -172,6 +182,16 @@ class VizApp:
 
         # Boot manual — customer arrivals are off until the user presses 'm'.
         facility.set_auto_arrivals(False)
+        # The interactive session is CONTINUOUS — it has no episode. Drop the
+        # training-time caps (max_sim_time / max_steps) so the env never reports
+        # `truncated` (which would set agent.done and freeze the sim until a
+        # reset). Without this, a long planner session silently stops playing.
+        import dataclasses
+        from oos.config.schema import EpisodeConfig
+        facility._experiment_cfg = dataclasses.replace(  # type: ignore[attr-defined]
+            facility._experiment_cfg,                     # type: ignore[attr-defined]
+            episode=EpisodeConfig(max_sim_time=float("inf"), max_steps=10**12),
+        )
         topo = facility.topology
 
         persisted = load_viz_state(self.runs_dir)
@@ -208,7 +228,11 @@ class VizApp:
 
         # Auto-load the last persisted policy if its checkpoint still exists.
         active_label = "(random policy)"
-        if persisted.policy_path:
+        if self.use_solver or persisted.policy_path == "__oossolver__":
+            from oos.solver.live import SolverDriver
+            driver = SolverDriver(agent, toasts)
+            active_label = "OOSSolver (complete planner)"
+        elif persisted.policy_path:
             match = next(
                 (e for e in picker.entries if e.path == persisted.policy_path),
                 None,
@@ -224,10 +248,17 @@ class VizApp:
         save_viz_state(self.runs_dir, facility_name=self.facility_name)
 
         # Apply persisted auto-queue (task-stream) knobs over the boot env's
-        # defaults so the incoming-task rate/dwell match what you last set.
-        # (auto-arrivals stay off — M toggles them; this only sets the rates.)
+        # defaults so the incoming-task rate/dwell match what you last set. The
+        # stream's running state is restored too (persisted "enabled"): if you
+        # left it running last session, it resumes; otherwise it stays paused.
         if self._auto_queue_cfg:
             apply_auto_queue(self._auto_queue_cfg, agent, toasts, do_reset=True)
+
+        # In solver mode, set the task-stream state last so it isn't overridden
+        # by persisted auto-queue knobs: auto → a continuous store stream;
+        # manual → only what the user queues (and the queue buttons show).
+        if self.use_solver:
+            agent.facility.set_auto_arrivals(self.solver_auto)
 
         state = _RunState(
             surface=surface,
@@ -270,11 +301,15 @@ class VizApp:
             )
             s.last_fullness, s.last_seed = fullness, used_seed
             s.anim_time = s.agent.facility.sim_time
+            self._invalidate_plan(s, "layout regenerated")
 
     def _tick_sim(self, s: _RunState, dt_wall: float) -> None:
         if s.mode == "anim" and not s.paused and not s.agent.done:
             s.anim_time += dt_wall * s.speed
             s.driver.drive_anim(s.anim_time)
+            # Safety net: if the driver advanced the sim past anim_time (e.g. a
+            # blocking sub-step), follow the clock so the view never freezes.
+            s.anim_time = max(s.anim_time, s.agent.facility.sim_time)
         if s.mode == "step":
             s.anim_time = s.agent.facility.sim_time
         s.toasts.tick()
@@ -289,6 +324,7 @@ class VizApp:
             _draw_done_banner(
                 s.surface, "EPISODE TERMINATED — R: reset · Q: quit",
             )
+        self._draw_planner_hud(s)
         s.picker.draw(s.surface, s.renderer.fonts, s.active_policy_label)
         s.facility_picker.draw(s.surface, s.renderer.fonts)
         s.help_modal.draw(s.surface, s.renderer.fonts)
@@ -383,6 +419,8 @@ class VizApp:
             s.renderer.auto_queue_content.handle_mouse_up(event.pos)
 
     def _on_mousedown(self, s: _RunState, event: pygame.event.Event) -> None:
+        if self._solving:
+            return  # don't mutate state while a solve thread is reading it
         pos = event.pos
         # Tab strip click switches sidebar tab.
         new_tab = s.renderer.tab_strip.hit_test(pos)
@@ -428,11 +466,13 @@ class VizApp:
             )
             if btn == "randomize":
                 s.anim_time = s.agent.facility.state.time
+            self._invalidate_plan(s, "queue changed")
             return
         # Pallet click → toggle Retrieve.
         for rect, pallet_id in s.renderer.pallet_hit_areas:
             if rect.collidepoint(pos):
                 handle_pallet_click(pallet_id, s.agent.facility, s.agent, s.toasts)
+                self._invalidate_plan(s, "request changed")
                 break
 
     def _on_keydown(self, s: _RunState, event: pygame.event.Event) -> None:
@@ -464,17 +504,32 @@ class VizApp:
             s.help_modal.handle_key(event)
             return
 
+        # While a solve is in flight, only Stop / quit are honored — block edits
+        # so the off-thread deepcopy of the state isn't raced.
+        if self._solving and event.key not in (
+            pygame.K_x, pygame.K_q, pygame.K_ESCAPE,
+        ):
+            if event.key == pygame.K_SPACE:
+                s.toasts.warn("SOLVING… press X to stop", lifetime=2.0)
+            return
+
         # Top-level sim controls.
         if event.key in (pygame.K_q, pygame.K_ESCAPE):
             s.running = False
         elif event.key == pygame.K_SPACE:
             s.paused = not s.paused
+        elif event.key == pygame.K_s:
+            self._start_solve(s)
+        elif event.key == pygame.K_x:
+            self._stop_solve(s)
         elif event.key == pygame.K_p:
             s.picker.toggle()
         elif event.key == pygame.K_f:
             s.facility_picker.toggle()
         elif event.key == pygame.K_h:
             s.help_modal.toggle()
+        elif event.key == pygame.K_g:
+            self._request_buried_retrieve(s)
         elif event.key == pygame.K_n:
             s.mode = "step" if s.mode == "anim" else "anim"
             if s.mode == "anim":
@@ -482,7 +537,8 @@ class VizApp:
             s.toasts.warn(f"MODE → {s.mode.upper()}", lifetime=2.0)
         elif event.key == pygame.K_m:
             s.agent.facility.set_auto_arrivals(not s.agent.facility.auto_arrivals_enabled)
-            if s.agent.facility.auto_arrivals_enabled:
+            enabled = s.agent.facility.auto_arrivals_enabled
+            if enabled:
                 s.toasts.success(
                     "MANUAL MODE OFF (auto arrivals resumed)", lifetime=3.0,
                 )
@@ -490,6 +546,13 @@ class VizApp:
                 s.toasts.accent(
                     "MANUAL MODE ON (auto arrivals paused)", lifetime=3.0,
                 )
+            # Keep the AUTO-QUEUE tab toggle + persisted state in sync with M.
+            self._auto_queue_cfg = {
+                **self._auto_queue_cfg,
+                **s.renderer.auto_queue_content.current_values(),
+                "enabled": enabled,
+            }
+            save_viz_state(self.runs_dir, auto_queue=self._auto_queue_cfg)
         elif event.key in (pygame.K_RIGHT, pygame.K_PERIOD):
             if not s.agent.done:
                 s.driver.step_one_decision()
@@ -512,6 +575,7 @@ class VizApp:
             pid = self._hovered_pallet_id(s.renderer)
             if pid is not None:
                 set_pallet_contents(pid, target, s.agent.facility, s.agent, s.toasts)
+                self._invalidate_plan(s, "pallet edited")
         elif event.key in (pygame.K_4, pygame.K_5):
             sid = self._hovered_shelf_id(s.renderer)
             if sid is not None:
@@ -519,6 +583,7 @@ class VizApp:
                     pop_shelf_top(sid, s.agent.facility, s.agent, s.toasts)
                 else:
                     push_empty_pallet(sid, s.agent.facility, s.agent, s.toasts)
+                self._invalidate_plan(s, "shelf edited")
 
     def _on_keydown_facility_picker(
         self, s: _RunState, event: pygame.event.Event,
@@ -552,15 +617,26 @@ class VizApp:
         elif action == "submit":
             entry = s.picker.selected()
             if entry is not None:
-                label = load_policy(
-                    entry, s.agent, s.agent.facility.topology, s.picker.deterministic,
-                    s.toasts,
-                    mcts_enabled=s.picker.mcts_enabled,
-                    mcts_n_sims=s.picker.mcts_n_sims,
-                )
-                if label is not None:
-                    s.active_policy_label = label
+                if entry.path == "__oossolver__":
+                    # Drive the facility directly with the complete OOSSolver.
+                    from oos.solver.live import SolverDriver
+                    s.driver = SolverDriver(s.agent, s.toasts)
+                    s.active_policy_label = "OOSSolver (complete planner)"
+                    s.toasts.success("DRIVER → OOSSolver", lifetime=4.0)
                     save_viz_state(self.runs_dir, policy_path=entry.path)
+                else:
+                    # Back to the standard policy-driven agent loop.
+                    if not isinstance(s.driver, SimDriver):
+                        s.driver = SimDriver(s.agent, s.toasts)
+                    label = load_policy(
+                        entry, s.agent, s.agent.facility.topology, s.picker.deterministic,
+                        s.toasts,
+                        mcts_enabled=s.picker.mcts_enabled,
+                        mcts_n_sims=s.picker.mcts_n_sims,
+                    )
+                    if label is not None:
+                        s.active_policy_label = label
+                        save_viz_state(self.runs_dir, policy_path=entry.path)
             s.picker.close()
 
     def _copy_layout_code(self, s: _RunState) -> None:
@@ -592,7 +668,132 @@ class VizApp:
         s.agent.reset()
         s.agent.facility.set_auto_arrivals(preserve_auto)
         s.anim_time = s.agent.facility.sim_time
+        self._invalidate_plan(s, "env reset")
         s.toasts.accent("ENV RESET", lifetime=2.0)
+
+    def _request_buried_retrieve(self, s: _RunState) -> None:
+        """G-key handler: request a Retrieve for a BURIED pallet (depth >= 1) so
+        you can watch the planner dig it out — a frictionless alternative to
+        precisely clicking a tiny pallet. Picks the deepest available, skipping
+        ones already requested."""
+        fac = s.agent.facility
+        st = fac.state
+        from oos.sim.tasks import Retrieve
+        pending = {t.pallet for t in fac.queue.pending if isinstance(t, Retrieve)}
+        best = None  # (depth, shelf_bottom_pallet_id)
+        for ss in st.shelves.values():
+            n = len(ss.stack)
+            for i, p in enumerate(ss.stack[:-1]):   # exclude the top (depth 0)
+                depth = n - 1 - i
+                if p.id in pending:
+                    continue
+                if best is None or depth > best[0]:
+                    best = (depth, p.id)
+        if best is None:
+            s.toasts.warn("no buried pallet to request", lifetime=2.5)
+            return
+        fac.engine.toggle_retrieve_for_pallet(best[1])
+        fac.wake_waiting_carriers()
+        self._invalidate_plan(s, "request added")
+        s.toasts.info(f"+ RETRIEVE pallet={best[1]} (depth {best[0]})", lifetime=3.0)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PlannerPolicy — Solve (S) / Stop (X) / invalidate / status HUD
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _active_planner(s: _RunState):
+        """Return the live PlannerPolicy if it's the selected policy, else None."""
+        from oos.plan.policy import PlannerPolicy
+        pol = s.agent.policy
+        return pol if isinstance(pol, PlannerPolicy) else None
+
+    def _invalidate_plan(self, s: _RunState, reason: str = "state changed") -> None:
+        """Drop any registered plan (the user mutated state). With no plan, the
+        planner WAITs everywhere, so SPACE does nothing until the next Solve."""
+        p = self._active_planner(s)
+        if p is not None and p.has_plan:
+            p.invalidate()
+            s.paused = True
+            s.toasts.warn(f"PLAN CLEARED ({reason}) — press S to re-solve", lifetime=3.5)
+
+    def _start_solve(self, s: _RunState) -> None:
+        p = self._active_planner(s)
+        if p is None:
+            s.toasts.error("SOLVE: select ▶ PLANNER first (press P)", lifetime=3.0)
+            return
+        if self._solving:
+            return
+        s.paused = True               # never play a half-built plan
+        s.agent.done = False          # a fresh solve re-opens a finished session
+        p.invalidate()                # clear the old plan up-front
+        self._solve_cancel = threading.Event()
+        cancel = self._solve_cancel
+        self._solving = True
+        s.toasts.info("SOLVING…  (X to stop)", lifetime=20.0)
+
+        def work() -> None:
+            try:
+                p.solve(cancel=cancel.is_set)
+            except Exception as exc:  # surface in the poll
+                p._solve_exc = repr(exc)  # type: ignore[attr-defined]
+
+        self._solve_thread = threading.Thread(target=work, daemon=True)
+        self._solve_thread.start()
+
+    def _stop_solve(self, s: _RunState) -> None:
+        if self._solving and self._solve_cancel is not None:
+            self._solve_cancel.set()
+            s.toasts.warn("STOPPING SOLVE…", lifetime=2.0)
+
+    def _poll_solve(self, s: _RunState) -> None:
+        """Finish-line for the solve thread: report time/steps once it exits."""
+        if not self._solving or self._solve_thread is None:
+            return
+        if self._solve_thread.is_alive():
+            return
+        self._solving = False
+        self._solve_thread = None
+        p = self._active_planner(s)
+        if p is None:
+            return
+        exc = getattr(p, "_solve_exc", None)
+        if exc:
+            p._solve_exc = None  # type: ignore[attr-defined]
+            s.toasts.error(f"SOLVE FAILED: {exc}"[:80], lifetime=6.0)
+            p.invalidate()
+            return
+        ms = (p.last_solve_seconds or 0.0) * 1000.0
+        if p.aborted:
+            s.toasts.error(f"SOLVE STOPPED ({ms:.0f} ms) — press S to retry", lifetime=5.0)
+            p.invalidate()
+            return
+        if p.last_plan_steps == 0:
+            s.toasts.accent(f"NOTHING TO DO ({ms:.0f} ms)", lifetime=4.0)
+        else:
+            msg = f"SOLVED {ms:.0f} ms · {p.last_plan_steps} steps — SPACE to play"
+            if p.unsolved:
+                msg += f"  ⚠ {len(p.unsolved)} unsolved"
+            s.toasts.success(msg, lifetime=8.0)
+
+    def _draw_planner_hud(self, s: _RunState) -> None:
+        p = self._active_planner(s)
+        if p is None:
+            return
+        if self._solving:
+            txt, color = "PLANNER ▸ SOLVING…  (X stops)", (255, 210, 80)
+        elif not p.has_plan:
+            txt, color = "PLANNER ▸ no plan — press S to solve", (170, 170, 185)
+        else:
+            ms = (p.last_solve_seconds or 0.0) * 1000.0
+            if p.last_plan_steps == 0:
+                txt, color = f"PLANNER ▸ nothing to do  ({ms:.0f} ms)", (170, 170, 185)
+            else:
+                txt = (f"PLANNER ▸ READY · {p.steps_left}/{p.last_plan_steps} steps left · "
+                       f"solved {ms:.0f} ms — SPACE plays")
+                color = (120, 230, 140)
+        surf = s.renderer.fonts.body.render(txt, True, color)
+        s.surface.blit(surf, (16, s.window_h - 30))
 
     # ─────────────────────────────────────────────────────────────────────
     # Renderer construction / wiring
@@ -641,7 +842,23 @@ class VizApp:
             if state is not None:
                 apply_auto_queue(params, state.agent, state.toasts)
                 state.anim_time = state.agent.facility.sim_time
+
+        def fire_toggle_enabled(enabled: bool) -> None:
+            # Flip the continuous stream live (no reset), persist the choice,
+            # and surface feedback. Mirrors the M key.
+            if state is not None:
+                state.agent.facility.set_auto_arrivals(enabled)
+                msg = ("STREAM RUNNING (auto arrivals on)" if enabled
+                       else "STREAM PAUSED (manual mode)")
+                if enabled:
+                    state.toasts.success(msg, lifetime=2.5)
+                else:
+                    state.toasts.accent(msg, lifetime=2.5)
+            self._auto_queue_cfg = dict(r.auto_queue_content.current_values())
+            save_viz_state(self.runs_dir, auto_queue=self._auto_queue_cfg)
+
         r.auto_queue_content.on_apply = fire_apply
+        r.auto_queue_content.on_toggle_enabled = fire_toggle_enabled
         if getattr(self, "_auto_queue_cfg", None):
             r.auto_queue_content.set_values(self._auto_queue_cfg)
         return r
@@ -728,6 +945,9 @@ def run_app(
     policy: Optional[PolicyFn] = None,
     seed: int = 0,
     facility_name: str = "dev",
+    use_solver: bool = False,
+    solver_auto: bool = True,
 ) -> None:
     VizApp(env=env, policy=policy or random_policy, seed=seed,
-           facility_name=facility_name).run()
+           facility_name=facility_name, use_solver=use_solver,
+           solver_auto=solver_auto).run()

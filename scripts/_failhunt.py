@@ -38,14 +38,15 @@ def load(ckpt):
     return net, GraphCollator(get_facility(FAC)()[0])
 
 
-def retr_env(strict=False, fullness=-1, room_cars=(0,), reqs=(1,), depths=(0, 1, 2)):
-    """Isolated RetrieveEnv (sampler). room_cars=(1,2)+reqs=(0,) => store/park."""
+def retr_env(strict=False, fullness=-1, room_cars=(0,), reqs=(1,), depths=(0, 1, 2), max_steps=200):
+    """Isolated RetrieveEnv (sampler). room_cars=(1,2)+reqs=(0,) => store/park.
+    max_steps: bump for multi-task (3 requests need room — solutions run >200)."""
     return RetrieveEnv(
         facility_factory=get_facility(FAC), room_car_amounts=room_cars, request_car_amounts=reqs,
         depths=depths, fullness=fullness, omni=True, target_any_shelf=True,
         require_noroom_empty=strict, require_all_waiting=strict, reward_success=15.0, require_solvable=True,
         experiment_config=ExperimentConfig(task_stream=TaskStreamConfig(store_rate=0.0),
-            episode=EpisodeConfig(max_steps=200, max_sim_time=360000.0)))
+            episode=EpisodeConfig(max_steps=max_steps, max_sim_time=360000.0)))
 
 
 def cont_env(store_rate=0.02, dwell=90.0):

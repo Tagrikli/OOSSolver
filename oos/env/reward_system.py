@@ -463,4 +463,5 @@ def base_system(cfg: Any) -> RewardSystem:
         ServeTerm(cfg.reward_serve),
         shaping,
         IdleWhileTaskTerm(cfg.penalty_idle_while_task),
+        MovementTerm(getattr(cfg, "penalty_move", 0.0)),   # anti-wander; 0 = off
     ])
