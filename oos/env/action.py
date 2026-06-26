@@ -178,6 +178,81 @@ def enumerate_actions(
     return entries
 
 
+def has_non_wait_action(
+    carrier: CarrierId,
+    state: FacilityState,
+    topo: Topology,
+    queue: TaskQueue | None = None,
+    policy_guards: bool = True,
+) -> bool:
+    """Fast decision predicate: does this carrier have ANY legal action other
+    than WAIT right now? Returns the same boolean as
+    `any(e.type != WAIT for e in enumerate_actions(...))` but early-exits on the
+    first legal non-WAIT action instead of building the whole list — this is on
+    the sim's hot path (`carriers_needing_decision` queries it constantly).
+
+    Mirrors `enumerate_actions`' legality + guard logic exactly; keep the two in
+    sync. Cheap candidates (TAKE/GIVE at the docked shelf) are tried first; the
+    retrieve-target set is built lazily, only if a room GOTO is reached.
+    """
+    cs = state.carriers[carrier]
+
+    at_shelf = cs.docked_at is not None and cs.docked_at.kind == "shelf"
+    if at_shelf:
+        if _ok(Take(carrier_id=carrier), state, topo) and not (
+            policy_guards and _is_immediate_inverse(cs, "give")
+        ):
+            return True
+        if _ok(Give(carrier_id=carrier), state, topo) and not (
+            policy_guards and _is_immediate_inverse(cs, "take")
+        ):
+            return True
+
+    def _goto_blocked_by_reverse_guard(target: DockRef) -> bool:
+        return (
+            policy_guards
+            and target.kind != "room"
+            and cs.last_take_give is None
+            and cs.came_from is not None
+            and target == cs.came_from
+        )
+
+    for sid in topo.accessible_shelves[carrier]:
+        target = DockRef("shelf", sid)
+        if cs.docked_at is not None and target == cs.docked_at:
+            continue
+        if _goto_blocked_by_reverse_guard(target):
+            continue
+        if _ok(Goto(carrier_id=carrier, target=target), state, topo):
+            return True
+
+    for pid in topo.handoff_partners[carrier]:
+        target = DockRef("handoff", pid)
+        if cs.docked_at is not None and target == cs.docked_at:
+            continue
+        if _goto_blocked_by_reverse_guard(target):
+            continue
+        if _ok(Goto(carrier_id=carrier, target=target), state, topo):
+            return True
+
+    retrieve_targets: set | None = None
+    for rid in topo.accessible_rooms[carrier]:
+        target = DockRef("room", rid)
+        if cs.docked_at is not None and target == cs.docked_at:
+            continue
+        if retrieve_targets is None:
+            retrieve_targets = (
+                {t.pallet for t in queue.pending if isinstance(t, Retrieve)}
+                if queue is not None else set()
+            )
+        if not _room_goto_allowed(cs, retrieve_targets):
+            continue
+        if _ok(Goto(carrier_id=carrier, target=target), state, topo):
+            return True
+
+    return False
+
+
 class ActionDecoder:
     """Maps flat Discrete indices to ActionEntry for the current observation.
 

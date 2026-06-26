@@ -1,4 +1,14 @@
-"""Build a typed-graph observation dict from facility state."""
+"""Build a typed-graph observation dict from facility state.
+
+`ObservationBuilder` precomputes everything that is constant for a topology —
+the node-id orderings, index maps, node offsets, the three structural edge sets
+(accesses / handoff / transfer), and the static feature columns (carrier kind,
+shelf size / capacity / transfer flag) — once, then fills only the dynamic
+columns per step. This keeps the per-step output BITWISE-IDENTICAL to the old
+all-at-once builder while skipping the static rebuild (the structural edges
+alone cost ~1.3M list appends across a rollout). `build_observation` stays as a
+stateless convenience wrapper for tests and ad-hoc callers.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +19,7 @@ import numpy as np
 
 from oos.sim.facility import SimEngine
 from oos.sim.tasks import Retrieve, Store, TaskQueue
-from oos.sim.topology import CarrierId
+from oos.sim.topology import CarrierId, Topology
 
 
 @dataclass(frozen=True)
@@ -106,176 +116,194 @@ ROOM_FEATURE_NAMES = (
 GLOBAL_FEATURE_NAMES: tuple[str, ...] = ()
 
 
+class ObservationBuilder:
+    """Stateful, topology-bound observation builder. Construct once per topology
+    (cheap statics precomputed in __init__), then call `build` every step."""
+
+    def __init__(self, topo: Topology, cfg: ObservationConfig) -> None:
+        self.topo = topo
+        self.cfg = cfg
+
+        self.carrier_ids = list(topo.carriers.keys())
+        self.shelf_ids = list(topo.shelves.keys())
+        self.room_ids = list(topo.rooms.keys())
+        self.carrier_idx = {cid: i for i, cid in enumerate(self.carrier_ids)}
+        self.shelf_idx = {sid: i for i, sid in enumerate(self.shelf_ids)}
+        self.room_idx = {rid: i for i, rid in enumerate(self.room_ids)}
+
+        # Single node-index space: [carriers | shelves | rooms].
+        self.c_off = 0
+        self.s_off = len(self.carrier_ids)
+        self.r_off = self.s_off + len(self.shelf_ids)
+
+        n_c = len(self.carrier_ids)
+        n_s = len(self.shelf_ids)
+        self._n_rooms = len(self.room_ids)
+        self._carrier_dim = len(CARRIER_FEATURE_NAMES)
+        self._shelf_dim = shelf_feature_count()
+        self._room_dim = len(ROOM_FEATURE_NAMES)
+        self._base_dim = len(SHELF_BASE_FEATURE_NAMES)
+        self._per_slot = SHELF_PER_SLOT_DIM
+
+        # ---- static carrier columns + per-carrier scalars --------------
+        self._c_min = np.empty(n_c, dtype=np.float32)
+        self._c_span = np.empty(n_c, dtype=np.float32)
+        carrier_static = np.zeros((n_c, self._carrier_dim), dtype=np.float32)
+        for i, cid in enumerate(self.carrier_ids):
+            c = topo.carriers[cid]
+            self._c_min[i] = c.min_pos
+            self._c_span[i] = max(c.span, 1)
+            carrier_static[i, 9 if c.kind == "lift" else 10] = 1.0
+        self._carrier_static = carrier_static
+
+        # ---- static shelf columns + per-shelf scalars ------------------
+        self._s_cap = np.empty(n_s, dtype=np.float32)
+        self._s_slot_bound = [0] * n_s
+        shelf_static = np.zeros((n_s, self._shelf_dim), dtype=np.float32)
+        for i, sid in enumerate(self.shelf_ids):
+            s = topo.shelves[sid]
+            shelf_static[i, 0] = 1.0 if s.size_class == "small" else 0.0
+            shelf_static[i, 1] = 1.0 if s.size_class == "big" else 0.0
+            shelf_static[i, 2] = s.capacity / SHELF_MAX_CAPACITY
+            shelf_static[i, 5] = 1.0 if s.is_transfer else 0.0
+            self._s_cap[i] = max(s.capacity, 1)
+            self._s_slot_bound[i] = min(SHELF_MAX_CAPACITY, s.capacity)
+        self._shelf_static = shelf_static
+
+        # ---- static structural edges (never change within a topology) --
+        accesses: list[tuple[int, int]] = []
+        transfer: list[tuple[int, int]] = []
+        for sid, s in topo.shelves.items():
+            for cid in s.access:
+                accesses.append((self.c_off + self.carrier_idx[cid], self.s_off + self.shelf_idx[sid]))
+                if s.is_transfer:
+                    transfer.append((self.c_off + self.carrier_idx[cid], self.s_off + self.shelf_idx[sid]))
+        for rid, r in topo.rooms.items():
+            accesses.append((self.c_off + self.carrier_idx[r.served_by], self.r_off + self.room_idx[rid]))
+        handoff: list[tuple[int, int]] = []
+        for h in topo.handoffs:
+            a, b = h.carriers
+            handoff.append((self.c_off + self.carrier_idx[a], self.c_off + self.carrier_idx[b]))
+            handoff.append((self.c_off + self.carrier_idx[b], self.c_off + self.carrier_idx[a]))
+        self._edges_accesses = np.ascontiguousarray(_edges_to_array(accesses))
+        self._edges_transfer = np.ascontiguousarray(_edges_to_array(transfer))
+        self._edges_handoff = np.ascontiguousarray(_edges_to_array(handoff))
+
+    def build(
+        self, facility: SimEngine, queue: TaskQueue, querying_carrier: CarrierId,
+    ) -> dict[str, Any]:
+        state = facility.state
+        requested_pallets = {t.pallet for t in queue.pending if isinstance(t, Retrieve)}
+        has_pending_store = any(isinstance(t, Store) for t in queue.pending)
+        horizon = self.cfg.horizon_seconds
+
+        cf = self._carrier_static.copy()
+        for i, cid in enumerate(self.carrier_ids):
+            cs = state.carriers[cid]
+            load = cs.load
+            cf[i, 0] = (cs.position - self._c_min[i]) / self._c_span[i]
+            if load is None:
+                cf[i, 1] = 1.0
+            elif load.is_empty:
+                cf[i, 2] = 1.0
+            elif load.contents == "small":
+                cf[i, 3] = 1.0
+            else:
+                cf[i, 4] = 1.0
+            if cs.current_command is not None:
+                cf[i, 5] = 1.0
+                if cs.busy_until is not None:
+                    eta = max(0.0, cs.busy_until - state.time)
+                    cf[i, 6] = min(1.0, eta / horizon)
+            if cid == querying_carrier:
+                cf[i, 7] = 1.0
+            if load is not None and not load.is_empty and load.id in requested_pallets:
+                cf[i, 8] = 1.0
+            d = cs.docked_at
+            if d is None:
+                cf[i, 11] = 1.0
+            else:
+                k = d.kind
+                if k == "shelf":
+                    cf[i, 12] = 1.0
+                elif k == "room":
+                    cf[i, 13] = 1.0
+                elif k == "handoff":
+                    cf[i, 14] = 1.0
+                if k == "handoff" and cs.waiting and load is not None:
+                    cf[i, 15] = 1.0
+
+        sf = self._shelf_static.copy()
+        base = self._base_dim
+        per_slot = self._per_slot
+        for i, sid in enumerate(self.shelf_ids):
+            stack = state.shelves[sid].stack
+            depth = len(stack)
+            sf[i, 3] = depth / SHELF_MAX_CAPACITY
+            sf[i, 4] = depth / self._s_cap[i]
+            n_requested_in_stack = 0
+            for slot_i in range(self._s_slot_bound[i]):
+                off = base + slot_i * per_slot
+                if slot_i < depth:
+                    p = stack[-(slot_i + 1)]
+                    if p.is_empty:
+                        sf[i, off + 1] = 1.0
+                    elif p.contents == "small":
+                        sf[i, off + 2] = 1.0
+                    else:
+                        sf[i, off + 3] = 1.0
+                    if p.id in requested_pallets:
+                        sf[i, off + 4] = 1.0
+                        n_requested_in_stack += 1
+                else:
+                    sf[i, off + 0] = 1.0
+            sf[i, 6] = n_requested_in_stack / SHELF_MAX_CAPACITY
+
+        rf = np.zeros((self._n_rooms, self._room_dim), dtype=np.float32)
+        for i, rid in enumerate(self.room_ids):
+            scs = state.carriers[self.topo.rooms[rid].served_by]
+            rf[i, 0] = 1.0 if has_pending_store else 0.0
+            rf[i, 1] = 1.0 if requested_pallets else 0.0
+            d = scs.docked_at
+            if d is not None and d.kind == "room" and d.id == rid and scs.load is not None:
+                if scs.load.is_empty:
+                    rf[i, 2] = 1.0
+                elif scs.load.id in requested_pallets:
+                    rf[i, 3] = 1.0
+
+        edges_docked: list[tuple[int, int]] = []
+        for cid, cs in state.carriers.items():
+            d = cs.docked_at
+            if d is None:
+                continue
+            tgt = _docked_node(d, self.s_off, self.r_off, self.shelf_idx, self.room_idx, self.carrier_idx)
+            if tgt is not None:
+                edges_docked.append((self.c_off + self.carrier_idx[cid], tgt))
+
+        return {
+            "carrier_features": cf,
+            "shelf_features": sf,
+            "room_features": rf,
+            "global_features": np.zeros(len(GLOBAL_FEATURE_NAMES), dtype=np.float32),
+            "edges_accesses": self._edges_accesses.copy(),
+            "edges_handoff": self._edges_handoff.copy(),
+            "edges_transfer": self._edges_transfer.copy(),
+            "edges_docked": _edges_to_array(edges_docked),
+            "querying_carrier": int(self.carrier_idx[querying_carrier]),
+        }
+
+
 def build_observation(
     facility: SimEngine,
     queue: TaskQueue,
     querying_carrier: CarrierId,
     cfg: ObservationConfig,
 ) -> dict[str, Any]:
-    topo = facility.topology
-    state = facility.state
-
-    carrier_ids = list(topo.carriers.keys())
-    shelf_ids = list(topo.shelves.keys())
-    room_ids = list(topo.rooms.keys())
-
-    carrier_idx = {cid: i for i, cid in enumerate(carrier_ids)}
-    shelf_idx = {sid: i for i, sid in enumerate(shelf_ids)}
-    room_idx = {rid: i for i, rid in enumerate(room_ids)}
-
-    # Set of pallet IDs being requested by pending Retrieves.
-    requested_pallets = {t.pallet for t in queue.pending if isinstance(t, Retrieve)}
-    has_pending_store = any(isinstance(t, Store) for t in queue.pending)
-
-    carrier_features = np.zeros((len(carrier_ids), len(CARRIER_FEATURE_NAMES)), dtype=np.float32)
-    for i, cid in enumerate(carrier_ids):
-        c = topo.carriers[cid]
-        cs = state.carriers[cid]
-        load = cs.load
-        carrier_features[i, 0] = (cs.position - c.min_pos) / max(c.span, 1)
-        if load is None:
-            carrier_features[i, 1] = 1.0
-        elif load.is_empty:
-            carrier_features[i, 2] = 1.0
-        elif load.contents == "small":
-            carrier_features[i, 3] = 1.0
-        else:
-            carrier_features[i, 4] = 1.0
-        is_busy_cmd = cs.current_command is not None
-        carrier_features[i, 5] = 1.0 if is_busy_cmd else 0.0
-        if is_busy_cmd and cs.busy_until is not None:
-            eta = max(0.0, cs.busy_until - state.time)
-            carrier_features[i, 6] = min(1.0, eta / cfg.horizon_seconds)
-        carrier_features[i, 7] = 1.0 if cid == querying_carrier else 0.0
-        if (
-            load is not None
-            and not load.is_empty
-            and load.id in requested_pallets
-        ):
-            carrier_features[i, 8] = 1.0
-        if c.kind == "lift":
-            carrier_features[i, 9] = 1.0
-        else:
-            carrier_features[i, 10] = 1.0
-        # Docked-location one-hot (11..14) + at-handoff-with-item (15).
-        d = cs.docked_at
-        if d is None:
-            carrier_features[i, 11] = 1.0
-        elif d.kind == "shelf":
-            carrier_features[i, 12] = 1.0
-        elif d.kind == "room":
-            carrier_features[i, 13] = 1.0
-        elif d.kind == "handoff":
-            carrier_features[i, 14] = 1.0
-        if (
-            d is not None
-            and d.kind == "handoff"
-            and cs.waiting
-            and load is not None
-        ):
-            carrier_features[i, 15] = 1.0
-
-    per_slot_dim = SHELF_PER_SLOT_DIM
-    total_shelf_dim = shelf_feature_count()
-    base_dim = len(SHELF_BASE_FEATURE_NAMES)
-    shelf_features = np.zeros((len(shelf_ids), total_shelf_dim), dtype=np.float32)
-    for i, sid in enumerate(shelf_ids):
-        s = topo.shelves[sid]
-        ss = state.shelves[sid]
-        depth = ss.depth
-        stack = ss.stack
-        shelf_features[i, 0] = 1.0 if s.size_class == "small" else 0.0
-        shelf_features[i, 1] = 1.0 if s.size_class == "big" else 0.0
-        shelf_features[i, 2] = s.capacity / SHELF_MAX_CAPACITY
-        shelf_features[i, 3] = depth / SHELF_MAX_CAPACITY
-        shelf_features[i, 4] = depth / max(s.capacity, 1)
-        shelf_features[i, 5] = 1.0 if s.is_transfer else 0.0
-        n_requested_in_stack = 0
-        # Per-slot occupancy. Slot index 0 = LIFO top (= stack[-1]).
-        for slot_i in range(min(SHELF_MAX_CAPACITY, s.capacity)):
-            off = base_dim + slot_i * per_slot_dim
-            if slot_i < depth:
-                p = stack[-(slot_i + 1)]
-                if p.is_empty:
-                    shelf_features[i, off + 1] = 1.0      # slot_pallet_empty
-                elif p.contents == "small":
-                    shelf_features[i, off + 2] = 1.0      # slot_pallet_small
-                else:
-                    shelf_features[i, off + 3] = 1.0      # slot_pallet_big
-                if p.id in requested_pallets:
-                    shelf_features[i, off + 4] = 1.0      # slot_pallet_requested
-                    n_requested_in_stack += 1
-            else:
-                shelf_features[i, off + 0] = 1.0          # slot_empty (no pallet here)
-        shelf_features[i, 6] = n_requested_in_stack / SHELF_MAX_CAPACITY
-
-    room_features = np.zeros((len(room_ids), len(ROOM_FEATURE_NAMES)), dtype=np.float32)
-    for i, rid in enumerate(room_ids):
-        room = topo.rooms[rid]
-        scs = state.carriers[room.served_by]
-        docked_here = (
-            scs.docked_at is not None
-            and scs.docked_at.kind == "room"
-            and scs.docked_at.id == rid
-        )
-        room_features[i, 0] = 1.0 if has_pending_store else 0.0
-        room_features[i, 1] = 1.0 if requested_pallets else 0.0
-        if docked_here and scs.load is not None:
-            if scs.load.is_empty:
-                room_features[i, 2] = 1.0
-            elif scs.load.id in requested_pallets:
-                room_features[i, 3] = 1.0
-
-    global_features = np.zeros(len(GLOBAL_FEATURE_NAMES), dtype=np.float32)
-
-    # ----- edges -----
-    edges_accesses: list[tuple[int, int]] = []  # carrier_node_idx -> shelf/room (offset)
-    edges_handoff: list[tuple[int, int]] = []
-    edges_transfer: list[tuple[int, int]] = []
-    edges_docked: list[tuple[int, int]] = []     # carrier -> the node it is docked at
-
-    # Single node-index space: [carriers | shelves | rooms].
-    c_off = 0
-    s_off = len(carrier_ids)
-    r_off = s_off + len(shelf_ids)
-
-    for sid, s in topo.shelves.items():
-        for cid in s.access:
-            edges_accesses.append((c_off + carrier_idx[cid], s_off + shelf_idx[sid]))
-            if s.is_transfer:
-                edges_transfer.append((c_off + carrier_idx[cid], s_off + shelf_idx[sid]))
-
-    for rid, r in topo.rooms.items():
-        edges_accesses.append(
-            (c_off + carrier_idx[r.served_by], r_off + room_idx[rid])
-        )
-
-    for h in topo.handoffs:
-        a, b = h.carriers
-        edges_handoff.append((c_off + carrier_idx[a], c_off + carrier_idx[b]))
-        edges_handoff.append((c_off + carrier_idx[b], c_off + carrier_idx[a]))
-
-    # Docked edge: each carrier -> the node it is currently docked at (a shelf,
-    # a room, or — for a handoff pose — its partner carrier node).
-    for cid, cs in state.carriers.items():
-        d = cs.docked_at
-        if d is None:
-            continue
-        tgt = _docked_node(d, s_off, r_off, shelf_idx, room_idx, carrier_idx)
-        if tgt is not None:
-            edges_docked.append((c_off + carrier_idx[cid], tgt))
-
-    return {
-        "carrier_features": carrier_features,
-        "shelf_features": shelf_features,
-        "room_features": room_features,
-        "global_features": global_features,
-        "edges_accesses": _edges_to_array(edges_accesses),
-        "edges_handoff": _edges_to_array(edges_handoff),
-        "edges_transfer": _edges_to_array(edges_transfer),
-        "edges_docked": _edges_to_array(edges_docked),
-        "querying_carrier": int(carrier_idx[querying_carrier]),
-    }
+    """Stateless convenience wrapper — builds a one-shot `ObservationBuilder`.
+    Hot paths should hold a persistent builder (see `Environment`)."""
+    return ObservationBuilder(facility.topology, cfg).build(
+        facility, queue, querying_carrier,
+    )
 
 
 def _edges_to_array(edges: list[tuple[int, int]]) -> np.ndarray:

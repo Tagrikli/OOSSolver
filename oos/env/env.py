@@ -20,14 +20,15 @@ from oos.env.action import (
     ActionEntry,
     ActionType,
     enumerate_actions,
+    has_non_wait_action,
     max_actions_per_carrier,
 )
 from oos.env.observation import (
     CARRIER_FEATURE_NAMES,
     GLOBAL_FEATURE_NAMES,
     ROOM_FEATURE_NAMES,
+    ObservationBuilder,
     ObservationConfig,
-    build_observation,
     shelf_feature_count,
 )
 from oos.env.reward import RewardConfig, RewardEvent
@@ -704,11 +705,12 @@ class Environment:
 
     def _has_non_wait_action(self, facility: SimEngine, cid: CarrierId) -> bool:
         """Decision predicate (injected into the sim): does this carrier have
-        at least one action other than WAIT right now?"""
-        entries = enumerate_actions(
-            cid, facility.state, facility.topology, facility.queue, policy_guards=self._policy_guards,
+        at least one action other than WAIT right now? Early-exits — see
+        `has_non_wait_action`."""
+        return has_non_wait_action(
+            cid, facility.state, facility.topology, facility.queue,
+            policy_guards=self._policy_guards,
         )
-        return any(e.type != ActionType.WAIT for e in entries)
 
     def _fresh_decoder(self, facility: SimEngine) -> ActionDecoder:
         idle = self._fresh_pending_idle(facility)
@@ -736,11 +738,15 @@ class Environment:
             obs = self._zero_obs()
             info: dict[str, Any] = {"action_entries": [], "dt": dt}
             return obs, info
-        obs = build_observation(
-            facility=facility,
-            queue=facility.queue,
-            querying_carrier=self._ctx.querying_carrier,
-            cfg=self._obs_cfg,
+        topo = facility.topology
+        if getattr(self, "_obs_builder", None) is None or self._obs_builder_topo is not topo:
+            # Build (or rebuild on a topology change: reset / facility swap) the
+            # persistent observation builder, which caches all per-topology
+            # statics so each step only fills the dynamic columns.
+            self._obs_builder = ObservationBuilder(topo, self._obs_cfg)
+            self._obs_builder_topo = topo
+        obs = self._obs_builder.build(
+            facility, facility.queue, self._ctx.querying_carrier,
         )
         mask = np.array(self._ctx.decoder.mask(), dtype=np.int8)
         obs["action_mask"] = mask
