@@ -29,6 +29,7 @@ Auto-driven side-effects:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from oos.sim.state import DockRef, FacilityState, SimTime
@@ -171,6 +172,42 @@ class Goto(Command):
         cs = state.carriers[self.carrier_id]
         cs.position = _dockref_position(self.target, self.carrier_id, topo)
         cs.docked_at = self.target
+
+
+# ---------------------------------------------------------------------------
+# Kinematics — continuous in-flight position (the viz's single motion source)
+# ---------------------------------------------------------------------------
+
+
+def carrier_position_at(
+    state: FacilityState, topo: Topology, carrier_id: CarrierId, t: SimTime
+) -> float:
+    """Continuous track position (mm) of a carrier at sim-time `t`.
+
+    The viz animates from this. While a carrier executes a Goto, its position
+    is the closed-form integral of the SAME trapezoidal profile the sim used
+    to size the move (the duration model delegates to `carrier.profile`), so
+    the sprite reaches the target exactly when the sim marks the move done —
+    the picture cannot drift from sim truth. In any other state (waiting, or a
+    TAKE/GIVE reach, neither of which moves along the track) the carrier sits
+    at its recorded `position`.
+    """
+    cs = state.carriers[carrier_id]
+    cmd = cs.current_command
+    if (
+        not isinstance(cmd, Goto)
+        or cs.command_started_at is None
+        or cs.command_start_position is None
+    ):
+        return float(cs.position)
+    start = cs.command_start_position
+    target = _dockref_position(cmd.target, carrier_id, topo)
+    dist = target - start
+    if dist == 0:
+        return float(target)
+    profile = topo.carriers[carrier_id].profile
+    traveled = profile.traveled_at(t - cs.command_started_at, dist)
+    return start + math.copysign(traveled, dist)
 
 
 # ---------------------------------------------------------------------------

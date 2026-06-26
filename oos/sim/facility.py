@@ -232,19 +232,16 @@ class SimEngine:
         )
 
     def wait(self, carrier_id: CarrierId) -> None:
-        """Carrier chooses WAIT: hold in place until a state change re-opens
-        the decision. No timer, no `current_command` — the carrier stays
-        recruitable as a handoff partner but is not re-queried until then.
+        """Carrier chooses WAIT: hold in place until a state change re-opens the
+        decision. No timer, no `current_command` — the carrier stays recruitable
+        as a handoff partner but is not re-queried until then.
 
-        The WAIT is ALSO the sole store/retrieve serve trigger: if this carrier
-        is now docked+waiting at a room holding the matching load with a pending
-        compatible task, the customer interaction fires here (not on arrival),
-        so the WAIT is always the creditable action. A serve is a state change,
-        so all waiting carriers are re-queried afterwards."""
+        WAIT is pure idle. Customer serves are arrival-triggered
+        (`_serve_ready_rooms`): they fire the instant a carrier docks at a room
+        holding the matching load, or the instant a matching task is injected
+        while it sits there — NOT bound to WAIT."""
         cs = self.state.carriers[carrier_id]
         cs.waiting = True
-        if self._try_serve_at_room(carrier_id, self._pending_completions):
-            self.wake_waiting_carriers()
 
     # ------------------------------------------------------------------
     # Manual task injection (used by the viz in manual mode; bypasses the
@@ -254,8 +251,10 @@ class SimEngine:
     def enqueue_store(self, size: SizeClass) -> None:
         """Add a Store of the given size to the queue right now."""
         self.queue.add(Store(arrived_at=self.state.time, size=size))
-        # A new task is a state change: re-open every waiting carrier so a
-        # carrier parked at a room re-decides and a re-chosen WAIT serves it.
+        # A carrier already idle at a room holding an empty pallet takes this car
+        # immediately (arrival-triggered serve); then re-open every waiting
+        # carrier so the agent reacts to the new demand.
+        self._serve_ready_rooms(self._pending_completions)
         self.wake_waiting_carriers()
 
     def clear_queue(self) -> None:
@@ -285,6 +284,10 @@ class SimEngine:
             initial_depth=pallet_depth(self.state, pallet_id),
             already_staged=self._target_already_staged(pallet_id),
         ))
+        # If the requested car is already held by a carrier idle at a room,
+        # deliver it now (tagged not-agent-delivered via already_staged above);
+        # then re-open waiting carriers to react.
+        self._serve_ready_rooms(self._pending_completions)
         self.wake_waiting_carriers()
         return True
 
@@ -333,10 +336,10 @@ class SimEngine:
         if self.carriers_needing_decision() and (peek is None or peek > self.state.time):
             if time_limit is not None and time_limit > self.state.time:
                 self.state.time = time_limit
-            # Carry any completions already produced this advance (e.g. a
-            # WAIT-serve that fired in submit_action and woke the carriers): this
-            # early return must NOT drop them, or the delivery never surfaces in
-            # info["completions"] — the agent would deliver yet get no reward.
+            # Carry any completions already produced before this advance (e.g. a
+            # manual enqueue_store / toggle_retrieve that served a carrier idle at
+            # a room): this early return must NOT drop them, or the delivery never
+            # surfaces in info["completions"] — the serve would go uncredited.
             return AdvanceResult(
                 dt=self.state.time - start_time,
                 completions=completions,
@@ -434,17 +437,21 @@ class SimEngine:
         # partner that just became free) is re-queried at this instant instead
         # of holding stale.
         self.wake_waiting_carriers()
-        # Serving (both retrieves and stores) happens ONLY on the WAIT customer
-        # interaction (`_try_serve_at_room`), so nothing is served here. But a
-        # handoff fires automatically when two partner carriers rendezvous at a
-        # pose, one loaded + one empty (no GIVE/TAKE needed) — that changes carrier
-        # loads, so re-wake to re-query both if it fired.
+        # A handoff fires automatically when two partner carriers rendezvous at a
+        # pose, one loaded + one empty (no GIVE/TAKE needed) — that changes
+        # carrier loads, so re-wake to re-query both if it fired.
         if self._auto_handoffs():
             self.wake_waiting_carriers()
         # After every event, sweep big Stores from the queue if the facility
         # currently has no big capacity. This handles both "arrived when full"
         # and "queued, then capacity disappeared as more bigs landed".
         self._sweep_unservable_bigs(dropped)
+        # Arrival-triggered customer serve: any carrier now idle at a room whose
+        # load matches a pending task is served immediately (deliver a requested
+        # item / load a queued car). AFTER the big-sweep so an unservable big is
+        # never loaded. A serve changes loads → re-wake to re-query.
+        if self._serve_ready_rooms(completions):
+            self.wake_waiting_carriers()
 
     def _on_command_done(self, carrier_id: CarrierId) -> None:
         cs = self.state.carriers[carrier_id]
@@ -586,24 +593,40 @@ class SimEngine:
         # this pallet and parked at a room re-decides and serves on its WAIT.
 
     # ------------------------------------------------------------------
-    # Customer-interaction serve (carrier-docked, WAIT-triggered)
+    # Customer-interaction serve (arrival-triggered: carrier idle at a room)
     # ------------------------------------------------------------------
+
+    def _serve_ready_rooms(self, completions: list[TaskCompletion]) -> bool:
+        """Serve every carrier currently idle at a room whose load matches a
+        pending task — deliver a requested item, or load a queued car onto an
+        empty pallet. Loops to a fixpoint so a carrier that delivers (freeing its
+        pallet) immediately takes a queued store in the same instant. Returns
+        True iff any serve fired. Each serve removes one task, so the queue
+        strictly shrinks and this terminates."""
+        served_any = False
+        changed = True
+        while changed:
+            changed = False
+            for carrier_id in self.state.carriers:
+                if self._try_serve_at_room(carrier_id, completions):
+                    served_any = True
+                    changed = True
+        return served_any
 
     def _try_serve_at_room(
         self, carrier_id: CarrierId, completions: list[TaskCompletion]
     ) -> bool:
-        """Fire a store/retrieve customer interaction against the load a carrier
-        physically holds while docked + WAITing at a room. Returns True iff a
-        task was served.
+        """Serve one customer interaction against the load a carrier holds while
+        idle + docked at a room. Returns True iff a task was served.
 
-        Exactly one serve per call (retrieve takes priority over store) so each
-        serve is bound to its own WAIT decision. A retrieve consumes the held
-        target (contents → empty, id preserved); a store fills the held empty
-        pallet (contents → size) and schedules its dwell retrieve. Rooms hold no
-        pallet of their own — the result stays on the carrier.
+        Exactly one serve per call (retrieve takes priority over store). A
+        retrieve consumes the held target (contents → empty, id preserved); a
+        store fills the held empty pallet (contents → size) and schedules its
+        dwell retrieve. Rooms hold no pallet of their own — the result stays on
+        the carrier. `_serve_ready_rooms` loops this to chain deliver-then-load.
         """
         cs = self.state.carriers[carrier_id]
-        if not cs.waiting or cs.load is None:
+        if cs.load is None or cs.is_busy:
             return False
         d = cs.docked_at
         if d is None or d.kind != "room":

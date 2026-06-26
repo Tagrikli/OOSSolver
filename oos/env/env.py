@@ -244,17 +244,16 @@ class Environment:
         ctx = self._ctx
         facility = ctx.facility
         # Snapshot Φ(s) BEFORE this action mutates state — a GOTO clears
-        # docked_at (carrier leaves its dock), a WAIT may serve a store. PBRS
-        # needs Φ of the pre-action state; capturing it after submit would
-        # silently drop those changes and break telescoping (the staging pump).
+        # docked_at (carrier leaves its dock). PBRS needs Φ of the pre-action
+        # state; capturing it after submit would silently drop that change and
+        # break telescoping (the staging pump).
         # Only the first submit of an instant captures; advance() consumes it.
         if self._phi_before is None:
             self._phi_before = self._potential(facility)
         entry: ActionEntry = ctx.decoder.decode(int(action))
         if entry.type == ActionType.WAIT:
-            # WAIT is not a command — hold the carrier until a state change
-            # re-opens its decision. This is also where a store/retrieve serves
-            # when the carrier is docked at a room holding the matching load.
+            # WAIT is not a command — just hold the carrier until a state change
+            # re-opens its decision (pure idle; serves are arrival-triggered).
             facility.wait(ctx.querying_carrier)
         else:
             cmd = entry.to_command(ctx.querying_carrier)
@@ -263,8 +262,8 @@ class Environment:
             except Exception as e:
                 raise IllegalActionError(str(e)) from e
         # Submitting may have locked another carrier (a handoff Take locks its
-        # waiting partner) or a WAIT-serve may have woken carriers. Keep only
-        # carriers that still need a decision at this instant.
+        # waiting partner). Keep only carriers that still need a decision at this
+        # instant.
         ctx.pending_idle = [
             c for c in ctx.pending_idle
             if facility.needs_decision(c)

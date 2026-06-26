@@ -2,7 +2,7 @@
 
   * the action-index ↔ type alignment invariant (the one silent footgun),
   * the carrier→carrier handoff transfer (receiver-initiated, atomic),
-  * the WAIT-triggered store/retrieve serve at a room,
+  * the arrival-triggered store/retrieve serve at a room (no WAIT needed),
   * the no-immediate-inverse masking guard.
 """
 
@@ -168,20 +168,21 @@ def test_handoff_auto_transfers_when_loaded_carrier_arrives_last():
 
 
 # ---------------------------------------------------------------------------
-# 3. WAIT-triggered serve at a room
+# 3. Arrival-triggered serve at a room (no WAIT needed)
 # ---------------------------------------------------------------------------
 
 
-def test_wait_serves_store_into_held_empty():
+def test_arrival_serves_store_into_held_empty():
     engine = _engine("tiny_medipol")
     room = next(iter(engine.topology.rooms))
     carrier = engine.topology.rooms[room].served_by
     cs = engine.state.carriers[carrier]
     cs.load = Pallet(id=7, contents="empty")
-    cs.docked_at = DockRef("room", room)
-    engine.queue.add(Store(arrived_at=0.0, size="small"))
+    cs.docked_at = DockRef("room", room)   # carrier idle at the room, empty
 
-    engine.wait(carrier)   # the serve fires here, not on arrival
+    # A car is queued while the carrier sits there → loaded immediately, no WAIT
+    # (enqueue_store scans rooms for a ready serve).
+    engine.enqueue_store("small")
 
     assert cs.load is not None and cs.load.contents == "small"
     assert not any(isinstance(t, Store) for t in engine.queue.pending)
@@ -191,36 +192,42 @@ def test_wait_serves_store_into_held_empty():
 def test_camped_retrieve_is_not_an_agent_delivery():
     """A carrier camping at a room with a stored car until it is asked for must
     NOT earn a DELIVER (the parked-car exploit). A Retrieve issued while the
-    target is already at a room is tagged not-agent-delivered."""
+    target is already at a room is tagged not-agent-delivered, and is served
+    immediately on injection."""
     engine = _engine("tiny_medipol")
     room = next(iter(engine.topology.rooms))
     car = engine.topology.rooms[room].served_by
     cs = engine.state.carriers[car]
     cs.docked_at = DockRef("room", room)
     cs.load = Pallet(id=55, contents="big")   # a stored car camped at the room
-    # Issue the retrieve now — the target is already at the room → camped.
-    engine.queue.add(Retrieve(
-        arrived_at=0.0, pallet=55, initial_depth=0,
-        already_staged=engine._target_already_staged(55),
-    ))
-    assert engine._find_pending_retrieve(55).already_staged is True
-    engine.wait(car)   # serves the retrieve
+
+    # Requesting the car while it already sits at the room serves it at once,
+    # tagged not-agent-delivered (camped) → no DELIVER.
+    assert engine.toggle_retrieve_for_pallet(55) is True
     comps = [c for c in engine._pending_completions if isinstance(c.task, Retrieve)]
     assert comps and comps[0].agent_delivered is False
+    assert cs.load is not None and cs.load.is_empty   # car handed to the customer
     # A target NOT sitting at a room (e.g. on a shelf) is a real delivery.
     assert engine._target_already_staged(999) is False
 
 
-def test_wait_serves_retrieve_from_held_target():
+def test_arrival_serves_retrieve_from_held_target():
     engine = _engine("tiny_medipol")
     room = next(iter(engine.topology.rooms))
     carrier = engine.topology.rooms[room].served_by
     cs = engine.state.carriers[carrier]
+    # Car requested while still in transit (not yet at the room) → a real,
+    # agent-credited delivery once the carrier arrives.
     cs.load = Pallet(id=99, contents="big")
-    cs.docked_at = DockRef("room", room)
-    engine.queue.add(Retrieve(arrived_at=0.0, pallet=99, initial_depth=1))
+    cs.docked_at = None
+    engine.queue.add(Retrieve(
+        arrived_at=0.0, pallet=99, initial_depth=1,
+        already_staged=engine._target_already_staged(99),   # False: not at a room
+    ))
 
-    engine.wait(carrier)
+    # Carrier arrives at the room → arrival-triggered serve fires.
+    cs.docked_at = DockRef("room", room)
+    assert engine._serve_ready_rooms(engine._pending_completions)
 
     # The target is consumed; an empty pallet is left on the carrier.
     assert cs.load is not None and cs.load.is_empty and cs.load.id == 99
