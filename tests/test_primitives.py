@@ -252,13 +252,6 @@ def test_no_immediate_reverse_goto():
     shelf_b = sorted(topo.accessible_shelves[carrier])[1]
     cs = engine.state.carriers[carrier]
 
-    # Put a pallet on each of this carrier's shelves so an empty carrier's GOTO is
-    # actually useful (a take is possible). The shelf-useful guard otherwise masks
-    # GOTOs to empty shelves an empty carrier can't take from; here we isolate the
-    # reverse-GOTO behaviour, not the shelf-useful guard.
-    for i, sid in enumerate(topo.accessible_shelves[carrier]):
-        engine.state.shelves[sid].stack = [Pallet(id=200 + i, contents="small")]
-
     def goto_targets():
         return {
             e.target
@@ -291,16 +284,11 @@ def test_no_immediate_reverse_goto():
 
 
 def test_wait_is_legal_anywhere_for_every_carrier():
-    """WAIT is legal anywhere — at a shelf, at a room, at a handoff pose, or
-    undocked. The loiter mask is gone; the all-wait stall is handled by the env's
-    penalty + re-query rescue. (The staging guards are the only WAIT modifiers:
-    an idle UNSTAGED room carrier is driven to stage when an empty is reachable,
-    and an idle STAGED one is held put. We clear the shelves so no empty is
-    fetchable — neither guard applies — and verify the base WAIT-anywhere rule.)"""
+    """WAIT is now unconditionally legal: any carrier may rest anywhere — at a
+    shelf, at a room, at a handoff pose, or undocked. The loiter mask is gone;
+    the all-wait stall is handled by the env's penalty + re-query rescue."""
     engine = _engine("tiny_medipol")
     topo = engine.topology
-    for ss in engine.state.shelves.values():
-        ss.stack = []
 
     def has_wait(c):
         return any(

@@ -218,8 +218,6 @@ class Session:
         )
         self.env.engine.clear_queue()
         self.env.wake_waiting_carriers()
-        if hasattr(self.agent.policy, "reset_escape"):
-            self.agent.policy.reset_escape()        # fresh cycle-escape memory per layout
         self._note(f"re-roll layout · fullness={fullness:.2f} · seed={seed}")
         return int(seed)
 
@@ -254,9 +252,6 @@ class Session:
                 checkpoint_path=entry.path, topology=self.env.topology,
                 device="cpu", deterministic=deterministic,
             )
-            # Give the policy the live env so its cycle-escape can escalate to MCTS
-            # look-ahead on the hardest stalls (pure-RL, the net's own search).
-            policy.env = self.env
             self.agent.policy = policy
             self.policy_info = PolicyInfo(
                 label=entry.display_name, deterministic=deterministic,

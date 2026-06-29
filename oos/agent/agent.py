@@ -6,7 +6,7 @@ Two interfaces:
   * `agent.step() -> AgentStep`       — convenience: act + apply + record.
 
 A `PolicyFn` is just `(obs, info) -> action_idx`. Used policies (random,
-LearnedPolicy, MCTSPolicy) all satisfy this protocol.
+LearnedPolicy) all satisfy this protocol.
 """
 
 from __future__ import annotations
@@ -109,10 +109,8 @@ class Agent:
         deterministic: bool = False,
         device: str = "cpu",
         seed: int = 0,
-        mcts_n_sims: int = 0,
     ) -> "Agent":
-        """Build an Agent backed by a `LearnedPolicy` (or `MCTSPolicy` if
-        `mcts_n_sims > 0`) loaded from disk."""
+        """Build an Agent backed by a `LearnedPolicy` loaded from disk."""
         from oos.learn.policy import LearnedPolicy
         policy: PolicyFn = LearnedPolicy(
             checkpoint_path=checkpoint_path,
@@ -120,11 +118,6 @@ class Agent:
             device=device,
             deterministic=deterministic,
         )
-        if mcts_n_sims > 0:
-            from oos.learn.policy import MCTSPolicy
-            policy = MCTSPolicy(
-                learned=policy, env=facility, n_sims=mcts_n_sims,
-            )
         return cls(facility=facility, policy=policy, seed=seed)
 
     # ─────────────────────────────────────────────────────────────────────
