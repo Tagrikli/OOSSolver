@@ -72,6 +72,7 @@ from oos.env.reward_system import (
     PotentialTerm,
     RequestedEventTerm,
     RewardSystem,
+    ServeTerm,
     StagingEventTerm,
 )
 from oos.env import targeting
@@ -104,11 +105,14 @@ class RetrieveEnv(Environment):
         request_car_amounts: Optional[tuple] = None,
         depths: Optional[tuple] = None,
         omni: bool = False,
+        stream: bool = False,
+        reward_serve: float = 0.0,
         require_noroom_empty: bool = False,
         require_all_waiting: bool = False,
         reward_gamma: float = 1.0,
         shape_room_carrier_holds: float = 0.0,
         shape_noroom_carrier_holds: float = 0.0,
+        shape_target_depth: float = 0.0,
         shape_room_carrier_empty_handed: float = 0.0,
         shape_room_carrier_empty_holds: float = 0.0,
         shape_room_carrier_empty_at_room: float = 0.0,
@@ -163,6 +167,14 @@ class RetrieveEnv(Environment):
         #     (or dropping the target) is penalized.
         self._shape_room_carrier_holds = float(shape_room_carrier_holds)
         self._shape_noroom_carrier_holds = float(shape_noroom_carrier_holds)
+        # Dense DIG breadcrumb: Φ += −w · Σ_requested pallet_depth(target). Each
+        # blocker TAKE-n off the top drops the target's burial depth by 1, so the
+        # dig (otherwise unshaped — TAKE/carry/GIVE/return is ~5 actions before the
+        # holds rung pays) earns +w per blocker removed. Held/delivered targets have
+        # depth 0 (pallet_depth returns 0 off-shelf), so it hands smoothly to the
+        # holds rung. Kept small: it only MILDLY disfavours the put-back (which lifts
+        # depth +1 transiently), so it doesn't fight the buffer-on-target maneuver.
+        self._shape_target_depth = float(shape_target_depth)
         # --- PARK task: bring an empty pallet to a room (stage it) ---
         # `park_prob` of episodes are PARK (no retrieve seeded; success = a room
         # carrier docked at its room holding an empty). The park potentials mirror
@@ -285,6 +297,14 @@ class RetrieveEnv(Environment):
         #     delivered. (Retrieve no longer ends on delivery; it continues until
         #     the other rooms are staged too.)
         self._omni = bool(omni)
+        # STREAM mode: continuous deployment training. auto-arrivals ON (Poisson
+        # stores + dwell retrieves), NO clean-rest termination (truncate at
+        # max_steps), reward = serve/deliver fast + keep rooms staged + idle when
+        # staged (StagingEventTerm) + tiny move cost. Teaches the policy to MAINTAIN
+        # staging and settle to idle across the stream — the episodic clean-rest
+        # policy reaches that state once but doesn't hold it under streaming churn.
+        self._stream = bool(stream)
+        self._reward_serve = float(reward_serve)
         # Per-episode task ("retrieve" | "park"), set in setup_episode: "retrieve"
         # iff ≥1 request is seeded this episode, else "park". A non-None
         # `_forced_task_type` overrides the sampling (used by the eval to run a
@@ -367,6 +387,7 @@ class RetrieveEnv(Environment):
         # outside a real action (e.g. the viz's pure-advance path), so events are
         # scored only on a genuine (s, a, s').
         self._stage_before: Optional[dict[str, bool]] = None
+        self._stage_use: Optional[dict[str, bool]] = None
         self._req_before: Optional[dict[str, bool]] = None
         self._room_acting: Optional[str] = None
         self._room_acting_wait: bool = False
@@ -379,9 +400,12 @@ class RetrieveEnv(Environment):
         terms: list = []
         if reward_deliver != 0.0:
             terms.append(DeliveryTerm(reward_deliver, scale_by_depth=False))
+        if self._reward_serve != 0.0:
+            terms.append(ServeTerm(self._reward_serve))
         any_shaping = (
             self._shape_room_carrier_holds != 0.0
             or self._shape_noroom_carrier_holds != 0.0
+            or self._shape_target_depth != 0.0
             or self._shape_room_carrier_empty_handed != 0.0
             or self._shape_room_carrier_empty_holds != 0.0
             or self._shape_room_carrier_empty_at_room != 0.0
@@ -438,7 +462,9 @@ class RetrieveEnv(Environment):
 
     def setup_episode(self, facility, seed):
         self._rng = np.random.default_rng(seed)
-        facility.set_auto_arrivals(False)   # no store stream — tasks are seeded
+        # Stream mode keeps the Poisson store stream + dwell retrieves ON; episodic
+        # modes seed their own tasks and keep arrivals OFF.
+        facility.set_auto_arrivals(self._stream)
         if not self._route_by_shelf:
             self._route_by_shelf = targeting.route_class_map(facility.topology)
             self._direct_shelves = [
@@ -453,13 +479,23 @@ class RetrieveEnv(Environment):
         self._room_last_content = {}
         self._room_was_at = {}
         self._stage_before = None
+        self._stage_use = None
         self._req_before = None
         # Per-episode fullness: fixed, or a fresh U[0,1] draw when fullness < 0.
         self._cur_fullness = (
             float(self._rng.random()) if self._fullness < 0 else self._fullness
         )
 
-        if self._forced_layout is not None:
+        if self._stream:
+            # Continuous deployment start: a random-fullness layout, carriers empty
+            # and undocked, rooms UNSTAGED, with at least one empty per room so the
+            # policy can stage. No tasks seeded — the Poisson stream + dwell provide
+            # them over time. The policy must proactively stage, serve, dig, settle.
+            shuffle_state(facility, self._cur_fullness, self._rng,
+                          require_solvable=self._require_solvable)
+            self._ensure_enough_empties(facility)
+            self._task_type = "park"
+        elif self._forced_layout is not None:
             # Battery / curriculum: an exact, difficulty-controlled layout. The
             # builder fills the shelves, sets `_task_type`, and seeds its
             # Retrieve(s) via `_seed_retrieve`.
@@ -892,6 +928,14 @@ class RetrieveEnv(Environment):
                     cid: self._carrier_staged(state.carriers[cid])
                     for cid in self._room_carriers
                 }
+                # Whether each room carrier is NEEDED for the current task — used so
+                # the stage-leave penalty fires only when a carrier with NO role
+                # un-stages a room (the user's rule), letting an involved carrier
+                # still un-stage to dig / buffer / deliver.
+                self._stage_use = {
+                    cid: self._carrier_has_use_to_leave(cid)
+                    for cid in self._room_carriers
+                }
             if self._any_req_event:
                 requested = self._requested_pallets()
                 self._req_before = {
@@ -930,6 +974,12 @@ class RetrieveEnv(Environment):
 
         all_delivered = self._all_targets_delivered()
         was_success = self._success
+        if self._stream:
+            # Continuous: never terminate on clean-rest (the stream goes on);
+            # truncation at max_steps ends the rollout episode. Reward is the
+            # serve/deliver/stage/idle suite + the rollout's latency penalty.
+            self._populate_info(info)
+            return obs, float(reward), terminated, truncated, info
         if self._omni:
             # ONE unified condition: all rooms staged AND ALL requests delivered —
             # plus, when enabled, every non-room carrier emptied out
@@ -1058,7 +1108,20 @@ class RetrieveEnv(Environment):
         # target IS delivery progress; they don't conflict (a carrier holds one
         # thing), and delivering feeds staging.
         if self._omni:
-            return self._phi_retrieve_ladder(facility) + self._phi_staging_ladder(facility)
+            # Gate the staging ladder OFF while a requested target is still
+            # undelivered. Otherwise the staging reward (a room carrier holding /
+            # staging an EMPTY) competes with the dig: a dug empty blocker gets
+            # mis-rewarded as "staging" and a staged room resists being disturbed to
+            # dig, so the dig never gets learned (measured: omni stalls at depth-1,
+            # retrieve-only masters it). With the gate, the policy focuses on the
+            # dig first, then stages once nothing is pending — which is also the
+            # correct responsiveness order (serve the waiting retrieve, then
+            # re-stage). The one-time Φ jump when the last target is delivered is a
+            # bonus for finishing the dig.
+            phi = self._phi_retrieve_ladder(facility)
+            if not self._undelivered_retrieve(facility):
+                phi += self._phi_staging_ladder(facility)
+            return phi
         # Non-omni: task-gated — a park episode uses ONLY the staging ladder, a
         # retrieve episode ONLY the target ladder (so a dug empty cover during a
         # retrieve never triggers the staging potential, and vice versa).
@@ -1066,13 +1129,29 @@ class RetrieveEnv(Environment):
             return self._phi_staging_ladder(facility)
         return self._phi_retrieve_ladder(facility)
 
+    def _undelivered_retrieve(self, facility) -> bool:
+        """True iff some requested target is still pending (not yet delivered)."""
+        return any(isinstance(t, Retrieve) for t in facility.queue.pending)
+
     def _phi_retrieve_ladder(self, facility) -> float:
         phi = 0.0
         if self._shape_room_carrier_holds:
             phi += self._shape_room_carrier_holds * self._phi_room_carrier_holds(facility)
         if self._shape_noroom_carrier_holds:
             phi += self._shape_noroom_carrier_holds * self._phi_noroom_carrier_holds(facility)
+        if self._shape_target_depth:
+            phi -= self._shape_target_depth * self._phi_target_depth(facility)
         return phi
+
+    def _phi_target_depth(self, facility) -> float:
+        """Σ over still-requested targets of their burial depth on a shelf (0 once
+        held/delivered). Lower is better — each blocker removed cuts this by 1."""
+        requested = {
+            t.pallet for t in facility.queue.pending if isinstance(t, Retrieve)
+        }
+        if not requested:
+            return 0.0
+        return float(sum(pallet_depth(facility.state, pid) for pid in requested))
 
     def _phi_staging_ladder(self, facility) -> float:
         phi = 0.0
@@ -1167,6 +1246,33 @@ class RetrieveEnv(Environment):
             t.pallet for t in self.engine.queue.pending if isinstance(t, Retrieve)
         }
 
+    def _carrier_has_use_to_leave(self, carrier_id) -> bool:
+        """True iff this room carrier has a ROLE in the current retrieve(s) and so
+        may legitimately un-stage its room: it can dig a requested target on a shelf
+        it reaches, OR — being a room-serving lift — a requested target sits on a
+        handoff-route shelf or is already held by a (non-room) shuttle, so this lift
+        may receive the handoff and deliver. When this is False the carrier has no
+        use for the task, and un-staging its room just makes a room unresponsive for
+        nothing — that is the only case the stage-leave penalty charges."""
+        requested = self._requested_pallets()
+        if not requested:
+            return False
+        state, topo = self.engine.state, self.engine.topology
+        for sid in topo.accessible_shelves[carrier_id]:
+            if any(p.id in requested for p in state.shelves[sid].stack):
+                return True
+        # Any room lift may deliver a handoff-route target → it has a role.
+        handoff_target = any(
+            self._route_by_shelf.get(sid) == "handoff"
+            and any(p.id in requested for p in ss.stack)
+            for sid, ss in state.shelves.items()
+        )
+        held_by_noroom = any(
+            cs.load is not None and cs.load.id in requested
+            for cid, cs in state.carriers.items() if cid not in self._room_carriers
+        )
+        return handoff_target or held_by_noroom
+
     def _carrier_req_pose(self, cs, requested: set[int]) -> bool:
         """True iff this carrier is docked at a room holding a REQUESTED pallet —
         the per-carrier 'requested item brought to the room' (delivery) pose."""
@@ -1195,16 +1301,20 @@ class RetrieveEnv(Environment):
         # --- STAGING: arrive (not→staged), wait (staged ∧ WAIT), leave (staged→not) ---
         n_arrived = n_left = n_wait = 0
         if self._stage_before is not None:
+            use = self._stage_use or {}
             for cid in self._room_carriers:
                 was = self._stage_before.get(cid, False)
                 now = self._carrier_staged(state.carriers[cid])
                 if now and not was:
                     n_arrived += 1
-                elif was and not now:
+                elif was and not now and not use.get(cid, False):
+                    # Only an un-stage by a carrier with NO role in the task is a
+                    # penalty; an involved carrier may leave to dig / buffer / deliver.
                     n_left += 1
                 if now and cid == acting and acted_wait:
                     n_wait += 1
             self._stage_before = None
+            self._stage_use = None
         # --- REQUESTED: arrive (not→pose), wait (pose ∧ WAIT serves), leave (pose ∧
         # the carrier left the room — NOT the serving WAIT, which keeps it at room) ---
         n_req_arr = n_req_wait = n_req_left = 0
@@ -1258,8 +1368,17 @@ class RetrieveEnv(Environment):
         )
 
     def _all_carriers_waiting(self, facility) -> bool:
-        """True iff EVERY carrier is currently WAITing (`cs.waiting` — has chosen to
-        idle, none executing a command). The extra omni terminal condition behind
-        `require_all_waiting`: the episode completes only once the whole facility has
-        settled to rest, never while a carrier is still mid-maneuver."""
-        return all(cs.waiting for cs in facility.state.carriers.values())
+        """True iff the whole facility has settled to rest: every carrier is either
+        WAITing (chose to idle) OR physically at rest with no action available — a
+        non-busy carrier the action guards leave with only WAIT (e.g. an
+        uninvolved staged room carrier that is masked to stay put) is at rest even
+        though it was never explicitly queried to set `cs.waiting`. A carrier mid-
+        command, or one that still has a real action it could take, is not at rest."""
+        for cid, cs in facility.state.carriers.items():
+            if cs.is_busy:
+                return False
+            if cs.waiting:
+                continue
+            if self._has_non_wait_action(facility, cid):
+                return False
+        return True

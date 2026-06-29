@@ -70,20 +70,33 @@ class Geometry:
 
 def build_geometry(
     topo: Topology,
-    width: int = 1200,
-    height: int = 720,
-    margin: int = 40,
-    label_w: int = 46,
+    host_w: float,
+    host_h: float,
+    zoom: float = 1.0,
+    margin: int = 30,
+    label_w: int = 44,
 ) -> Geometry:
-    """Lay the facility out in `width`×`height` px. One lane per carrier."""
+    """Lay the facility out for a `host_w`×`host_h` viewport at `zoom`.
+
+    At zoom=1 the whole track span fits the host width. zoom>1 scales the system
+    HORIZONTALLY — the returned `width` (the drawlist size) then exceeds host_w,
+    and the host's horizontal scrollbar pans it. Lanes always fit the host
+    height. One lane per carrier; a single shared world→px mapping.
+    """
     carriers = sorted(topo.carriers.values(), key=lambda c: c.id)
     n = max(1, len(carriers))
 
     gmin = min(c.min_pos for c in carriers)
     gmax = max(c.max_pos for c in carriers)
-    avail_w = max(1, width - 2 * margin - label_w)
-    px_per_mm = avail_w / max(1, gmax - gmin)
+    span = max(1, gmax - gmin)
+    base_fit = max(1e-4, (host_w - 2 * margin - label_w) / span)
+    px_per_mm = base_fit * max(0.05, zoom)
     left = margin + label_w
+
+    track_w = span * px_per_mm
+    content_w = int(left + track_w + margin)
+    width = max(int(host_w), content_w)
+    height = max(1, int(host_h))
 
     geo = Geometry(width=width, height=height, gmin=gmin,
                    px_per_mm=px_per_mm, left=left)

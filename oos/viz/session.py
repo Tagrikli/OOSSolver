@@ -148,7 +148,7 @@ class Session:
         if self.env.needs_decision():
             self._submit_one_at_current_time()
         obs, reward, info = self.env.advance_until(sim_time=None)
-        self._record_advance(reward, info)
+        self._record_advance(obs, reward, info)
 
     def reset(self) -> None:
         """Re-roll the episode from the session seed and clear playback state."""
@@ -218,6 +218,8 @@ class Session:
         )
         self.env.engine.clear_queue()
         self.env.wake_waiting_carriers()
+        if hasattr(self.agent.policy, "reset_escape"):
+            self.agent.policy.reset_escape()        # fresh cycle-escape memory per layout
         self._note(f"re-roll layout · fullness={fullness:.2f} · seed={seed}")
         return int(seed)
 
@@ -252,6 +254,9 @@ class Session:
                 checkpoint_path=entry.path, topology=self.env.topology,
                 device="cpu", deterministic=deterministic,
             )
+            # Give the policy the live env so its cycle-escape can escalate to MCTS
+            # look-ahead on the hardest stalls (pure-RL, the net's own search).
+            policy.env = self.env
             self.agent.policy = policy
             self.policy_info = PolicyInfo(
                 label=entry.display_name, deterministic=deterministic,
@@ -279,7 +284,7 @@ class Session:
                 self._submit_one_at_current_time()
                 continue
             obs, reward, info = env.advance_until(sim_time=anim_time)
-            self._record_advance(reward, info)
+            self._record_advance(obs, reward, info)
             if self.agent.done or not env.needs_decision():
                 return
 
@@ -308,9 +313,14 @@ class Session:
         agent.last_step = _Step(querying, action_idx, label, reward, info)
         self._emit(info)
 
-    def _record_advance(self, reward: float, info: dict) -> None:
+    def _record_advance(self, obs: dict, reward: float, info: dict) -> None:
         agent = self.agent
-        agent.obs = agent.obs  # obs already current; keep info fresh
+        # CRITICAL: advancing time moves the sim to a NEW decision instant with a
+        # new querying carrier and a new observation. The agent's cached obs MUST be
+        # refreshed to this new obs — otherwise the next policy query runs on a STALE
+        # observation (wrong carrier/state) while info/action_entries are fresh,
+        # making a correct brain pick near-random actions.
+        agent.obs = obs
         agent.info = info
         agent.total_reward += reward
         agent.total_completions += len(info.get("completions", []))
