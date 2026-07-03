@@ -18,6 +18,12 @@ class FacilityValidationError(ValueError):
     pass
 
 
+#: Hard upper bound on a shelf's slot count. Deeper stacks are physically
+#: possible but make every buried car unreachable in practice; the DSL
+#: refuses them so a typo'd capacity fails at build time.
+SHELF_MAX_CAPACITY = 5
+
+
 def validate(fac: "Facility") -> None:
     if not fac._carriers:
         raise FacilityValidationError("facility has no carriers")
@@ -46,8 +52,6 @@ def validate(fac: "Facility") -> None:
         raise FacilityValidationError("facility has no rooms")
 
     # --- shelves -----------------------------------------------------------
-
-    from oos.env.observation import SHELF_MAX_CAPACITY
 
     seen_shelf_names: set[str] = set()
     for c in fac._carriers:

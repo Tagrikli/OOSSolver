@@ -1,4 +1,4 @@
-"""Smoke tests: DSL builds, env resets, random rollout runs to truncation.
+"""Smoke tests: DSL builds, env resets, random-legal-action rollouts run.
 
 Run against the `tiny` facility — the smallest layout the DSL produces.
 The exact carrier/shelf counts below assert against tiny's authored shape.
@@ -8,11 +8,19 @@ from __future__ import annotations
 
 import numpy as np
 
-from oos.config.schema import EpisodeConfig, ExperimentConfig, TaskStreamConfig
+from oos.config.schema import ExperimentConfig, TaskStreamConfig
 from oos.env import Environment
 from oos.facilities import get_facility
 
 make_facility = get_facility("tiny")
+
+_CFG = ExperimentConfig(
+    task_stream=TaskStreamConfig(
+        store_rate=0.10,
+        mean_dwell_seconds=60.0,
+        std_dwell_seconds=30.0,
+    ),
+)
 
 
 def test_dsl_builds_tiny_facility():
@@ -25,74 +33,72 @@ def test_dsl_builds_tiny_facility():
     assert sum(seed.empties_on_shelf.values()) >= 1
 
 
+def _random_rollout(env: Environment, seed: int, *, time_cap: float = 200.0,
+                    on_submit=None) -> tuple[int, int]:
+    """Drive the decision loop with uniform-random legal actions until
+    `time_cap` sim-seconds (or a stall: nothing scheduled, nobody deciding).
+    Returns (decisions submitted, tasks completed)."""
+    env.reset(seed=seed)
+    rng = np.random.default_rng(seed)
+    submitted = completions = 0
+    stalled = 0
+    while env.sim_time < time_cap and stalled < 32 and submitted < 5000:
+        if env.needs_decision():
+            n_legal = len(env._ctx.decoder.entries)
+            assert n_legal >= 1                     # at least WAIT
+            env.submit_action(int(rng.integers(n_legal)))
+            submitted += 1
+            if on_submit is not None:
+                on_submit(env)
+            stalled = 0
+            continue
+        t0 = env.sim_time
+        info = env.advance_until(sim_time=None)
+        completions += len(info["completions"])
+        if not env.needs_decision() and env.sim_time == t0:
+            stalled += 1                            # event-less standstill
+    return submitted, completions
+
+
 def test_env_reset_and_random_rollout():
-    cfg = ExperimentConfig(
-        task_stream=TaskStreamConfig(
-            store_rate=0.10,
-            mean_dwell_seconds=60.0,
-            std_dwell_seconds=30.0,
-        ),
-        episode=EpisodeConfig(max_sim_time=200.0, max_steps=500),
-    )
-    env = Environment(facility_factory=make_facility, experiment_config=cfg)
-    obs, info = env.reset(seed=42)
-
+    env = Environment(facility_factory=make_facility, experiment_config=_CFG)
+    info = env.reset(seed=42)
+    assert info["action_entries"]                   # a first decision exists
     # tiny: 2 carriers, 4 shelves, 1 room.
-    assert obs["carrier_features"].shape[0] == 2
-    assert obs["shelf_features"].shape[0] == 4
-    assert obs["room_features"].shape[0] == 1
-    assert obs["action_mask"].sum() >= 1  # at least WAIT
+    assert len(env.state.carriers) == 2
+    assert len(env.state.shelves) == 4
+    assert len(env.topology.rooms) == 1
 
-    rng = np.random.default_rng(0)
-    steps = 0
-    terminated = truncated = False
-    while not (terminated or truncated):
-        legal = np.flatnonzero(obs["action_mask"])
-        a = int(rng.choice(legal))
-        obs, r, terminated, truncated, info = env.step(a)
-        assert np.isfinite(r)
-        steps += 1
-    assert steps > 0
-    assert info["sim_time"] >= 0.0
+    submitted, _ = _random_rollout(env, seed=42)
+    assert submitted > 0
+    assert env.sim_time >= 0.0
 
 
 def test_pallet_count_conserved():
     """Pallet count must never change — pallets are physical, conserved objects."""
-    cfg = ExperimentConfig(
-        task_stream=TaskStreamConfig(
-            store_rate=0.20,
-            mean_dwell_seconds=40.0,
-            std_dwell_seconds=20.0,
-        ),
-        episode=EpisodeConfig(max_sim_time=400.0, max_steps=2000),
-    )
-    env = Environment(facility_factory=make_facility, experiment_config=cfg)
-    obs, _ = env.reset(seed=7)
-    fac = env._ctx.facility
+    env = Environment(facility_factory=make_facility, experiment_config=_CFG)
 
-    def count_pallets() -> int:
+    def count_pallets(e: Environment) -> int:
         n = 0
-        for ss in fac.state.shelves.values():
+        for ss in e.state.shelves.values():
             n += len(ss.stack)
-        for cs in fac.state.carriers.values():
+        for cs in e.state.carriers.values():
             # A pallet being delivered to / staged at a room physically sits on
-            # the carrier now (rooms are no longer storage slots).
+            # the carrier (rooms are not storage slots).
             if cs.load is not None:
                 n += 1
         return n
 
-    initial = count_pallets()
-    rng = np.random.default_rng(7)
-    for _ in range(2000):
-        mask = obs["action_mask"]
-        legal = np.flatnonzero(mask)
-        a = int(rng.choice(legal))
-        obs, _, term, trunc, _ = env.step(a)
-        assert count_pallets() == initial, (
-            f"pallet count drifted: started at {initial}, now {count_pallets()}"
+    env.reset(seed=7)
+    initial = count_pallets(env)
+
+    def check(e: Environment) -> None:
+        assert count_pallets(e) == initial, (
+            f"pallet count drifted: started at {initial}, now {count_pallets(e)}"
         )
-        if term or trunc:
-            break
+
+    submitted, _ = _random_rollout(env, seed=7, time_cap=400.0, on_submit=check)
+    assert submitted > 0
 
 
 def test_big_stores_dropped_when_big_capacity_exhausted():
@@ -150,28 +156,10 @@ def test_big_stores_dropped_when_big_capacity_exhausted():
 
 
 def test_determinism_across_seeds():
-    cfg = ExperimentConfig(
-        task_stream=TaskStreamConfig(
-            store_rate=0.10,
-            mean_dwell_seconds=60.0,
-            std_dwell_seconds=30.0,
-        ),
-        episode=EpisodeConfig(max_sim_time=100.0, max_steps=200),
-    )
-
-    def run(seed: int) -> tuple[float, float]:
-        env = Environment(facility_factory=make_facility, experiment_config=cfg)
-        obs, _ = env.reset(seed=seed)
-        rng = np.random.default_rng(seed)
-        total = 0.0
-        for _ in range(200):
-            legal = np.flatnonzero(obs["action_mask"])
-            a = int(rng.choice(legal))
-            obs, r, term, trunc, info = env.step(a)
-            total += r
-            if term or trunc:
-                break
-        return total, info["sim_time"]
+    def run(seed: int) -> tuple[int, int, float]:
+        env = Environment(facility_factory=make_facility, experiment_config=_CFG)
+        submitted, completions = _random_rollout(env, seed=seed, time_cap=100.0)
+        return submitted, completions, env.sim_time
 
     a1 = run(123)
     a2 = run(123)

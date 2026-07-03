@@ -1,20 +1,17 @@
 # OOSKiller
 
-A discrete-event **simulator** and supporting tooling for an **OOS automated car
-park** — a facility where carriers (lifts and shuttles) move pallet-borne cars
-between LIFO shelves and customer rooms. The system and its dynamics are specified
-in [`docs/PROBLEM.md`](docs/PROBLEM.md).
+A discrete-event **simulator** and a **deterministic plan solver** for an **OOS
+automated car park** — a facility where carriers (lifts and shuttles) move
+pallet-borne cars between LIFO shelves and customer rooms. The system and its
+dynamics are specified in [`docs/PROBLEM.md`](docs/PROBLEM.md).
 
-This repository provides the simulator, an environment / observation / reward
-framework, an interactive visualizer, and neutral building blocks for
-learning-based control.
-
-**Control is solved by the V3 deterministic plan solver** (no RL in the
-control path): `oos/plan/planner.py` + `oos/plan/solver.py` +
-`oos/plan/runtime.py`, specified by [`docs/SOLUTION_V3.md`](docs/SOLUTION_V3.md)
-with the behavior contract in [`docs/AGENT_BEHAVIOR.md`](docs/AGENT_BEHAVIOR.md).
-Its acceptance battery runs with `python -m oos.plan.battery --gate all`;
-in the visualizer, pick **"(classical solver)"** in the policy dropdown.
+**Control is solved by the V3 plan solver** (no learning anywhere in the
+system): `oos/plan/planner.py` + `oos/plan/solver.py` + `oos/plan/runtime.py`,
+specified by [`docs/SOLUTION_V3.md`](docs/SOLUTION_V3.md) with the behavior
+contract in [`docs/AGENT_BEHAVIOR.md`](docs/AGENT_BEHAVIOR.md). Its acceptance
+battery runs with `python -m oos.plan.battery --gate all`. An earlier RL
+training pipeline was removed once the solver passed the full battery; it
+survives in git history and in the docs under `docs/`.
 
 ## The system
 
@@ -28,43 +25,30 @@ load/unload, and concurrency — is in [`docs/PROBLEM.md`](docs/PROBLEM.md).
 
 ## Code structure
 
-The runtime is layered into single-responsibility parts. A driver (the visualizer,
-or any training loop you write) owns an **Agent**, which pairs an injected policy
-with an **Environment**. The Environment runs episode control and the per-carrier
-decision loop, delegating the world to a **SimEngine** and scoring to an injected
-**RewardSystem**.
-
 | Part | Module | Responsibility |
 |------|--------|----------------|
-| **SimEngine** | `oos/sim/facility.py` | The discrete-event world: topology, state, scheduler, task queue, dynamics, `advance_until`. No RL, no torch. |
-| **Environment** | `oos/env/env.py` | Episode control, typed-graph observation + action encoding/masking, the per-carrier decision loop, and an injected RewardSystem. `reset`/`step` for training; `advance_until` / `submit_action` / `needs_decision` / `from_name` for embedding and the viz. |
-| **RewardSystem** | `oos/env/reward_system.py` | A pluggable suite of reward terms, each a pure function of `(s, a, s')`, injected into an Environment. |
-| **Agent** | `oos/agent/agent.py` | One class with the policy injected; drives an Environment step by step. UI-free and embeddable. |
-
-A separation contract is enforced: **`oos.sim` and `oos.env` never import from
-`oos.learn`** — torch is isolated to `oos.learn`.
+| **SimEngine** | `oos/sim/facility.py` | The discrete-event world: topology, state, scheduler, task queue, dynamics, `advance_until`. |
+| **Plan solver** | `oos/plan/` | The control brain: `oracle.py` (solvability/admission oracle), `planner.py` (retrieval planning), `solver.py` (plan + rung dispatch), `runtime.py` (headless pump loop), `battery.py` (acceptance battery). |
+| **Move layer** | `oos/env/moves.py` | Pallet-move primitives (`Move`, `MoveExecutor`): compiles a move into carrier scripts and executes them against the live engine. |
+| **Environment** | `oos/env/env.py` | The per-carrier decision loop over one SimEngine: action enumeration/decoding (`oos/env/action.py`), `advance_until` / `submit_action` / `needs_decision`. Used by the viz to drive the sim frame by frame. |
+| **Viz** | `oos/viz/` | Interactive DearPyGui visualizer: `Session` (headless logic) + `SolverBridge` (solver ↔ decision loop) + `app` (rendering glue). |
 
 ## Repository layout
 
 ```
 oos/
-├── sim/         discrete-event SimEngine (state, scheduler, queue, dynamics, motion) — no RL, no torch
-├── env/         Environment + typed-graph observation, action enumeration/masking, pluggable reward suite
-├── agent/       embeddable, UI-free Agent runtime (policy + Environment, step by step)
-├── learn/       learning building blocks (torch): a graph policy/value network, a PPO update, rollout
-│                collection, batching, checkpoint/normalize, and a checkpoint-loading policy adapter
-├── viz/         interactive DearPyGui visualizer / driver
+├── sim/         discrete-event SimEngine (state, scheduler, queue, dynamics, motion)
+├── plan/        the deterministic V3 plan solver: oracle, planner, solver, runtime, battery
+├── env/         decision-loop Environment + action enumeration + the pallet-move executor
+├── viz/         interactive DearPyGui visualizer / driver (solver-driven)
 ├── facilities/  hand-authored facility registry (name -> factory)
 ├── dsl/         facility-definition builder DSL (authors + validates topologies)
-└── config/      experiment-config dataclasses (durations, task stream, episode budgets)
+└── config/      experiment-config dataclasses (durations, task stream)
 
-tests/           pytest suite (47 tests): smoke, kinematics, network, reward-system, reward-potential,
-                 primitives, shuffle, viz
-docs/            PROBLEM.md — the system-and-dynamics specification
+tests/           pytest suite: smoke, kinematics, primitives, shuffle, plan solver, viz
+docs/            PROBLEM.md — the system spec; SOLUTION_V3.md — the solver spec;
+                 AGENT_BEHAVIOR.md — the behavior contract; earlier docs are history
 ```
-
-The `oos/learn/` modules are provided as a starting point only; the model design,
-the reward, and the training procedure are **not** prescribed here.
 
 ## Getting started
 
@@ -77,21 +61,29 @@ uv sync
 ### Tests
 
 ```bash
-SDL_VIDEODRIVER=dummy uv run python -m pytest tests/ -q
+uv run python -m pytest tests/ -q
+```
+
+### Acceptance battery
+
+The solver's full acceptance battery (retrieval gates, continuous operation,
+full-state conformance):
+
+```bash
+uv run python -m oos.plan.battery --gate all
 ```
 
 ### Visualizer
 
 ```bash
-python -m oos.viz [facility] [--runs DIR]
+uv run python -m oos.viz [facility]
 ```
 
 Opens a DearPyGui app: a canvas renders the live facility (carrier tracks, shelves,
 room docks, the customer queue) beside a sidebar to play / pause / step, randomize
-state, queue customer interactions by hand, click pallets to request a car, and
-load a policy checkpoint discovered under `--runs` (default `runs/`). With no
-positional facility it reopens the last-used one (or `tiny_medipol`). torch is
-imported lazily, so it runs with just the random policy when torch is absent.
+state, tune a set-point auto-world, queue customer interactions by hand, and click
+pallets to request a car. The V3 plan solver drives the carriers. With no
+positional facility it reopens the last-used one (or `tiny_medipol`).
 
 ## Facilities
 

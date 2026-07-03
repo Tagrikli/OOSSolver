@@ -1,10 +1,8 @@
-"""Persisted viz settings — facility, brain, speed, world knobs, zoom — in
-`runs/.viz_state.json`, so re-launching restores what you were last looking at.
+"""Persisted viz settings — facility, speed, world knobs, zoom — in
+`.viz_state.json`, so re-launching restores what you were last looking at.
 
-The brain is identified by *path*, so an overwritten checkpoint (e.g. a training
-run rewriting ckpt_latest.pt) is picked up fresh. All failures are silent:
-missing / malformed file, a facility or checkpoint that no longer exists, or a
-read-only fs → fall back to defaults.
+All failures are silent: missing / malformed file, a facility that no longer
+exists, or a read-only fs → fall back to defaults.
 """
 
 from __future__ import annotations
@@ -19,8 +17,6 @@ _FILE = ".viz_state.json"
 @dataclass
 class ViewState:
     facility: str = "tiny_medipol"
-    policy_path: str = ""          # absolute path to a .pt, or "" for random
-    deterministic: bool = False
     speed: float = 1.0
     auto_arrivals: bool = False
     target_fullness: float = 0.5     # set-point the world converges to
@@ -32,8 +28,8 @@ class ViewState:
     zoom: float = 1.0
 
 
-def _path(runs_dir: str) -> str:
-    return os.path.join(runs_dir, _FILE)
+def _path(state_dir: str) -> str:
+    return os.path.join(state_dir, _FILE)
 
 
 def _clamp(v, default: float, lo: float, hi: float) -> float:
@@ -43,9 +39,9 @@ def _clamp(v, default: float, lo: float, hi: float) -> float:
         return default
 
 
-def load_view_state(runs_dir: str = "runs") -> ViewState:
+def load_view_state(state_dir: str = ".") -> ViewState:
     try:
-        with open(_path(runs_dir)) as f:
+        with open(_path(state_dir)) as f:
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return ViewState()
@@ -56,11 +52,6 @@ def load_view_state(runs_dir: str = "runs") -> ViewState:
     fac = data.get("facility") or data.get("facility_name")  # tolerate the old key
     if isinstance(fac, str):
         st.facility = fac
-    pp = data.get("policy_path")
-    if isinstance(pp, str) and pp:
-        ap = os.path.abspath(pp)
-        st.policy_path = ap if os.path.isfile(ap) else ""
-    st.deterministic = bool(data.get("deterministic", False))
     st.auto_arrivals = bool(data.get("auto_arrivals", False))
     st.speed = _clamp(data.get("speed"), 1.0, 0.0, 64.0)
     # Set-point world knobs. Older files (open-loop rate/visit keys) don't
@@ -79,10 +70,10 @@ def load_view_state(runs_dir: str = "runs") -> ViewState:
     return st
 
 
-def save_view_state(runs_dir: str, st: ViewState) -> None:
+def save_view_state(st: ViewState, state_dir: str = ".") -> None:
     try:
-        os.makedirs(runs_dir, exist_ok=True)
-        with open(_path(runs_dir), "w") as f:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(_path(state_dir), "w") as f:
             json.dump(asdict(st), f, indent=2)
     except OSError:
         pass

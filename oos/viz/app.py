@@ -8,7 +8,7 @@ via `carrier_position_at`, so what you see is exactly what the sim computed.
 Layout: a scrollable canvas on the left (resizes with the window; mouse-wheel
 scales the system horizontally) and a fixed control panel on the right.
 
-Run:  python -m oos.viz [facility] [--runs DIR]
+Run:  python -m oos.viz [facility]
 """
 
 from __future__ import annotations
@@ -72,9 +72,9 @@ _FONT_PATHS = (
 def _ui_glyphs() -> set[int]:
     """Every non-ASCII codepoint the UI can emit: scan the sources whose
     strings end up on buttons or in the event log (self-maintaining)."""
-    import oos.env.moves, oos.plan.planner, oos.plan.solver, oos.viz.move_bridge, oos.viz.session
+    import oos.env.moves, oos.plan.planner, oos.plan.solver, oos.viz.session, oos.viz.solver_bridge
     chars: set[int] = set()
-    for mod in (None, oos.viz.session, oos.viz.move_bridge,
+    for mod in (None, oos.viz.session, oos.viz.solver_bridge,
                 oos.plan.solver, oos.plan.planner, oos.env.moves):
         path = __file__ if mod is None else (mod.__file__ or "")
         try:
@@ -103,20 +103,18 @@ def _bind_ui_font() -> None:
         pass                        # any hiccup → default font, still usable
 
 
-def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
-    vs = load_view_state(runs_dir)
+def run_app(facility: str | None = None) -> None:
+    vs = load_view_state()
     facility = facility or vs.facility
     if facility not in FACILITIES:
         facility = "tiny_medipol"
-    session = Session(facility, runs_dir=runs_dir)
+    session = Session(facility)
     session.set_speed(vs.speed)
     ui: dict = {
         "geom": None,
         "geom_key": None,
         "zoom": vs.zoom,
         "pallet_rects": [],     # (x0, y0, x1, y1, pallet_id) from last redraw
-        "ckpt": {},             # display_name -> CheckpointEntry
-        "policy_path": vs.policy_path,
     }
 
     dpg.create_context()
@@ -126,11 +124,9 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8, 1)
 
     def _save():
-        """Persist the current picks to runs/.viz_state.json."""
-        save_view_state(runs_dir, ViewState(
+        """Persist the current picks to .viz_state.json."""
+        save_view_state(ViewState(
             facility=session.facility_name,
-            policy_path=ui["policy_path"],
-            deterministic=dpg.get_value("deterministic"),
             speed=session.speed,
             auto_arrivals=session.auto_arrivals,
             target_fullness=dpg.get_value("target_full"),
@@ -147,24 +143,8 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
         if not name or name == session.facility_name:
             return                    # ignore a spurious / no-op startup callback
         session.swap_facility(name)
-        ui["policy_path"] = ""       # swap drops to random (brain was topo-sized)
         ui["geom_key"] = None        # force a geometry rebuild for the new topo
-        _refresh_policy_combo()
         _sync_play_label()
-        _save()
-
-    def on_policy(_s, display, _u):
-        entry = ui["ckpt"].get(display)
-        if entry is not None:
-            session.load_policy(entry, dpg.get_value("deterministic"))
-            ui["policy_path"] = entry.path
-            _sync_deterministic(entry)
-            _save()
-
-    def on_deterministic(_s, _val, _u):
-        entry = ui["ckpt"].get(dpg.get_value("policy_combo"))
-        if entry is not None:
-            session.load_policy(entry, dpg.get_value("deterministic"))
         _save()
 
     def on_play(*_):
@@ -230,30 +210,6 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
     def _sync_play_label():
         dpg.set_item_label("playbtn", "‖ Pause" if session.playing else "▶ Play")
 
-    def _sync_deterministic(entry) -> None:
-        # The classical solver IS deterministic; the argmax toggle is an
-        # RL-checkpoint concept — grey it out when it has no meaning.
-        is_classical = entry is not None and entry.path == session.CLASSICAL_PATH
-        dpg.configure_item("deterministic", enabled=not is_classical)
-
-    def _refresh_policy_combo():
-        ui["ckpt"] = {e.display_name: e for e in session.checkpoints()}
-        names = list(ui["ckpt"].keys())
-        # Restore the saved brain if its checkpoint still exists.
-        sel = names[0]
-        for e in ui["ckpt"].values():
-            if e.path and e.path == ui["policy_path"]:
-                sel = e.display_name
-                break
-        dpg.configure_item("policy_combo", items=names, default_value=sel)
-        entry = ui["ckpt"].get(sel)
-        if entry is not None and entry.path:
-            session.load_policy(entry, dpg.get_value("deterministic"))
-            ui["policy_path"] = entry.path
-        else:
-            ui["policy_path"] = ""
-        _sync_deterministic(entry)
-
     # ---- window: scrollable canvas (left) + fixed panel (right) --------
     with dpg.window(tag="root"):
         with dpg.group(horizontal=True):
@@ -285,10 +241,6 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
                 dpg.add_text("FACILITY", color=HEAD)
                 dpg.add_combo(sorted(FACILITIES), default_value=facility,
                               callback=on_facility, width=-1, tag="facility_combo")
-                dpg.add_text("BRAIN", color=HEAD)
-                dpg.add_combo([], callback=on_policy, width=-1, tag="policy_combo")
-                dpg.add_checkbox(label="deterministic (argmax)", default_value=vs.deterministic,
-                                 callback=on_deterministic, tag="deterministic")
 
                 dpg.add_separator()
                 dpg.add_text("PLAYBACK", color=HEAD)
@@ -362,7 +314,6 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
         dpg.add_key_press_handler(dpg.mvKey_S, callback=on_step)
         dpg.add_key_press_handler(dpg.mvKey_R, callback=on_reset)
 
-    _refresh_policy_combo()
     _sync_play_label()
     if vs.random_room:
         session.set_random_room(True)

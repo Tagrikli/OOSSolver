@@ -47,7 +47,7 @@ DAY_START = 5 * H          # sim t=0 corresponds to 05:00 on day 0
 
 
 # ---------------------------------------------------------------------------
-# Day-cycle exogenous world (torch-free twins of oos/learn/day_cycle_eval.py)
+# Day-cycle exogenous world
 # ---------------------------------------------------------------------------
 
 

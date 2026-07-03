@@ -1,9 +1,8 @@
 """Tests for the GOTO/TAKE/GIVE/WAIT primitive action model:
 
-  * the action-index ↔ type alignment invariant (the one silent footgun),
+  * the canonical enumeration order (GOTO..., TAKE, GIVE, WAIT last),
   * the carrier→carrier handoff transfer (receiver-initiated, atomic),
-  * the arrival-triggered store/retrieve serve at a room (no WAIT needed),
-  * the no-immediate-inverse masking guard.
+  * the arrival-triggered store/retrieve serve at a room (no WAIT needed).
 """
 
 from __future__ import annotations
@@ -42,47 +41,33 @@ def _run_to_idle(engine: SimEngine, carrier: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. The load-bearing invariant: enumerate order == collated type-per-slot
+# 1. Canonical enumeration order
 # ---------------------------------------------------------------------------
 
 
-def test_action_index_type_alignment():
-    import torch  # noqa: F401 — guard: skip silently if torch absent
-    from oos.learn.batching import GraphCollator, sample_from_env_step
-
+def test_action_enumeration_order():
+    """Canonical order: all GOTO, then optional TAKE, then optional GIVE, then
+    WAIT (always present, always last)."""
     for name in ("tiny_medipol", "stacker_deep", "campus"):
         env = Environment.from_name(name)
-        obs, info = env.reset(seed=0)
-        coll = GraphCollator(env.topology)
+        env.reset(seed=0)
         rng = np.random.default_rng(0)
         for _ in range(30):
-            entries = info["action_entries"]
-            # Canonical order: all GOTO, then optional TAKE, then optional GIVE,
-            # then optional WAIT (last). WAIT may be masked for a room carrier
-            # docked at a shelf, so it is at most one and, when present, last.
+            entries = list(env._ctx.decoder.entries)
             types = [e.type for e in entries]
-            n_wait = types.count(ActionType.WAIT)
-            assert n_wait <= 1
-            if n_wait == 1:
-                assert types[-1] == ActionType.WAIT
-            # GOTO entries are a contiguous prefix; TAKE/GIVE (if present) come
-            # after, before WAIT.
+            assert types.count(ActionType.WAIT) == 1
+            assert types[-1] == ActionType.WAIT
+            # GOTO entries are a contiguous prefix; TAKE/GIVE (if present)
+            # come after, before WAIT.
             seen_non_goto = False
             for t in types:
                 if t == ActionType.GOTO:
                     assert not seen_non_goto, "GOTO after a non-GOTO entry"
                 else:
                     seen_non_goto = True
-            s = sample_from_env_step(obs, info, entries)
-            batch = coll.collate([s], n_max=env.n_actions)
-            tps = batch.type_per_slot[0].tolist()
-            for i, e in enumerate(entries):
-                assert int(e.type) == tps[i], (
-                    f"{name}: slot {i} decodes {e.type} but collated {tps[i]}"
-                )
-            legal = np.flatnonzero(obs["action_mask"])
-            obs, _r, term, trunc, info = env.step(int(rng.choice(legal)))
-            if term or trunc:
+            env.submit_action(int(rng.integers(len(entries))))
+            env.advance_until(sim_time=None)
+            if not env.needs_decision():
                 break
 
 
@@ -237,56 +222,13 @@ def test_arrival_serves_retrieve_from_held_target():
 
 
 # ---------------------------------------------------------------------------
-# 4. No-immediate-inverse masking guard
+# 4. WAIT legality
 # ---------------------------------------------------------------------------
 
 
-def test_no_immediate_reverse_goto():
-    """After GOTOing to a shelf/handoff, going straight back to where it came
-    from (no TAKE/GIVE in between) is masked — except returning to a room."""
-    engine = _engine("tiny_medipol")
-    carrier = "L1"
-    topo = engine.topology
-    room = next(iter(topo.accessible_rooms[carrier]))
-    shelf_a = sorted(topo.accessible_shelves[carrier])[0]
-    shelf_b = sorted(topo.accessible_shelves[carrier])[1]
-    cs = engine.state.carriers[carrier]
-
-    def goto_targets():
-        return {
-            e.target
-            for e in enumerate_actions(carrier, engine.state, topo, engine.queue)
-            if e.type == ActionType.GOTO
-        }
-
-    # --- shelf reverse is masked ---
-    engine.submit(Goto(carrier_id=carrier, target=DockRef("shelf", shelf_a)))
-    _run_to_idle(engine, carrier)
-    engine.submit(Goto(carrier_id=carrier, target=DockRef("shelf", shelf_b)))
-    _run_to_idle(engine, carrier)
-    assert DockRef("shelf", shelf_a) not in goto_targets()   # reverse masked
-    assert any(t.kind == "shelf" for t in goto_targets())    # others reachable
-
-    # A TAKE at shelf_b lifts the guard → reverse to shelf_a allowed again.
-    engine.state.shelves[shelf_b].stack = [Pallet(id=7, contents="small")]
-    engine.submit(Take(carrier_id=carrier))
-    _run_to_idle(engine, carrier)
-    assert DockRef("shelf", shelf_a) in goto_targets()
-
-    # --- reverse to a ROOM is always allowed ---
-    cs.load = Pallet(id=8, contents="empty")     # so GOTO(room) passes its own gate
-    cs.docked_at = DockRef("room", room)
-    cs.came_from = None
-    cs.last_take_give = None
-    engine.submit(Goto(carrier_id=carrier, target=DockRef("shelf", shelf_a)))
-    _run_to_idle(engine, carrier)                # came_from is now the room
-    assert DockRef("room", room) in goto_targets()
-
-
 def test_wait_is_legal_anywhere_for_every_carrier():
-    """WAIT is now unconditionally legal: any carrier may rest anywhere — at a
-    shelf, at a room, at a handoff pose, or undocked. The loiter mask is gone;
-    the all-wait stall is handled by the env's penalty + re-query rescue."""
+    """WAIT is unconditionally legal: any carrier may rest anywhere — at a
+    shelf, at a room, at a handoff pose, or undocked."""
     engine = _engine("tiny_medipol")
     topo = engine.topology
 
@@ -311,26 +253,3 @@ def test_wait_is_legal_anywhere_for_every_carrier():
         cs.docked_at = None
         assert has_wait(carrier)
 
-
-def test_no_immediate_give_back_after_take():
-    engine = _engine("stacker_deep")
-    carrier = "L1"
-    shelf = sorted(engine.topology.accessible_shelves[carrier])[0]
-    # A single item on an otherwise-empty shelf (so capacity is never the
-    # reason GIVE is unavailable).
-    engine.state.shelves[shelf].stack = [Pallet(id=1, contents="small")]
-
-    engine.submit(Goto(carrier_id=carrier, target=DockRef("shelf", shelf)))
-    _run_to_idle(engine, carrier)
-    engine.submit(Take(carrier_id=carrier))
-    _run_to_idle(engine, carrier)
-    # Just took from `shelf` and still docked there → GIVE back is masked.
-    entries = enumerate_actions(carrier, engine.state, engine.topology, engine.queue)
-    assert not any(e.type == ActionType.GIVE for e in entries), (
-        "GIVE-back onto the just-taken shelf must be masked"
-    )
-    # A GIVE would otherwise be physically legal (shelf has room) — prove the
-    # guard is what suppressed it: clearing it re-enables GIVE.
-    engine.state.carriers[carrier].last_take_give = None
-    entries2 = enumerate_actions(carrier, engine.state, engine.topology, engine.queue)
-    assert any(e.type == ActionType.GIVE for e in entries2)

@@ -1,13 +1,11 @@
 [project]
 name = "ooskiller"
 version = "0.1.0"
-description = "RL planner for a Parkolay automated storage/retrieval system"
+description = "Deterministic plan solver for a Parkolay automated storage/retrieval system"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.4.6",
-    "torch>=2.5.0",
-    "tensorboard>=2.18.0",
     "dearpygui>=2.3.1",
 ]
 

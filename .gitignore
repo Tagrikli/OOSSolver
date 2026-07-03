@@ -9,8 +9,8 @@ wheels/
 # Virtual environments
 .venv
 
-# Training artifacts
-runs/
+# Local viz settings
+.viz_state.json
 
 # Claude Code local runtime state
 .claude/

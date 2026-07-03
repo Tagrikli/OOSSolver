@@ -1,14 +1,14 @@
 """Session — headless logic core for the viz.
 
-Owns an `Agent` + `Environment` and exposes exactly two interaction surfaces,
-mirroring the two exogenous inputs to the real system:
+Owns an `Environment` + `SolverBridge` (the V3 plan solver is the only
+brain) and exposes exactly two interaction surfaces, mirroring the two
+exogenous inputs to the real system:
 
   * **World** (you play the customer/operator): `enqueue_store`,
-    `request_retrieve`, `set_auto_arrivals` / `set_store_rate`, `reroll_layout`,
-    `swap_facility`. These mutate the *world* (the task queue + the physical
-    layout) — never a carrier.
-  * **Playback** (you watch the brain): `play`/`pause`/`step_once`/`set_speed`,
-    plus `load_policy` to pick which brain drives the carriers.
+    `request_retrieve`, `set_auto_arrivals`, `configure_setpoint`,
+    `reroll_layout`, `swap_facility`. These mutate the *world* (the task
+    queue + the physical layout) — never a carrier.
+  * **Playback** (you watch the solver): `play`/`pause`/`step_once`/`set_speed`.
 
 `tick(dt_wall)` advances a playback clock and drives the sim up to it, so
 carriers animate smoothly between decision instants (the canvas reads
@@ -25,59 +25,37 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from oos.agent import Agent, random_policy
 from oos.env import Environment
 from oos.env.action import ActionType
-from oos.learn.policy import CheckpointEntry, discover_checkpoints
 from oos.sim.actions import short_action_label
 from oos.sim.shuffle import shuffle_state
 from oos.sim.tasks import Retrieve, Store
-
-
-@dataclass
-class PolicyInfo:
-    """What's currently driving the carriers (for the status readout)."""
-    label: str = "(random policy)"
-    deterministic: bool = False
-    iteration: int = -1
+from oos.viz.solver_bridge import SolverBridge
 
 
 class Session:
-    """Headless owner of the live facility + agent. The DearPyGui app is glue
+    """Headless owner of the live facility + solver. The DearPyGui app is glue
     on top; everything stateful and sim-touching lives here."""
 
     MAX_ITERS_PER_FRAME = 1000  # livelock guard on instant-time decision chains
     #                             (sized for 64x playback: a dense decision
     #                             burst must fit in one UI frame)
 
-    @staticmethod
-    def _viz_config():
-        """Episode caps are an RL-training concept; a live session runs
-        continuously (the 3600 s / 2000-step defaults made the viz 'suddenly
-        stop solving' mid-watch)."""
-        from oos.config.schema import EpisodeConfig, ExperimentConfig
-        return ExperimentConfig(episode=EpisodeConfig(
-            max_sim_time=float("inf"), max_steps=10**9))
-
     def __init__(
         self,
         facility_name: str = "tiny_medipol",
-        runs_dir: str = "runs",
         seed: int = 0,
     ) -> None:
         self.facility_name = facility_name
-        self.runs_dir = runs_dir
         self._seed = seed
 
-        self.env = Environment.from_name(
-            facility_name, experiment_config=self._viz_config())
-        self.agent = Agent(facility=self.env, policy=random_policy, seed=seed)
-        self.policy_info = PolicyInfo()
+        self.env = Environment.from_name(facility_name)
+        self.bridge = SolverBridge(self.env)
 
-        # Playback state. `play_time` is the sim-time the canvas renders at; it
-        # is advanced by wall-clock * speed each tick, then the sim is driven up
-        # to it. Manual mode (no auto-arrivals) by default — a fresh session is
-        # an empty world the user pokes.
+        # Playback state. The sim-time the canvas renders at is advanced by
+        # wall-clock * speed each tick, then the sim is driven up to it.
+        # Manual mode (no auto-arrivals) by default — a fresh session is an
+        # empty world the user pokes.
         self.playing = False
         self.speed = 1.0
         self.auto_arrivals = False
@@ -109,10 +87,6 @@ class Session:
     def querying_carrier(self) -> str:
         return self.env.querying_carrier
 
-    @property
-    def done(self) -> bool:
-        return self.agent.done
-
     def pending_retrieve_ids(self) -> set[int]:
         """Pallet ids with a Retrieve currently pending — for highlighting."""
         return {t.pallet for t in self.queue.pending if isinstance(t, Retrieve)}
@@ -121,12 +95,11 @@ class Session:
         return sum(1 for t in self.queue.pending if isinstance(t, Store))
 
     def status_line(self) -> str:
-        a = self.agent
-        last = a.last_step.action_label if a.last_step else "—"
+        last = self.last_step.action_label if self.last_step else "—"
         return (
             f"t={self.sim_time:7.2f}s  query={self.querying_carrier}  "
-            f"last={last}  Σr={a.total_reward:+.1f}  "
-            f"done={a.total_completions}  pending={len(self.queue.pending)}"
+            f"last={last}  done={self.total_completions}  "
+            f"pending={len(self.queue.pending)}"
         )
 
     # ────────────────────────────────────────────────────────────────────
@@ -148,27 +121,28 @@ class Session:
     def tick(self, dt_wall: float) -> None:
         """Advance the playback clock by `dt_wall * speed` (wall seconds) and
         drive the sim up to it. Call once per rendered frame while playing."""
-        if not self.playing or self.agent.done:
+        if not self.playing:
             return
         self._drive_to(self.sim_time + dt_wall * self.speed)
         self._setpoint_tick()
         self._solver_heartbeat()
 
     def _solver_heartbeat(self) -> None:
-        """Liveness nudge for plan-solver policies: the solver retries
-        blocked work on TICKS, and ticks happen only when a carrier is
-        queried — which needs an event. In manual mode a transiently
-        blocked store/stage can leave the world event-less, so the viz
-        looks frozen with work pending. Re-open the waiting carriers twice
-        a second so the solver gets its retry."""
-        solver = getattr(self.agent.policy, "solver", None)
-        if solver is None:
-            return
+        """Liveness nudge for the plan solver: the solver retries blocked
+        work on TICKS, and ticks happen only when a carrier is queried —
+        which needs an event. In manual mode a transiently blocked
+        store/stage can leave the world event-less, so the viz looks frozen
+        with work pending. Re-open the waiting carriers twice a second so
+        the solver gets its retry."""
         now = _time.perf_counter()
         if now - getattr(self, "_hb_t", 0.0) < 0.5:
             return
         self._hb_t = now
         try:
+            self.bridge._rebind()
+            solver = self.bridge.solver
+            if solver is None:
+                return
             # Release finished roles FIRST: a claim whose move completed
             # but was never query-synced hides its carrier from
             # work_pending — gating the sync on work_pending would be
@@ -199,20 +173,20 @@ class Session:
         """Single-step: submit one decision, then run until the next one (no
         time bound). Pauses playback so the user can inspect."""
         self.playing = False
-        if self.agent.done:
-            return
         if self.env.needs_decision():
             self._submit_one_at_current_time()
-        obs, reward, info = self.env.advance_until(sim_time=None)
-        self._record_advance(obs, reward, info)
+        info = self.env.advance_until(sim_time=None)
+        self._record_advance(info)
 
     def reset(self) -> None:
-        """Re-roll the episode from the session seed and clear playback state."""
-        self.agent.reset(seed=self._seed)
+        """Re-roll the world from the session seed and clear playback state."""
+        self.env.reset(seed=self._seed)
         self.env.set_auto_arrivals(self.auto_arrivals)
         self.playing = False
         self.log.clear()
         self.dropped_suvs = 0
+        self.total_completions = 0
+        self.last_step = None
         self._ret_sizes = {}           # pallet id -> "small"|"big" (cached)
         self._ret_stats = {"small": [], "big": [], "?": []}
         self._note(f"reset · facility={self.facility_name}")
@@ -234,24 +208,22 @@ class Session:
 
     def ensure_started(self) -> None:
         """Guarantee the env is reset before the canvas reads it. A render frame
-        must never hit an un-reset engine (some GUI startup orderings can leave it
-        so); call this at the top of the render loop as a cheap safety net. Re-points
-        the agent at the live env first, so a reset can't land on a stale instance."""
+        must never hit an un-reset engine (some GUI startup orderings can leave
+        it so); call this at the top of the render loop as a cheap safety net."""
         if self.engine_ready:
             return
-        self.agent.facility = self.env
         self.reset()
 
     def _zero_refresh(self) -> None:
-        """Zero-time advance to rebuild obs/info against the CURRENT state.
-        Must run after any world edit that fires instant serves or rebuilds
-        the decision context (enqueue/toggle/reroll): the agent's cached
-        `action_entries` otherwise go stale, and an action index computed
-        against the stale list is decoded against the fresh one — the
-        mismatch clamps to WAIT and, in manual mode (empty scheduler), the
-        session can freeze with work pending."""
-        obs, reward, info = self.env.advance_until(sim_time=self.env.sim_time)
-        self._record_advance(obs, reward, info)
+        """Zero-time advance to rebuild the decision context against the
+        CURRENT state. Must run after any world edit that fires instant
+        serves or rebuilds the decision context (enqueue/toggle/reroll):
+        the cached `action_entries` otherwise go stale, and an action index
+        computed against the stale list is decoded against the fresh one —
+        the mismatch clamps to WAIT and, in manual mode (empty scheduler),
+        the session can freeze with work pending."""
+        info = self.env.advance_until(sim_time=self.env.sim_time)
+        self._record_advance(info)
 
     # ────────────────────────────────────────────────────────────────────
     # World surface (you = customer/operator; never touch a carrier)
@@ -263,18 +235,14 @@ class Session:
 
     def big_admission_ok(self):
         """Live SUV-admission verdict for the UI: True/False from the
-        driving policy's deployment gate ("would accepting one more SUV
-        keep every stored car retrievable?"), or None when no gate applies
-        (e.g. the random policy). Throttled; UI-safe."""
-        gate = getattr(self.agent.policy, "admission_ok_for", None)
-        if gate is None:
-            return None
+        solver's deployment gate ("would accepting one more SUV keep every
+        stored car retrievable?"). Throttled; UI-safe."""
         now = _time.perf_counter()
         if now - getattr(self, "_adm_t", -1.0) < self._ADMISSION_TTL_S:
             return getattr(self, "_adm_ok", None)
         self._adm_t = now
         try:
-            self._adm_ok = bool(gate("big"))
+            self._adm_ok = bool(self.bridge.admission_ok_for("big"))
         except Exception:   # noqa: BLE001 — indicator must never break the UI
             self._adm_ok = None
         return self._adm_ok
@@ -283,7 +251,7 @@ class Session:
         """Cars deliberately WAITING ON LIFTS because no free empty exists
         to re-stage with (operator full-state rule, AGENT_BEHAVIOR §5.1).
         Shown by the UI so the rest-at-full state doesn't read as a bug."""
-        solver = getattr(self.agent.policy, "solver", None)
+        solver = self.bridge.solver
         if solver is None:
             return 0
         try:
@@ -296,19 +264,17 @@ class Session:
             return 0
 
     def enqueue_store(self, size: str = "small") -> None:
-        """A car arrives wanting to be parked. When a move-level brain is
-        driving, the deployment admission gate applies (AGENT_BEHAVIOR §10):
-        a store that would strand the headroom some car needs is REFUSED —
-        the customer leaves — exactly as in the real system."""
-        gate = getattr(self.agent.policy, "admission_ok_for", None)
-        if gate is not None:
-            try:
-                if not gate(size):
-                    self._note(f"✗ STORE {size} REFUSED (admission: no "
-                               f"solvable placement)")
-                    return
-            except Exception:   # noqa: BLE001 — gate failure must not block UI
-                pass
+        """A car arrives wanting to be parked. The solver's deployment
+        admission gate applies (AGENT_BEHAVIOR §10): a store that would
+        strand the headroom some car needs is REFUSED — the customer
+        leaves — exactly as in the real system."""
+        try:
+            if not self.bridge.admission_ok_for(size):
+                self._note(f"✗ STORE {size} REFUSED (admission: no "
+                           f"solvable placement)")
+                return
+        except Exception:   # noqa: BLE001 — gate failure must not block UI
+            pass
         self.env.engine.enqueue_store(size)   # type: ignore[arg-type]
         self.env.wake_waiting_carriers()
         self._zero_refresh()
@@ -348,71 +314,6 @@ class Session:
         self.env.engine.serve_order_rng = (
             np.random.default_rng(secrets.randbits(63))
             if getattr(self, "random_room", False) else None)
-
-    def set_store_rate(self, rate: float, big_prob: float = 0.3,
-                       mean_dwell: float = 60.0, std_dwell: float = 20.0) -> None:
-        """Back-compat wrapper: live retune (no reset)."""
-        self.configure_world(rate=rate, big_prob=big_prob,
-                             mean_dwell=mean_dwell)
-
-    def configure_world(self, rate: float | None = None,
-                        big_prob: float | None = None,
-                        mean_dwell: float | None = None,
-                        std_dwell: float | None = None) -> None:
-        """Retune the auto-world LIVE — no reset, the facility keeps
-        running. `rate` = store arrivals/sec; `big_prob` = SUV share;
-        `mean_dwell` = seconds until a parked car is requested back
-        (<= 0 disables auto retrieves)."""
-        from oos.sim.tasks import PoissonTaskStream
-        eng = self.env.engine
-        st = eng.task_stream
-        if rate is not None or big_prob is not None:
-            self._world_rate = float(rate if rate is not None
-                                     else getattr(self, "_world_rate", 0.05))
-            self._world_big = float(big_prob if big_prob is not None
-                                    else getattr(self, "_world_big", 0.3))
-            mix = {"small": 1.0 - self._world_big, "big": self._world_big}
-            if not isinstance(st, PoissonTaskStream):
-                st = PoissonTaskStream(
-                    rng=np.random.default_rng(secrets.randbits(63)),
-                    store_rate=self._world_rate, size_mix=mix)
-                eng.task_stream = st
-            st.store_rate = self._world_rate
-            st.size_mix = mix
-            # Re-anchor the next arrival at NOW (a naive restart would
-            # replay a backlog of past-timestamped arrivals as one burst).
-            st._started = True
-            st._next_store = (
-                eng.state.time
-                + float(st.rng.exponential(1.0 / self._world_rate))
-                if self._world_rate > 0 else float("inf"))
-            eng._schedule_next_arrival()
-            self._note(f"world: rate={self._world_rate:.3f}/s "
-                       f"SUV={self._world_big:.0%}")
-        if mean_dwell is not None or std_dwell is not None:
-            if mean_dwell is not None:
-                self._world_dwell = float(mean_dwell)
-            if std_dwell is not None:
-                self._world_dwell_std = float(std_dwell)
-            rng = getattr(self, "_dwell_rng", None)
-            if rng is None:
-                rng = self._dwell_rng = np.random.default_rng(
-                    secrets.randbits(63))
-
-            def dwell(_pid, _size, _rng=rng):
-                m = self._world_dwell
-                if m <= 0:
-                    return float("inf")
-                std = max(1.0, float(getattr(self, "_world_dwell_std",
-                                             m / 3.0)))
-                shape = (m / std) ** 2
-                return float(_rng.gamma(shape=shape, scale=std**2 / m))
-
-            eng.dwell_sampler = dwell
-            self._note(
-                "world: auto-requests OFF" if self._world_dwell <= 0 else
-                f"world: visit={self._world_dwell / 60.0:.0f}"
-                f"±{getattr(self, '_world_dwell_std', 0) / 60.0:.0f} min")
 
     # ---- set-point auto-world -----------------------------------------
     # Fullness is the dial, traffic is derived: a correction flow marches
@@ -589,95 +490,16 @@ class Session:
         return int(seed)
 
     def swap_facility(self, name: str) -> None:
-        """Rebuild the world on a different facility. Drops to the random policy
-        (the loaded brain was sized for the old topology)."""
-        self.env = Environment.from_name(
-            name, experiment_config=self._viz_config())
-        self.agent = Agent(facility=self.env, policy=random_policy, seed=self._seed)
+        """Rebuild the world on a different facility. The solver rebinds to
+        the new engine on its next query."""
+        self.env = Environment.from_name(name)
+        self.bridge = SolverBridge(self.env)
         self.facility_name = name
-        self.policy_info = PolicyInfo()
         self.reset()
         self._note(f"facility → {name}")
 
     # ────────────────────────────────────────────────────────────────────
-    # Brain selection
-    # ────────────────────────────────────────────────────────────────────
-
-    CLASSICAL_PATH = "::classical"   # sentinel path for the rule-based solver
-
-    def checkpoints(self) -> list[CheckpointEntry]:
-        out = discover_checkpoints(self.runs_dir)
-        out.insert(1, CheckpointEntry("(classical solver)", self.CLASSICAL_PATH))
-        return out
-
-    def load_policy(self, entry: CheckpointEntry, deterministic: bool = False) -> bool:
-        """Swap the brain driving the carriers. `entry.path == ""` → random.
-        Returns True on success (a failed load leaves the old policy in place).
-
-        Move-level checkpoints (the SOLUTION_V2 stack, runs/move/*.pt — blob
-        keys `state_dict` + `net_cfg`) load as a MovePolicyBridge: the move
-        policy dispatches pallet moves and the bridge answers the primitive
-        queries from its executor scripts. The RL-only action guards are
-        dropped while a bridge drives (scripts are physically legal by
-        construction and must never be masked)."""
-        if entry.path == "":
-            self.agent.policy = random_policy
-            self.env._policy_guards = True   # type: ignore[attr-defined]
-            self.policy_info = PolicyInfo(label="(random policy)")
-            self._note("policy → random")
-            return True
-        if entry.path == self.CLASSICAL_PATH:
-            try:
-                from oos.viz.move_bridge import ClassicalPolicyBridge
-                bridge = ClassicalPolicyBridge(self.env)
-                self.agent.policy = bridge
-                self.env._policy_guards = False  # type: ignore[attr-defined]
-                self.env.refresh_decision_context()
-                self.policy_info = PolicyInfo(
-                    label="(classical solver)", deterministic=True)
-                self._note("policy → classical solver [V3 plan solver, no RL]")
-                return True
-            except Exception as e:   # noqa: BLE001
-                self._note(f"LOAD FAILED: {type(e).__name__}: {e}"[:80])
-                return False
-        try:
-            import torch
-            blob = torch.load(entry.path, map_location="cpu",
-                              weights_only=False)
-            if isinstance(blob, dict) and "net_cfg" in blob and "state_dict" in blob:
-                from oos.viz.move_bridge import MovePolicyBridge
-                bridge = MovePolicyBridge(self.env, entry.path, device="cpu")
-                self.agent.policy = bridge
-                self.env._policy_guards = False  # type: ignore[attr-defined]
-                self.env.refresh_decision_context()
-                self.policy_info = PolicyInfo(
-                    label=f"{entry.display_name} [move]",
-                    deterministic=True, iteration=bridge.iteration,
-                )
-                self._note(
-                    f"policy → {entry.display_name} [move-level, iter "
-                    f"{bridge.iteration}, greedy]")
-                return True
-            from oos.learn.policy import LearnedPolicy
-            policy = LearnedPolicy(
-                checkpoint_path=entry.path, topology=self.env.topology,
-                device="cpu", deterministic=deterministic,
-            )
-            self.agent.policy = policy
-            self.env._policy_guards = True   # type: ignore[attr-defined]
-            self.policy_info = PolicyInfo(
-                label=entry.display_name, deterministic=deterministic,
-                iteration=policy.iteration,
-            )
-            mode = "argmax" if deterministic else "sample"
-            self._note(f"policy → {entry.display_name} [iter {policy.iteration}, {mode}]")
-            return True
-        except Exception as e:   # noqa: BLE001 — surface any load failure to the UI
-            self._note(f"LOAD FAILED: {type(e).__name__}: {e}"[:80])
-            return False
-
-    # ────────────────────────────────────────────────────────────────────
-    # Driver internals (port of the old SimDriver — pure Agent+Env, no UI)
+    # Driver internals (pure Session+Env, no UI)
     # ────────────────────────────────────────────────────────────────────
 
     def _drive_to(self, anim_time: float) -> None:
@@ -685,25 +507,21 @@ class Session:
         before it first, so animation time flows smoothly between instants."""
         env = self.env
         for _ in range(self.MAX_ITERS_PER_FRAME):
-            if self.agent.done:
-                return
             if env.needs_decision() and env.sim_time <= anim_time:
                 self._submit_one_at_current_time()
                 continue
-            obs, reward, info = env.advance_until(sim_time=anim_time)
-            self._record_advance(obs, reward, info)
-            if self.agent.done or not env.needs_decision():
+            info = env.advance_until(sim_time=anim_time)
+            self._record_advance(info)
+            if not env.needs_decision():
                 return
 
     def _submit_one_at_current_time(self) -> None:
-        """Submit a single decision via the agent without letting time pass
+        """Submit a single decision from the solver without letting time pass
         (other carriers may decide at the same instant), then zero-advance to
-        refresh obs/info."""
-        agent, env = self.agent, self.env
+        refresh the decision context."""
+        env = self.env
         querying = env.querying_carrier
-        action_idx = agent.act()
-        agent.total_actions += 1
-        agent.record_policy_query(querying)
+        action_idx = self.bridge.decide()
 
         live_n = len(env._ctx.decoder.entries)  # type: ignore[attr-defined]
         if not (0 <= action_idx < live_n):
@@ -711,14 +529,9 @@ class Session:
         label = self._label_for(action_idx, querying)
 
         env.submit_action(action_idx)
-        obs, reward, info = env.advance_until(sim_time=env.sim_time)  # 0-time refresh
-        agent.obs, agent.info = obs, info
-        agent.total_reward += reward
-        agent.total_completions += len(info.get("completions", []))
-        if info.get("terminated") or info.get("truncated"):
-            agent.done = True
-        agent.last_step = _Step(querying, action_idx, label, reward, info)
-        self._emit(info)
+        info = env.advance_until(sim_time=env.sim_time)  # 0-time refresh
+        self.last_step = _Step(querying, action_idx, label, info)
+        self._record_advance(info)
 
     def _cache_pending_retrieve_sizes(self) -> None:
         """Remember each pending retrieve's car size while the car still
@@ -781,7 +594,7 @@ class Session:
     def system_state(self) -> tuple[str, str]:
         """(label, tone) for the status panel: WHY the system is (not)
         moving right now. tone ∈ {"ok", "warn", "dim"}."""
-        solver = getattr(self.agent.policy, "solver", None)
+        solver = self.bridge.solver
         if solver is None:
             return "", "dim"
         try:
@@ -800,18 +613,16 @@ class Session:
             return "", "dim"
 
     def can_take(self, size: str):
-        """Admission verdict for the status panel (None = no gate)."""
-        gate = getattr(self.agent.policy, "admission_ok_for", None)
-        if gate is None:
-            return None
+        """Admission verdict for the status panel."""
         if size != "big":
             return True
         return self.big_admission_ok()
 
-    def _record_advance(self, obs: dict, reward: float, info: dict) -> None:
-        agent = self.agent
+    def _record_advance(self, info: dict) -> None:
         self._cache_pending_retrieve_sizes()
-        for c in info.get("completions", []):
+        completions = info.get("completions", [])
+        self.total_completions += len(completions)
+        for c in completions:
             task = getattr(c, "task", None)
             if isinstance(task, Retrieve):
                 size = getattr(self, "_ret_sizes", {}).pop(task.pallet, "?")
@@ -829,23 +640,10 @@ class Session:
                            "cannot absorb another SUV)")
             else:
                 self._note("✗ store arrival dropped")
-        # CRITICAL: advancing time moves the sim to a NEW decision instant with a
-        # new querying carrier and a new observation. The agent's cached obs MUST be
-        # refreshed to this new obs — otherwise the next policy query runs on a STALE
-        # observation (wrong carrier/state) while info/action_entries are fresh,
-        # making a correct brain pick near-random actions.
-        agent.obs = obs
-        agent.info = info
-        agent.total_reward += reward
-        agent.total_completions += len(info.get("completions", []))
-        if agent.last_step is not None:
-            agent.last_step.reward += reward
-        if info.get("terminated") or info.get("truncated"):
-            agent.done = True
         self._emit(info)
 
     def _label_for(self, action_idx: int, querying: str) -> str:
-        entries = self.agent.info.get("action_entries", [])
+        entries = self.env._ctx.decoder.entries  # type: ignore[attr-defined]
         if 0 <= action_idx < len(entries):
             entry = entries[action_idx]
             if entry.type == ActionType.WAIT:
@@ -858,8 +656,8 @@ class Session:
     # ────────────────────────────────────────────────────────────────────
 
     def _emit(self, info: dict) -> None:
-        # Surface bridge-policy dispatch notes (move starts, self-heals).
-        notes = getattr(self.agent.policy, "notes", None)
+        # Surface solver dispatch notes (move starts, self-heals).
+        notes = self.bridge.notes
         if notes:
             for msg in notes:
                 self._note(msg)
@@ -883,9 +681,8 @@ class Session:
 
 @dataclass
 class _Step:
-    """Minimal last-action record for the status readout (a trimmed AgentStep)."""
+    """Minimal last-action record for the status readout."""
     querying: str
     action_idx: int
     action_label: str
-    reward: float
     info: dict

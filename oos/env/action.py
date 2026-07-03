@@ -1,6 +1,6 @@
 """Action enumeration, legality masking, and index decoding for a carrier.
 
-Primitive action model — the policy chooses from exactly:
+Primitive action model — the brain chooses from exactly:
 
   - `GOTO(target)` — move the carrier to one of its connected locations: a
     specific shelf, a room, or a handoff pose (`target` is a `DockRef`). Docks
@@ -18,8 +18,6 @@ Primitive action model — the policy chooses from exactly:
 The enumeration order is the single authority for the flat action index space:
 all legal GOTO entries (in node iteration order), then TAKE (if legal), then
 GIVE (if legal), then WAIT (always last — any carrier may rest anywhere).
-Everything downstream — the mask, the per-slot tensors, the network logits, the
-decoder — is keyed to this order.
 
 Customer interactions on rooms are auto-fired (not policy-chosen).
 """
@@ -94,31 +92,19 @@ def _room_goto_allowed(cs, retrieve_targets: set) -> bool:
     return load.is_empty or load.id in retrieve_targets
 
 
-def _is_immediate_inverse(cs, kind: str) -> bool:
-    """True iff the carrier's last TAKE/GIVE was `kind` at the location it is
-    still docked at — i.e. the candidate would immediately undo it. Cleared by
-    a GOTO (the carrier moved away), so this only fires without an intervening
-    move."""
-    ltg = cs.last_take_give
-    return ltg is not None and ltg[0] == kind and ltg[1] == cs.docked_at
-
-
 def enumerate_actions(
     carrier: CarrierId,
     state: FacilityState,
     topo: Topology,
     queue: TaskQueue | None = None,
-    policy_guards: bool = True,
 ) -> list[ActionEntry]:
     """List every legal action for the given (idle) carrier, in canonical order.
 
     Each candidate primitive is validated against the same `check_preconditions`
-    the engine uses (`_ok`), so the mask can never surface an action the engine
-    would reject. Two policy gates are layered on top of physical legality:
-      - a room GOTO is only offered when the held load is servable there
-        (`_room_goto_allowed`);
-      - a TAKE/GIVE that would immediately undo the carrier's last TAKE/GIVE at
-        the same dock is suppressed (`_is_immediate_inverse`).
+    the engine uses (`_ok`), so the list can never surface an action the engine
+    would reject. One policy gate is layered on top of physical legality: a
+    room GOTO is only offered when the held load is servable there
+    (`_room_goto_allowed`).
     """
     entries: list[ActionEntry] = []
     cs = state.carriers[carrier]
@@ -139,41 +125,23 @@ def enumerate_actions(
     for target in targets:
         if cs.docked_at is not None and target == cs.docked_at:
             continue  # already docked there — a no-op move
-        # Reverse-GOTO guard: don't go straight back to the dock we just left
-        # without having done a TAKE/GIVE there (a pointless A→B→A bounce).
-        # Returning to a room is always allowed (it has its own gate below).
-        if (
-            policy_guards
-            and target.kind != "room"
-            and cs.last_take_give is None
-            and cs.came_from is not None
-            and target == cs.came_from
-        ):
-            continue
         if target.kind == "room" and not _room_goto_allowed(cs, retrieve_targets):
             continue
         if _ok(Goto(carrier_id=carrier, target=target), state, topo):
             entries.append(ActionEntry(type=ActionType.GOTO, target=target))
 
     # TAKE / GIVE — 0 or 1, against the docked SHELF only. Carrier↔carrier
-    # handoffs are now AUTOMATIC on rendezvous (see SimEngine._auto_handoffs), so
+    # handoffs are AUTOMATIC on rendezvous (see SimEngine._auto_handoffs), so
     # there is no manual handoff TAKE/GIVE action to enumerate — a carrier just
     # GOTOs the pose and the transfer fires when its partner is there.
     at_shelf = cs.docked_at is not None and cs.docked_at.kind == "shelf"
-    if at_shelf and _ok(Take(carrier_id=carrier), state, topo) and not (
-        policy_guards and _is_immediate_inverse(cs, "give")
-    ):
+    if at_shelf and _ok(Take(carrier_id=carrier), state, topo):
         entries.append(ActionEntry(type=ActionType.TAKE))
 
-    if at_shelf and _ok(Give(carrier_id=carrier), state, topo) and not (
-        policy_guards and _is_immediate_inverse(cs, "take")
-    ):
+    if at_shelf and _ok(Give(carrier_id=carrier), state, topo):
         entries.append(ActionEntry(type=ActionType.GIVE))
 
-    # WAIT — last entry, ALWAYS legal: any carrier may rest anywhere (no
-    # loitering mask). The "all carriers waiting while work remains" stall is
-    # handled by the env's penalty + wake/re-query rescue (see
-    # Environment.advance), not by masking WAIT here.
+    # WAIT — last entry, ALWAYS legal: any carrier may rest anywhere.
     entries.append(ActionEntry(type=ActionType.WAIT))
     return entries
 
@@ -183,7 +151,6 @@ def has_non_wait_action(
     state: FacilityState,
     topo: Topology,
     queue: TaskQueue | None = None,
-    policy_guards: bool = True,
 ) -> bool:
     """Fast decision predicate: does this carrier have ANY legal action other
     than WAIT right now? Returns the same boolean as
@@ -191,37 +158,22 @@ def has_non_wait_action(
     first legal non-WAIT action instead of building the whole list — this is on
     the sim's hot path (`carriers_needing_decision` queries it constantly).
 
-    Mirrors `enumerate_actions`' legality + guard logic exactly; keep the two in
-    sync. Cheap candidates (TAKE/GIVE at the docked shelf) are tried first; the
+    Mirrors `enumerate_actions`' legality logic exactly; keep the two in sync.
+    Cheap candidates (TAKE/GIVE at the docked shelf) are tried first; the
     retrieve-target set is built lazily, only if a room GOTO is reached.
     """
     cs = state.carriers[carrier]
 
     at_shelf = cs.docked_at is not None and cs.docked_at.kind == "shelf"
     if at_shelf:
-        if _ok(Take(carrier_id=carrier), state, topo) and not (
-            policy_guards and _is_immediate_inverse(cs, "give")
-        ):
+        if _ok(Take(carrier_id=carrier), state, topo):
             return True
-        if _ok(Give(carrier_id=carrier), state, topo) and not (
-            policy_guards and _is_immediate_inverse(cs, "take")
-        ):
+        if _ok(Give(carrier_id=carrier), state, topo):
             return True
-
-    def _goto_blocked_by_reverse_guard(target: DockRef) -> bool:
-        return (
-            policy_guards
-            and target.kind != "room"
-            and cs.last_take_give is None
-            and cs.came_from is not None
-            and target == cs.came_from
-        )
 
     for sid in topo.accessible_shelves[carrier]:
         target = DockRef("shelf", sid)
         if cs.docked_at is not None and target == cs.docked_at:
-            continue
-        if _goto_blocked_by_reverse_guard(target):
             continue
         if _ok(Goto(carrier_id=carrier, target=target), state, topo):
             return True
@@ -229,8 +181,6 @@ def has_non_wait_action(
     for pid in topo.handoff_partners[carrier]:
         target = DockRef("handoff", pid)
         if cs.docked_at is not None and target == cs.docked_at:
-            continue
-        if _goto_blocked_by_reverse_guard(target):
             continue
         if _ok(Goto(carrier_id=carrier, target=target), state, topo):
             return True
@@ -254,9 +204,9 @@ def has_non_wait_action(
 
 
 class ActionDecoder:
-    """Maps flat Discrete indices to ActionEntry for the current observation.
+    """Maps flat action indices to ActionEntry for the current decision.
 
-    Index assignment: 0..len(entries)-1 for legal entries, rest masked.
+    Index assignment: 0..len(entries)-1 for legal entries, rest illegal.
     """
 
     def __init__(self, entries: list[ActionEntry], n_max: int) -> None:

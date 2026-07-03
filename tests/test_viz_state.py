@@ -8,12 +8,12 @@ from oos.viz.state_store import ViewState, load_view_state, save_view_state
 
 
 def test_round_trip(tmp_path):
-    runs = str(tmp_path)
-    st = ViewState(facility="campus", policy_path="", deterministic=True, speed=3.5,
+    d = str(tmp_path)
+    st = ViewState(facility="campus", speed=3.5,
                    auto_arrivals=True, target_fullness=0.8, change_rate=0.7,
                    dynamicity=0.3, suv_rate=0.4, fullness=0.7, zoom=2.5)
-    save_view_state(runs, st)
-    assert load_view_state(runs) == st
+    save_view_state(st, d)
+    assert load_view_state(d) == st
 
 
 def test_missing_file_defaults(tmp_path):
@@ -52,6 +52,11 @@ def test_old_keys_tolerated(tmp_path):
     assert abs(st.fullness - 0.8) < 1e-9
 
 
-def test_dropped_policy_path(tmp_path):
-    (tmp_path / ".viz_state.json").write_text(json.dumps({"policy_path": "/nope/ckpt.pt"}))
-    assert load_view_state(str(tmp_path)).policy_path == ""   # missing file -> random
+def test_policy_era_keys_ignored(tmp_path):
+    # Files written by the RL-era viz carried brain-selection keys; they are
+    # simply ignored now.
+    (tmp_path / ".viz_state.json").write_text(json.dumps(
+        {"facility": "tiny", "policy_path": "/nope/ckpt.pt", "deterministic": True}))
+    st = load_view_state(str(tmp_path))
+    assert st.facility == "tiny"
+    assert not hasattr(st, "policy_path")

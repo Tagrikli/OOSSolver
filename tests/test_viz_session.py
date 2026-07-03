@@ -1,6 +1,6 @@
 """Session — the viz's headless logic core. World pokes mutate the queue, the
-agent never moves except via playback, and facility/layout swaps don't crash.
-No DearPyGui import here (Session is GUI-free)."""
+solver never moves carriers except via playback, and facility/layout swaps
+don't crash. No DearPyGui import here (Session is GUI-free)."""
 
 from __future__ import annotations
 
@@ -53,13 +53,6 @@ def test_layout_reroll_and_facility_swap():
     assert s.facility_name == "tiny"
 
 
-def test_checkpoints_always_has_random():
-    s = Session("tiny_medipol")
-    entries = s.checkpoints()
-    assert entries and entries[0].path == ""        # synthetic random entry first
-    assert s.load_policy(entries[0]) is True
-
-
 def _fullness(s: Session) -> float:
     inv = s.inventory()
     return (inv["sedans"] + inv["suvs"]) / max(1, inv["pallets"])
@@ -70,8 +63,6 @@ def test_setpoint_world_converges_holds_and_churns():
     the deadband, churn exchanges cars without moving the level, and a
     lower target drains back down."""
     s = Session("tiny_medipol")
-    classical = next(e for e in s.checkpoints() if e.path == s.CLASSICAL_PATH)
-    assert s.load_policy(classical) is True
     s.reroll_layout(fullness=0.2)
     s.set_auto_arrivals(True)
     s.configure_setpoint(target=0.6, change=1.0, churn=0.0, suv_rate=0.0)
@@ -107,8 +98,6 @@ def test_random_room_spreads_stores():
     """OFF: the first staged room (topology order) always absorbs a store.
     ON: absorption spreads across staged rooms."""
     s = Session("tiny_medipol")
-    classical = next(e for e in s.checkpoints() if e.path == s.CLASSICAL_PATH)
-    assert s.load_policy(classical) is True
     s.reroll_layout(fullness=0.3)
     s.set_speed(64.0)
     s.play()
@@ -167,14 +156,12 @@ def test_heartbeat_ticks_solver_without_events():
     from oos.sim.state import Pallet
 
     s = Session("tiny_medipol")
-    classical = next(e for e in s.checkpoints() if e.path == s.CLASSICAL_PATH)
-    assert s.load_policy(classical) is True
     s.reroll_layout(fullness=0.3)
     s.set_speed(64.0)
     s.play()
     for _ in range(160):                       # reach rest (rooms staged)
         s.tick(0.25)
-    solver = s.agent.policy.solver
+    solver = s.bridge.solver
     assert solver is not None
 
     # Surgery: put a car on a lift with nothing else to do — the exact
