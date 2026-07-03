@@ -1,4 +1,4 @@
-# OOSKiller
+# OOSSolver
 
 A discrete-event **simulator** and a **deterministic plan solver** for an **OOS
 automated car park** — a facility where carriers (lifts and shuttles) move

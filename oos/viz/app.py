@@ -323,7 +323,7 @@ def run_app(facility: str | None = None) -> None:
             target=vs.target_fullness, change=vs.change_rate,
             churn=vs.dynamicity, suv_rate=vs.suv_rate)
 
-    dpg.create_viewport(title=f"OOSKiller — {facility}", width=1320, height=760)
+    dpg.create_viewport(title=f"OOSSolver — {facility}", width=1320, height=760)
     dpg.setup_dearpygui()
     dpg.set_primary_window("root", True)
     dpg.show_viewport()

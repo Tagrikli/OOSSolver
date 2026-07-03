@@ -1,5 +1,5 @@
 [project]
-name = "ooskiller"
+name = "oossolver"
 version = "0.1.0"
 description = "Deterministic plan solver for a Parkolay automated storage/retrieval system"
 readme = "README.md"
