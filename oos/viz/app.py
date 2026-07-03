@@ -43,6 +43,7 @@ PALLET = {
 REQUESTED   = (252, 238, 12, 255)    # YELLOW_BRIGHT — pending-retrieve highlight
 ROOM_FILL   = (30, 24, 56, 255)      # BASE_SURFACE
 ROOM_EDGE   = (204, 255, 0, 255)     # LIME_BRIGHT
+HANDOFF_DOT = (255, 140, 66, 255)    # ORANGE — handoff-pose marker on a lane
 CARRIER_IDLE = (5, 217, 232, 255)    # CYAN_BRIGHT
 CARRIER_BUSY = (255, 42, 109, 255)   # MAGENTA_BRIGHT
 CARRIER_OUT = (5, 3, 16, 255)        # BASE_BLACK
@@ -462,6 +463,13 @@ def _redraw(session: Session, ui: dict) -> None:
     for cid, lane in geom.lanes.items():
         dpg.draw_line((lane.x0, lane.y), (lane.x1, lane.y), color=TRACK, thickness=2, parent="canvas")
         dpg.draw_text((6, lane.y - 9), cid, size=15, color=TEXT, parent="canvas")
+
+    # handoff poses: a dot on each partner lane marking the transfer spot
+    # (drawn under the carrier sprites; the pose is otherwise invisible)
+    for hm in geom.handoffs:
+        for x, y in ((hm.ax, hm.ay), (hm.bx, hm.by)):
+            dpg.draw_circle((x, y), 4.0, fill=HANDOFF_DOT, color=HANDOFF_DOT,
+                            parent="canvas")
 
     # shelves: dark background frame + role-colored outline + borderless pallets
     for sb in geom.shelves:
