@@ -13,6 +13,7 @@ Run:  python -m oos.viz [facility] [--runs DIR]
 
 from __future__ import annotations
 
+import os
 import time
 
 import dearpygui.dearpygui as dpg
@@ -48,6 +49,58 @@ CARRIER_OUT = (5, 3, 16, 255)        # BASE_BLACK
 QUERY_HL    = (252, 238, 12, 255)    # querying-carrier outline
 
 PANEL_W = 360
+LOG_LINES = 28                            # pooled, individually-colored rows
+
+C_SEDAN = (5, 217, 232, 255)              # cyan — everything sedan
+C_SUV   = (255, 42, 109, 255)             # magenta — everything SUV
+C_REQ   = (252, 238, 12, 255)             # yellow — requests/retrievals
+C_OK    = (110, 230, 130, 255)
+C_BAD   = (255, 96, 96, 255)
+C_WARN  = (240, 200, 90, 255)
+
+# DPG's built-in font is ASCII-only — every ✓/▶/⇩ glyph renders as '?'.
+# Load a system font that has them; silently keep the default if none found.
+_FONT_PATHS = (
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",       # Fedora
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",         # Debian/Ubuntu
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",                     # Arch
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",    # macOS
+    "C:/Windows/Fonts/segoeui.ttf",                            # Windows
+)
+
+
+def _ui_glyphs() -> set[int]:
+    """Every non-ASCII codepoint the UI can emit: scan the sources whose
+    strings end up on buttons or in the event log (self-maintaining)."""
+    import oos.env.moves, oos.plan.planner, oos.plan.solver, oos.viz.move_bridge, oos.viz.session
+    chars: set[int] = set()
+    for mod in (None, oos.viz.session, oos.viz.move_bridge,
+                oos.plan.solver, oos.plan.planner, oos.env.moves):
+        path = __file__ if mod is None else (mod.__file__ or "")
+        try:
+            with open(path, encoding="utf-8") as f:
+                chars |= {ord(c) for c in f.read() if ord(c) > 127}
+        except OSError:
+            pass
+    return chars
+
+
+def _bind_ui_font() -> None:
+    path = next((p for p in _FONT_PATHS if os.path.isfile(p)), None)
+    if path is None:
+        return
+    try:
+        ver = str(dpg.get_dearpygui_version())
+        with dpg.font_registry():
+            with dpg.font(path, 15) as f:
+                if ver.startswith(("0.", "1.")):
+                    # DPG ≥ 2.x loads glyph ranges automatically; older
+                    # versions need the hint + explicit codepoints.
+                    dpg.add_font_range_hint(dpg.mvFontRangeHint_Default)
+                    dpg.add_font_chars(sorted(_ui_glyphs()))
+        dpg.bind_font(f)
+    except Exception:
+        pass                        # any hiccup → default font, still usable
 
 
 def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
@@ -67,6 +120,10 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
     }
 
     dpg.create_context()
+    _bind_ui_font()
+    with dpg.theme(tag="tight_theme"):     # dense text blocks (status, log)
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 8, 1)
 
     def _save():
         """Persist the current picks to runs/.viz_state.json."""
@@ -76,14 +133,19 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
             deterministic=dpg.get_value("deterministic"),
             speed=session.speed,
             auto_arrivals=session.auto_arrivals,
-            store_rate=dpg.get_value("store_rate"),
-            big_prob=dpg.get_value("big_prob"),
+            target_fullness=dpg.get_value("target_full"),
+            change_rate=dpg.get_value("change_rate"),
+            dynamicity=dpg.get_value("dynamicity"),
+            suv_rate=dpg.get_value("suv_rate"),
+            random_room=dpg.get_value("random_room"),
             fullness=dpg.get_value("fullness"),
             zoom=ui["zoom"],
         ))
 
     # ---- callbacks ----------------------------------------------------
     def on_facility(_s, name, _u):
+        if not name or name == session.facility_name:
+            return                    # ignore a spurious / no-op startup callback
         session.swap_facility(name)
         ui["policy_path"] = ""       # swap drops to random (brain was topo-sized)
         ui["geom_key"] = None        # force a geometry rebuild for the new topo
@@ -96,6 +158,7 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
         if entry is not None:
             session.load_policy(entry, dpg.get_value("deterministic"))
             ui["policy_path"] = entry.path
+            _sync_deterministic(entry)
             _save()
 
     def on_deterministic(_s, _val, _u):
@@ -118,14 +181,33 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
     def on_store_big(*_):   session.enqueue_store("big")
     def on_clear(*_):       session.clear_queue()
 
-    def on_auto(_s, val, _u):
-        session.set_auto_arrivals(val); _save()
+    def _world_kwargs() -> dict:
+        return dict(
+            target=dpg.get_value("target_full"),
+            change=dpg.get_value("change_rate"),
+            churn=dpg.get_value("dynamicity"),
+            suv_rate=dpg.get_value("suv_rate"),
+        )
 
-    def on_store_rate(_s, val, _u):
-        if dpg.get_value("auto"):
-            session.set_store_rate(val, big_prob=dpg.get_value("big_prob"))
-            _sync_play_label()
-            _save()
+    def on_auto(_s, val, _u):
+        session.set_auto_arrivals(val)
+        if val:
+            session.configure_setpoint(**_world_kwargs())
+        _save()
+
+    def on_world(*_):
+        # LIVE retune — the facility keeps running (no reset).
+        session.configure_setpoint(**_world_kwargs())
+        _save()
+
+    def on_random_room(_s, val, _u):
+        session.set_random_room(val)
+        _save()
+
+    def on_burst_small(*_): session.burst_stores(5, "small")
+    def on_burst_big(*_):   session.burst_stores(2, "big")
+    def on_req_random(*_):  session.request_random(3)
+    def on_rush_out(*_):    session.request_all()
 
     def on_reroll(*_):
         session.reroll_layout(fullness=dpg.get_value("fullness")); _save()
@@ -146,7 +228,13 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
                 return
 
     def _sync_play_label():
-        dpg.set_item_label("playbtn", "❚❚ Pause" if session.playing else "▶ Play")
+        dpg.set_item_label("playbtn", "‖ Pause" if session.playing else "▶ Play")
+
+    def _sync_deterministic(entry) -> None:
+        # The classical solver IS deterministic; the argmax toggle is an
+        # RL-checkpoint concept — grey it out when it has no meaning.
+        is_classical = entry is not None and entry.path == session.CLASSICAL_PATH
+        dpg.configure_item("deterministic", enabled=not is_classical)
 
     def _refresh_policy_combo():
         ui["ckpt"] = {e.display_name: e for e in session.checkpoints()}
@@ -164,6 +252,7 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
             ui["policy_path"] = entry.path
         else:
             ui["policy_path"] = ""
+        _sync_deterministic(entry)
 
     # ---- window: scrollable canvas (left) + fixed panel (right) --------
     with dpg.window(tag="root"):
@@ -172,6 +261,27 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
                                   horizontal_scrollbar=True):
                 dpg.add_drawlist(width=900, height=600, tag="canvas")
             with dpg.child_window(width=PANEL_W, height=-1, tag="controls"):
+                dpg.add_text("STATUS", color=HEAD)
+                with dpg.group(tag="status_grp"):
+                    dpg.add_text("", tag="st_state", wrap=PANEL_W - 20)
+                    dpg.add_text("", tag="st_fac")
+                    dpg.add_text("", tag="st_cap")
+                    dpg.add_text("", tag="st_sedans", color=C_SEDAN)
+                    dpg.add_text("", tag="st_suvs", color=C_SUV)
+                    dpg.add_text("", tag="st_take_s")
+                    dpg.add_text("", tag="st_take_b")
+                    dpg.add_text("", tag="st_wait_s", color=C_SEDAN)
+                    dpg.add_text("", tag="st_wait_b", color=C_SUV)
+                    dpg.add_text("", tag="st_wait_r", color=C_REQ)
+                    dpg.add_text("", tag="st_drop")
+                    dpg.add_text("", tag="full_state", wrap=PANEL_W - 20)
+                    dpg.add_text("RETRIEVALS (since reset, seconds)", color=HEAD)
+                    dpg.add_text("", tag="st_stat_sedan", color=C_SEDAN)
+                    dpg.add_text("", tag="st_stat_suv", color=C_SUV)
+                    dpg.add_text("", tag="st_stat_total")
+                dpg.bind_item_theme("status_grp", "tight_theme")
+
+                dpg.add_separator()
                 dpg.add_text("FACILITY", color=HEAD)
                 dpg.add_combo(sorted(FACILITIES), default_value=facility,
                               callback=on_facility, width=-1, tag="facility_combo")
@@ -184,24 +294,49 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
                 dpg.add_text("PLAYBACK", color=HEAD)
                 with dpg.group(horizontal=True):
                     dpg.add_button(label="▶ Play", callback=on_play, tag="playbtn", width=92)
-                    dpg.add_button(label="⏭ Step", callback=on_step, width=80)
+                    dpg.add_button(label="» Step", callback=on_step, width=80)
                     dpg.add_button(label="↻ Reset", callback=on_reset, width=80)
                 dpg.add_slider_float(label="speed", default_value=vs.speed, min_value=0.0,
-                                     max_value=8.0, callback=on_speed, width=-60)
+                                     max_value=64.0, callback=on_speed, width=-60)
+                dpg.add_text("", tag="status", wrap=PANEL_W - 20, color=DIM)
 
                 dpg.add_separator()
-                dpg.add_text("WORLD  (you are the customer)", color=HEAD)
+                dpg.add_text("DEMAND  (you are the customer)", color=HEAD)
                 with dpg.group(horizontal=True):
-                    dpg.add_button(label="+ Store small", callback=on_store_small, width=120)
-                    dpg.add_button(label="+ Store big", callback=on_store_big, width=110)
+                    dpg.add_button(label="+1 sedan", callback=on_store_small, width=82)
+                    dpg.add_button(label="+1 SUV", callback=on_store_big,
+                                   width=74, tag="store_big_btn")
+                    dpg.add_button(label="+5 sedan", callback=on_burst_small, width=82)
+                    dpg.add_button(label="+2 SUV", callback=on_burst_big, width=-1)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Request 3 random", callback=on_req_random, width=140)
+                    dpg.add_button(label="RUSH-OUT (all)", callback=on_rush_out, width=-1)
                 dpg.add_button(label="Clear queue", callback=on_clear, width=-1)
                 dpg.add_text("click a pallet on the canvas → request it", color=DIM)
-                dpg.add_checkbox(label="auto-world (Poisson stream)", default_value=vs.auto_arrivals,
+
+                dpg.add_separator()
+                dpg.add_text("AUTO WORLD  (set-point)", color=HEAD)
+                dpg.add_checkbox(label="auto-world", default_value=vs.auto_arrivals,
                                  callback=on_auto, tag="auto")
-                dpg.add_slider_float(label="store rate", default_value=vs.store_rate, min_value=0.0,
-                                     max_value=0.5, callback=on_store_rate, width=-70, tag="store_rate")
-                dpg.add_slider_float(label="big prob", default_value=vs.big_prob, min_value=0.0,
-                                     max_value=1.0, width=-70, tag="big_prob")
+                dpg.add_slider_float(label="target fullness", default_value=vs.target_fullness,
+                                     min_value=0.0, max_value=1.0,
+                                     callback=on_world, width=-120, tag="target_full")
+                dpg.add_slider_float(label="change rate", default_value=vs.change_rate,
+                                     min_value=0.0, max_value=1.0,
+                                     callback=on_world, width=-120, tag="change_rate")
+                dpg.add_slider_float(label="dynamicity", default_value=vs.dynamicity,
+                                     min_value=0.0, max_value=1.0,
+                                     callback=on_world, width=-120, tag="dynamicity")
+                dpg.add_slider_float(label="SUV rate", default_value=vs.suv_rate,
+                                     min_value=0.0, max_value=1.0,
+                                     callback=on_world, width=-120, tag="suv_rate")
+                dpg.add_checkbox(label="random room", default_value=vs.random_room,
+                                 callback=on_random_room, tag="random_room")
+                dpg.add_text("", tag="world_hint", color=C_WARN, wrap=PANEL_W - 20)
+                dpg.add_text("fullness marches to the target at the change-rate\n"
+                             "pace; dynamicity = constant in-out exchange on top\n"
+                             "(1 = doors saturated, visits get short)",
+                             color=DIM, wrap=PANEL_W - 20)
 
                 dpg.add_separator()
                 dpg.add_text("LAYOUT", color=HEAD)
@@ -211,11 +346,14 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
                 dpg.add_text("mouse-wheel over canvas → scale horizontally", color=DIM)
 
                 dpg.add_separator()
-                dpg.add_text("", tag="status", wrap=PANEL_W - 20)
-                dpg.add_separator()
                 dpg.add_text("EVENT LOG", color=HEAD)
-                with dpg.child_window(height=-1, tag="logbox"):
-                    dpg.add_text("", tag="log", wrap=PANEL_W - 30)
+                # Fixed height: the controls column scrolls as a whole, so a
+                # stretch (-1) here would collapse to nothing once the STATUS
+                # block grew. ~17 rows visible, the rest scroll inside.
+                with dpg.child_window(height=330, tag="logbox"):
+                    for i in range(LOG_LINES):
+                        dpg.add_text("", tag=f"log{i}", wrap=PANEL_W - 30)
+                dpg.bind_item_theme("logbox", "tight_theme")
 
     with dpg.handler_registry():
         dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Left, callback=on_canvas_click)
@@ -226,9 +364,13 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
 
     _refresh_policy_combo()
     _sync_play_label()
-    if vs.auto_arrivals:                 # restore the saved auto-world stream
+    if vs.random_room:
+        session.set_random_room(True)
+    if vs.auto_arrivals:                 # restore the saved set-point world
         session.set_auto_arrivals(True)
-        session.set_store_rate(vs.store_rate, vs.big_prob)
+        session.configure_setpoint(
+            target=vs.target_fullness, change=vs.change_rate,
+            churn=vs.dynamicity, suv_rate=vs.suv_rate)
 
     dpg.create_viewport(title=f"OOSKiller — {facility}", width=1320, height=760)
     dpg.setup_dearpygui()
@@ -240,15 +382,88 @@ def run_app(facility: str | None = None, runs_dir: str = "runs") -> None:
         now = time.perf_counter()
         dt = now - last
         last = now
+        session.ensure_started()      # never render an un-reset engine
         session.tick(dt)
         _relayout(session, ui)
         _redraw(session, ui)
         dpg.set_value("status", session.status_line())
-        dpg.set_value("log", "\n".join(list(session.log)[-14:]))
+        _update_status_panel(session)
+        _update_log(session)
         dpg.render_dearpygui_frame()
 
     _save()                              # persist final speed / zoom / world knobs
     dpg.destroy_context()
+
+
+def _yes_no(tag: str, label: str, verdict) -> None:
+    """Render a gate verdict line: YES (green) / NO (red) / — (no gate)."""
+    if verdict is None:
+        dpg.set_value(tag, f"{label}  —")
+        dpg.configure_item(tag, color=DIM)
+    else:
+        dpg.set_value(tag, f"{label}  {'YES' if verdict else 'NO'}")
+        dpg.configure_item(tag, color=C_OK if verdict else C_BAD)
+
+
+def _fmt_stat(label: str, s: dict) -> str:
+    if not s.get("n"):
+        return f"{label:<6} —"
+    return (f"{label:<6} n={s['n']:<4d} min {s['min']:.0f}  med {s['med']:.0f}  "
+            f"avg {s['avg']:.0f}  max {s['max']:.0f}")
+
+
+def _update_status_panel(session: Session) -> None:
+    inv = session.inventory()
+    qs = session.queue_stats()
+    state, tone = session.system_state()
+    dpg.set_value("st_state", state)
+    dpg.configure_item("st_state", color={"ok": C_OK, "warn": C_WARN,
+                                          "dim": DIM}[tone])
+    dpg.set_value("st_fac", f"facility   {session.facility_name}")
+    dpg.set_value("st_cap", f"capacity   {inv['pallets']} pallets · "
+                            f"{inv['slots']} slots · "
+                            f"{inv['sedans'] + inv['suvs']} cars")
+    dpg.set_value("st_sedans", f"sedans stored    {inv['sedans']}")
+    dpg.set_value("st_suvs",   f"SUVs stored      {inv['suvs']}")
+    _yes_no("st_take_s", "accepts sedan", session.can_take("small"))
+    _yes_no("st_take_b", "accepts SUV  ", session.can_take("big"))
+    dpg.configure_item("store_big_btn", enabled=session.can_take("big") is not False)
+    dpg.set_value("st_wait_s", f"waiting sedans   {qs['small']}")
+    dpg.set_value("st_wait_b", f"waiting SUVs     {qs['big']}")
+    dpg.set_value("st_wait_r", f"waiting requests {qs['retrieves']}")
+    dpg.set_value("st_drop",   f"SUVs dropped     {qs['dropped_suvs']}")
+    dpg.configure_item("st_drop", color=C_BAD if qs["dropped_suvs"] else DIM)
+    kept = session.kept_on_lift()
+    dpg.set_value("full_state",
+                  f"FULL: {kept} car(s) held on lift — no free empty to "
+                  f"re-stage (delivers instantly on request)" if kept else "")
+    if kept:
+        dpg.configure_item("full_state", color=C_WARN)
+    st = session.retrieve_stats()
+    dpg.set_value("st_stat_sedan", _fmt_stat("sedan", st["sedan"]))
+    dpg.set_value("st_stat_suv",   _fmt_stat("SUV",   st["suv"]))
+    dpg.set_value("st_stat_total", _fmt_stat("total", st["total"]))
+    dpg.set_value("world_hint",
+                  session.setpoint_hint() if session.auto_arrivals else "")
+
+
+def _update_log(session: Session) -> None:
+    lines = list(session.log)[-LOG_LINES:]
+    pad = LOG_LINES - len(lines)
+    for i in range(LOG_LINES):
+        text = lines[i - pad] if i >= pad else ""
+        dpg.set_value(f"log{i}", text)
+        if "✓" in text:
+            color = C_OK
+        elif "✗" in text or "FAILED" in text:
+            color = C_BAD
+        elif "RETRIEVE" in text or "RUSH-OUT" in text:
+            color = C_REQ
+        elif "STORE" in text:
+            color = C_SEDAN if "small" in text else C_SUV
+        else:
+            color = DIM
+        dpg.configure_item(f"log{i}", color=color)
 
 
 def _relayout(session: Session, ui: dict) -> None:

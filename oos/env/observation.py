@@ -113,7 +113,19 @@ ROOM_FEATURE_NAMES = (
     "target_staged_here",    # serving carrier docked here holding a requested item
 )
 
-GLOBAL_FEATURE_NAMES: tuple[str, ...] = ()
+# Global summary scalars — the constraints the agent must respect live here.
+# Without these the policy must reconstruct them by pooling per-node features, and
+# the value head's mean-pool averages away the one deeply-buried car that dominates
+# system retrieval cost. All are normalized to ~[0,1].
+GLOBAL_FEATURE_NAMES: tuple[str, ...] = (
+    "free_headroom_total",   # free shelf slots (air) / total capacity
+    "free_headroom_big",     # free big-shelf slots / total big capacity (the scarce one)
+    "max_buried_depth",      # deepest car's burial depth / SHELF_MAX_CAPACITY
+    "big_pollution",         # small items occupying big-shelf slots / total big capacity
+    "n_pending_retrieves",   # pending retrieves / n_rooms (clipped at 1)
+    "n_pending_stores",      # pending stores / n_rooms (clipped at 1)
+    "frac_rooms_unstaged",   # rooms not staged / n_rooms
+)
 
 
 class ObservationBuilder:
@@ -169,6 +181,13 @@ class ObservationBuilder:
             self._s_cap[i] = max(s.capacity, 1)
             self._s_slot_bound[i] = min(SHELF_MAX_CAPACITY, s.capacity)
         self._shelf_static = shelf_static
+
+        # ---- statics for the global summary features -------------------
+        self._big_shelf_ids = [sid for sid, s in topo.shelves.items() if s.size_class == "big"]
+        self._total_capacity = max(1, sum(s.capacity for s in topo.shelves.values()))
+        self._total_big_capacity = max(1, sum(topo.shelves[sid].capacity for sid in self._big_shelf_ids))
+        self._n_rooms_f = max(1, len(self.room_ids))
+        self._global_dim = len(GLOBAL_FEATURE_NAMES)
 
         # ---- static structural edges (never change within a topology) --
         accesses: list[tuple[int, int]] = []
@@ -271,6 +290,34 @@ class ObservationBuilder:
                 elif scs.load.id in requested_pallets:
                     rf[i, 3] = 1.0
 
+        # ---- global summary features (one pass over shelves) ----
+        gf = np.zeros(self._global_dim, dtype=np.float32)
+        free_total = free_big = big_pollution = max_depth = 0
+        for sid, ss in state.shelves.items():
+            stack = ss.stack
+            n = len(stack)
+            sh = self.topo.shelves[sid]
+            free_total += sh.capacity - n
+            is_big = sh.size_class == "big"
+            if is_big:
+                free_big += sh.capacity - n
+            for slot_i, p in enumerate(stack):
+                if not p.is_empty:
+                    d = n - 1 - slot_i
+                    if d > max_depth:
+                        max_depth = d
+                    if is_big and p.contents == "small":
+                        big_pollution += 1
+        n_stores = sum(1 for t in queue.pending if isinstance(t, Store))
+        n_staged = int(rf[:, 2].sum())
+        gf[0] = free_total / self._total_capacity
+        gf[1] = free_big / self._total_big_capacity
+        gf[2] = min(1.0, max_depth / SHELF_MAX_CAPACITY)
+        gf[3] = big_pollution / self._total_big_capacity
+        gf[4] = min(1.0, len(requested_pallets) / self._n_rooms_f)
+        gf[5] = min(1.0, n_stores / self._n_rooms_f)
+        gf[6] = (self._n_rooms_f - n_staged) / self._n_rooms_f
+
         edges_docked: list[tuple[int, int]] = []
         for cid, cs in state.carriers.items():
             d = cs.docked_at
@@ -284,7 +331,7 @@ class ObservationBuilder:
             "carrier_features": cf,
             "shelf_features": sf,
             "room_features": rf,
-            "global_features": np.zeros(len(GLOBAL_FEATURE_NAMES), dtype=np.float32),
+            "global_features": gf,
             "edges_accesses": self._edges_accesses.copy(),
             "edges_handoff": self._edges_handoff.copy(),
             "edges_transfer": self._edges_transfer.copy(),

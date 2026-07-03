@@ -103,6 +103,15 @@ class SimEngine:
         # call (e.g. `enqueue_store` triggers an auto-serve that completes a
         # task immediately). Drained into the next AdvanceResult.
         self._pending_completions: list[TaskCompletion] = []
+        # Optional deployment gates (mirrors of GatedEngine, consulted when
+        # set — the plan solver installs its oracle-backed checks here so
+        # ANY engine, the viz's included, refuses stores it cannot absorb):
+        # admission_check(size) -> bool: arrival-time gate; a refused STORE
+        #   arrival is DROPPED (the customer leaves).
+        # store_serve_gate(size) -> bool: serve-time gate; a queued store
+        #   that is not fundable right now simply waits at the entrance.
+        self.admission_check: Optional[Callable[[str], bool]] = None
+        self.store_serve_gate: Optional[Callable[[str], bool]] = None
         # Optional predicate `(carrier_id) -> bool` injected by the env layer:
         # "does this carrier have at least one non-WAIT action available?".
         # A waiting carrier is only treated as needing a decision when this is
@@ -269,6 +278,20 @@ class SimEngine:
         Carriers executing a real command are untouched."""
         for cs in self.state.carriers.values():
             cs.waiting = False
+
+    def retry_serves(self) -> bool:
+        """Re-attempt room serves at a QUIESCENT instant. Serve gates are
+        time-varying (they consult in-flight effects and planner
+        reservations), so a store refused at its arrival event must be
+        re-checked once the world settles — otherwise a queued car whose
+        gate has since cleared waits for an unrelated event forever.
+        Callers: idle heartbeats (viz Session, SolverRuntime) — NOT the
+        event loop itself (mid-advance serves violate pump invariants).
+        Returns True iff a serve fired."""
+        fired = self._serve_ready_rooms(self._pending_completions)
+        if fired:
+            self.wake_waiting_carriers()
+        return fired
 
     def toggle_retrieve_for_pallet(self, pallet_id: PalletId) -> bool:
         """If a pending Retrieve for this pallet exists, remove it; else add
@@ -487,9 +510,13 @@ class SimEngine:
         # Recreate the task with the arrival time set to current sim time.
         if isinstance(task, Store):
             task = Store(arrived_at=self.state.time, size=task.size)
+            if self.admission_check is not None:
+                if not self.admission_check(task.size):
+                    dropped.append(task)
+                    return
             # Big-store admission gate (opt-in): a SUV is only accepted if a
             # big slot is free and placing it keeps the facility retrievable.
-            if (
+            elif (
                 task.size == "big"
                 and self.gate_big_retrievability
                 and not self._big_admission_ok()
@@ -582,6 +609,11 @@ class SimEngine:
         pallet_id = payload["pallet"]
         if not _pallet_exists(self, pallet_id):
             return
+        if not _pallet_has_car(self, pallet_id):
+            # The car already left (e.g. retrieved manually before its
+            # dwell fired) — a Retrieve for an EMPTY pallet is meaningless
+            # and would send a carrier to deliver nothing.
+            return
         task = Retrieve(
             arrived_at=self.state.time, pallet=pallet_id,
             initial_depth=pallet_depth(self.state, pallet_id),
@@ -604,14 +636,25 @@ class SimEngine:
         True iff any serve fired. Each serve removes one task, so the queue
         strictly shrinks and this terminates."""
         served_any = False
+        order = list(self.state.carriers)
+        if self.serve_order_rng is not None:
+            # Opt-in (viz realism): a queued store lands on a RANDOM staged
+            # room instead of the first in topology order. Retrieves are
+            # unaffected — they serve wherever their target pallet is.
+            order = [order[i]
+                     for i in self.serve_order_rng.permutation(len(order))]
         changed = True
         while changed:
             changed = False
-            for carrier_id in self.state.carriers:
+            for carrier_id in order:
                 if self._try_serve_at_room(carrier_id, completions):
                     served_any = True
                     changed = True
         return served_any
+
+    _serving_cid = None   # serve-gate context (set during _try_serve_at_room)
+    #: None = deterministic serve order (the default everywhere but the viz)
+    serve_order_rng: Optional[np.random.Generator] = None
 
     def _try_serve_at_room(
         self, carrier_id: CarrierId, completions: list[TaskCompletion]
@@ -631,6 +674,9 @@ class SimEngine:
         d = cs.docked_at
         if d is None or d.kind != "room":
             return False
+        # Serve-gate context: which carrier would absorb the store (the
+        # solver's wedge-safety check needs it; see store_serve_gate).
+        self._serving_cid = carrier_id
         pallet = cs.load
         # Retrieve: the held pallet is the target of a pending Retrieve (a real
         # agent delivery — the only way a retrieve can complete now).
@@ -641,6 +687,7 @@ class SimEngine:
         # Store: the held empty pallet absorbs the oldest pending Store.
         if pallet.is_empty:
             store = self._find_pending_store()
+            self._serving_cid = None
             if store is not None:
                 cost = self.state.time - store.arrived_at
                 self.queue.remove(store)
@@ -751,8 +798,22 @@ class SimEngine:
     def _find_pending_store(self) -> "Store | None":
         for t in self.queue.pending:
             if isinstance(t, Store):
-                return t
+                if (self.store_serve_gate is None
+                        or self.store_serve_gate(t.size)):
+                    return t
         return None
+
+
+def _pallet_has_car(facility: "SimEngine", pallet_id: PalletId) -> bool:
+    """True iff the pallet currently carries a car (not empty)."""
+    for ss in facility.state.shelves.values():
+        for p in ss.stack:
+            if p.id == pallet_id:
+                return not p.is_empty
+    for cs in facility.state.carriers.values():
+        if cs.load is not None and cs.load.id == pallet_id:
+            return not cs.load.is_empty
+    return False
 
 
 def _pallet_exists(facility: "SimEngine", pallet_id: PalletId) -> bool:

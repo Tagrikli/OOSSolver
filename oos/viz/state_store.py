@@ -23,8 +23,11 @@ class ViewState:
     deterministic: bool = False
     speed: float = 1.0
     auto_arrivals: bool = False
-    store_rate: float = 0.05
-    big_prob: float = 0.3
+    target_fullness: float = 0.5     # set-point the world converges to
+    change_rate: float = 0.5         # convergence pace, 1 = saturate the doors
+    dynamicity: float = 0.15         # balanced in-out churn at rest
+    suv_rate: float = 0.15           # share of arrivals that are SUVs
+    random_room: bool = False        # stores land on a random staged room
     fullness: float = 0.5
     zoom: float = 1.0
 
@@ -59,9 +62,14 @@ def load_view_state(runs_dir: str = "runs") -> ViewState:
         st.policy_path = ap if os.path.isfile(ap) else ""
     st.deterministic = bool(data.get("deterministic", False))
     st.auto_arrivals = bool(data.get("auto_arrivals", False))
-    st.speed = _clamp(data.get("speed"), 1.0, 0.0, 8.0)
-    st.store_rate = _clamp(data.get("store_rate"), 0.05, 0.0, 0.5)
-    st.big_prob = _clamp(data.get("big_prob"), 0.3, 0.0, 1.0)
+    st.speed = _clamp(data.get("speed"), 1.0, 0.0, 64.0)
+    # Set-point world knobs. Older files (open-loop rate/visit keys) don't
+    # translate to a set-point — only the SUV share carries over.
+    st.target_fullness = _clamp(data.get("target_fullness"), 0.5, 0.0, 1.0)
+    st.change_rate = _clamp(data.get("change_rate"), 0.5, 0.0, 1.0)
+    st.dynamicity = _clamp(data.get("dynamicity"), 0.15, 0.0, 1.0)
+    st.suv_rate = _clamp(data.get("suv_rate", data.get("big_prob")), 0.15, 0.0, 1.0)
+    st.random_room = bool(data.get("random_room", False))
     # `fullness` tolerates the old nested "randomize": {"fullness": ...}.
     fullness = data.get("fullness")
     if fullness is None and isinstance(data.get("randomize"), dict):

@@ -25,6 +25,11 @@ class PPOConfig:
     n_epochs: int = 4
     minibatch_size: int = 256
     normalize_advantage: bool = True
+    # KL leash toward a frozen reference (warm-start) policy: penalize
+    # KL(ref ‖ current) so a continuous fine-tune stays a *nudge* and cannot drift
+    # off the reference's hard-won dig skill (CONTINUOUS_REDESIGN.md §3.3). 0 = off
+    # (requires passing `ref_net` to `ppo_update`).
+    kl_coef: float = 0.0
 
 
 @dataclass
@@ -36,6 +41,7 @@ class PPOUpdateMetrics:
     clip_fraction: float
     explained_variance: float
     n_minibatches: int
+    ref_kl: float = 0.0    # mean KL(ref ‖ current) when a KL leash is active
 
 
 def ppo_update(
@@ -46,6 +52,7 @@ def ppo_update(
     buffer: "RolloutBuffer | list[RolloutBuffer]",
     cfg: PPOConfig,
     device: "torch.device | str" = "cpu",
+    ref_net: "PolicyValueNet | None" = None,
 ) -> PPOUpdateMetrics:
     """Run K epochs of PPO updates over the rollout buffer.
 
@@ -101,7 +108,11 @@ def ppo_update(
     ent_sum = 0
     kl_sum = 0
     clip_sum = 0
+    refkl_sum = 0.0
     n_mb = 0
+    use_leash = ref_net is not None and cfg.kl_coef > 0
+    if use_leash:
+        ref_net.eval()
     net.train()
     for epoch in range(cfg.n_epochs):
         np.random.shuffle(indices)
@@ -133,6 +144,29 @@ def ppo_update(
             value_loss = F.mse_loss(out.value, mb_ret)
             loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy
 
+            ref_kl_val = 0.0
+            if use_leash:
+                with torch.no_grad():
+                    ref_logits = ref_net(batch).logits
+                # KL(ref ‖ current) over legal actions. Illegal slots are −∞ in BOTH
+                # (same mask) → the per-slot term is non-finite; zero those out so
+                # only the shared legal support contributes.
+                logp_ref = F.log_softmax(ref_logits, dim=-1)
+                logp_cur = F.log_softmax(out.logits, dim=-1)
+                kl_slots = logp_ref.exp() * (logp_ref - logp_cur)
+                kl_per = kl_slots.masked_fill(~torch.isfinite(kl_slots), 0.0).sum(-1)  # [B]
+                # STATE-CONDITIONAL leash: pin the policy to the warm-start ONLY where
+                # the hard-won dig skill lives — states with a pending retrieve. Rest /
+                # staging states (no pending retrieve) are left UNleashed so the fluency
+                # fines can freely flip wandering→WAIT; a global KL(ref‖·) would instead
+                # floor p(GOTO) at the warm-start's habit (it blows up as p_cur(GOTO)→0),
+                # which is exactly why an unconditional leash cannot fix the wandering.
+                # global_x[:,4] = n_pending_retrieves (>0 iff a retrieve is pending).
+                active = (batch.global_x[:, 4] > 0).to(kl_per.dtype)
+                kl_ref = (kl_per * active).sum() / active.sum().clamp_min(1.0)
+                loss = loss + cfg.kl_coef * kl_ref
+                ref_kl_val = float(kl_ref.item())
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), cfg.max_grad_norm)
@@ -146,6 +180,7 @@ def ppo_update(
             ent_sum += float(entropy.item())
             kl_sum += float(kl)
             clip_sum += float(cf)
+            refkl_sum += ref_kl_val
             n_mb += 1
 
     var_ret = float(returns_np.var())
@@ -161,4 +196,5 @@ def ppo_update(
         clip_fraction=clip_sum / max(1, n_mb),
         explained_variance=explained_var,
         n_minibatches=n_mb,
+        ref_kl=refkl_sum / max(1, n_mb),
     )

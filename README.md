@@ -7,8 +7,14 @@ in [`docs/PROBLEM.md`](docs/PROBLEM.md).
 
 This repository provides the simulator, an environment / observation / reward
 framework, an interactive visualizer, and neutral building blocks for
-learning-based control. It deliberately does **not** fix an objective, a reward, or
-a control approach — those are open, to be defined separately.
+learning-based control.
+
+**Control is solved by the V3 deterministic plan solver** (no RL in the
+control path): `oos/plan/planner.py` + `oos/plan/solver.py` +
+`oos/plan/runtime.py`, specified by [`docs/SOLUTION_V3.md`](docs/SOLUTION_V3.md)
+with the behavior contract in [`docs/AGENT_BEHAVIOR.md`](docs/AGENT_BEHAVIOR.md).
+Its acceptance battery runs with `python -m oos.plan.battery --gate all`;
+in the visualizer, pick **"(classical solver)"** in the policy dropdown.
 
 ## The system
 
