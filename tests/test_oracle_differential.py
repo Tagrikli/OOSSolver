@@ -13,6 +13,8 @@ fired: a run where every candidate fell through would be vacuous.
 
 from __future__ import annotations
 
+import zlib
+
 import numpy as np
 
 from oos.facilities import get_facility
@@ -78,7 +80,7 @@ def test_move_ok_ctx_matches_move_ok():
     for name in TOPOLOGIES:
         topo, _ = get_facility(name)()
         oracle = SolvabilityOracle(topo, max_holds=1)
-        rng = np.random.default_rng(hash(name) % 2**32)
+        rng = np.random.default_rng(zlib.crc32(name.encode()))
         views_used = 0
         for _ in range(400):
             if views_used >= 120:
