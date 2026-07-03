@@ -617,6 +617,27 @@ class MoveExecutor:
                 (ms.move.dst_kind, ms.move.dst_id),
             )
 
+    def abort(self, ms: MoveState) -> None:
+        """Cancel an in-flight move: release its claims and shelf locks and
+        forget it. Carriers finish their current primitive (a busy carrier
+        stays busy until its command completes) and end idle, possibly still
+        holding the move's pallet — the caller's recovery rungs re-shelve
+        held pallets. Exists for moves whose completion can become
+        IMPOSSIBLE: a car's room delivery waits on a serve that never fires
+        once its Retrieve is canceled (the room-GOTO is masked for
+        non-requested loads), so the move would otherwise stay in flight —
+        and its carriers claimed — forever."""
+        if ms not in self.inflight:
+            return
+        self.inflight.remove(ms)
+        if ms.move.src_kind == "shelf" and not ms.popped:
+            self.src_locked.discard(ms.move.src_id)
+        if ms.move.dst_kind == "shelf" and not ms.landed:
+            self.dst_locked.discard(ms.move.dst_id)
+        for cid in ms.move.chain:
+            if self.claimed.get(cid) is ms:
+                del self.claimed[cid]
+
     def startable_store_dst_exists(self, holder: CarrierId, contents: str,
                                    loaded: set[CarrierId]) -> bool:
         """True iff a store move for a car of `contents` held by `holder`

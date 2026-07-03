@@ -182,3 +182,63 @@ def test_heartbeat_ticks_solver_without_events():
             break
     assert solver.ex.completed_moves > moves0 or solver.ex.n_inflight, \
         "held car never moved: solver not ticked without engine events"
+
+
+def test_cancel_mid_delivery_recovers():
+    """Canceling a retrieve while its car is already riding to the room must
+    not wedge: the serve can never fire without a pending request and the
+    room-GOTO is masked for non-requested loads, so the solver must abort
+    the delivery move (the store rung re-shelves the car) instead of keeping
+    the lift claimed forever (the cancel-mid-delivery wedge)."""
+    s = Session("tiny_medipol")
+    s.reroll_layout(fullness=0.5, seed=3)
+    s.set_speed(64.0)
+    s.play()
+    for _ in range(200):                       # settle: rooms staged
+        s._hb_t = 0.0
+        s.tick(0.25)
+    solver = s.bridge.solver
+
+    def deepest_car():
+        best = None
+        for ss in s.state.shelves.values():
+            n = len(ss.stack)
+            for i, p in enumerate(ss.stack):
+                if p.is_empty:
+                    continue
+                d = n - 1 - i
+                if best is None or d > best[0]:
+                    best = (d, p.id)
+        return best[1]
+
+    target = deepest_car()
+    s.request_retrieve(target)
+    riding = False
+    for _ in range(1200):                      # wait for the delivery leg
+        s._hb_t = 0.0
+        s.tick(0.25)
+        if any(ms.move.dst_kind == "room" and ms.move.pallet_id == target
+               and ms.popped for ms in solver.ex.inflight):
+            riding = True
+            break
+        if target not in s.pending_retrieve_ids():
+            break                              # served before we could cancel
+    if not riding:
+        return                                 # degenerate seed; nothing to test
+    s.request_retrieve(target)                 # CANCEL mid-delivery
+
+    for _ in range(1500):
+        s._hb_t = 0.0
+        s.tick(0.25)
+        staged = all(solver.room_staged(r) for r in solver.room_ids)
+        on_shelf = any(p.id == target for ss in s.state.shelves.values()
+                       for p in ss.stack)
+        if staged and on_shelf and solver.ex.n_inflight == 0 \
+                and not solver.plans:
+            break
+    else:
+        raise AssertionError(
+            f"no recovery after cancel-mid-delivery: staged="
+            f"{sum(solver.room_staged(r) for r in solver.room_ids)}"
+            f"/{len(solver.room_ids)} inflight={solver.ex.n_inflight} "
+            f"plans={len(solver.plans)}\n{solver.dump_state()}")

@@ -307,11 +307,23 @@ class PlanSolver:
                 self._drop_plan(target)
                 continue
             if plan.kind == "retrieve" and target not in requested:
-                delivered = any(i.kind == "deliver" and i.status != "pending"
+                # "Delivered" means the deliver intent is DONE (the carrier
+                # reached the room while the request was pending, so the
+                # serve consumed the car). A RUNNING deliver whose request
+                # was CANCELED can never complete: the serve will never
+                # fire and the car's room-GOTO is masked for non-requested
+                # loads — the lift would stay claimed forever (the
+                # cancel-mid-delivery wedge). Abort its move so the carrier
+                # frees with the car in hand; the store rung re-shelves it.
+                delivered = any(i.kind == "deliver" and i.status == "done"
                                 for i in plan.intents)
                 if not delivered:
-                    # True cancel (manual): abandon; rungs recover any held
-                    # pallets.
+                    for it in plan.intents:
+                        if it.status != "running":
+                            continue
+                        ms = self._intent_ms.get(id(it))
+                        if ms is not None and ms.move.dst_kind == "room":
+                            self.ex.abort(ms)
                     self.notes.append(f"plan {target}: request gone, dropped")
                     self._drop_plan(target)
                     continue
@@ -332,8 +344,28 @@ class PlanSolver:
                     plan.reserved_slots[mv.dst_id] -= 1
                 started += 1
                 progressed = True
-            if progressed or self._plan_has_inflight(plan):
+            if progressed:
                 self._plan_progress_t[target] = now
+            elif self._plan_has_inflight(plan):
+                # In-flight moves normally complete on their own (an intent
+                # completion refreshes the clock in the sync loop above) —
+                # but a WEDGED move whose completion has become impossible
+                # must not refresh the clock forever and outlive every
+                # watchdog. 10× the replan window is far beyond any
+                # legitimate single-move makespan: abort the plan's moves
+                # and rebuild from the live state (carriers free holding
+                # their pallets; the rungs re-shelve them).
+                stalled_s = now - self._plan_progress_t.get(target, now)
+                if stalled_s > 10.0 * self.REPLAN_AFTER_S:
+                    for it in plan.intents:
+                        if it.status == "running":
+                            ms = self._intent_ms.get(id(it))
+                            if ms is not None:
+                                self.ex.abort(ms)
+                    self.notes.append(
+                        f"plan {target}: wedged in flight, replanning")
+                    self.replans += 1
+                    self._drop_plan(target)
             else:
                 stalled_s = now - self._plan_progress_t.get(target, now)
                 holds_out = any(i.kind == "land" and i.status != "done"
