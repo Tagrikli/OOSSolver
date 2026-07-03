@@ -41,7 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from oos.env.moves import MoveExecutor
+from oos.plan.moves import MoveExecutor
 from oos.plan.oracle import FutureView
 from oos.sim.facility import SimEngine
 
@@ -137,7 +137,7 @@ RESERVE_BIG = 8e6   # non-big placement would starve the dig's big-air need
 #                     starved big air kills the dig outright)
 
 
-class _Sim:
+class PlanSim:
     """Virtual world for one plan construction: stacks as (pid, contents)
     lists, per-shelf usable air (net of reservations), and the emitted
     intent list. Mutated only by the planner's own decisions."""
@@ -359,7 +359,7 @@ class RetrievalPlanner:
         for src in srcs:
             for helper in helpers:
                 volatile = set(serving) - {helper, holder}
-                sim = _Sim(self, engine, reserved_slots, locked_shelves, None)
+                sim = PlanSim(self, engine, reserved_slots, locked_shelves, None)
                 sim.volatile = volatile
                 sim.reserved = set(reserved_carriers)
                 cost = 0.0
@@ -511,7 +511,7 @@ class RetrievalPlanner:
         return not any(c in avoid for c in chain)
 
     @staticmethod
-    def _chain_free_sim(sim: _Sim, chain: Optional[tuple],
+    def _chain_free_sim(sim: PlanSim, chain: Optional[tuple],
                         src_holder: Optional[str] = None) -> bool:
         """Every chain member's hands are free at this plan sequence point
         (the carrier holding the moved pallet excepted), and no member is a
@@ -566,7 +566,7 @@ class RetrievalPlanner:
             avoid = (set(reserved_carriers) | volatile) - {holder, lift}
             if chain is None or not self._chain_ok(chain, avoid):
                 return None
-            sim = _Sim(self, engine, reserved_slots, locked_shelves, None)
+            sim = PlanSim(self, engine, reserved_slots, locked_shelves, None)
             sim.volatile = volatile
             sim.reserved = set(reserved_carriers)
             sim.allow_bury = allow_bury
@@ -640,7 +640,7 @@ class RetrievalPlanner:
         essential = set(deliver_chain0) | {xc, lift}
         avoid_chain = (set(reserved_carriers) | volatile) - essential
 
-        sim = _Sim(self, engine, reserved_slots, locked_shelves, X)
+        sim = PlanSim(self, engine, reserved_slots, locked_shelves, X)
         sim.volatile = volatile
         sim.reserved = set(reserved_carriers)
         sim.allow_bury = allow_bury
@@ -891,7 +891,7 @@ class RetrievalPlanner:
                             {**holders, **sim.extraction_holds},
                             cost, reserved_slots)
 
-    def _finish(self, sim: _Sim, engine, target: int, room: str, lift: str,
+    def _finish(self, sim: PlanSim, engine, target: int, room: str, lift: str,
                 X: Optional[str], holders: dict[int, str], cost: float,
                 other_reserved: dict[str, int]) -> Optional[Plan]:
         """Assemble the Plan and validate the simulated terminal stacks."""
@@ -913,7 +913,7 @@ class RetrievalPlanner:
                     created_at=engine.state.time)
 
     @staticmethod
-    def _bigs_above_target(sim: _Sim, X: str, target: int) -> int:
+    def _bigs_above_target(sim: PlanSim, X: str, target: int) -> int:
         """Big blockers still above the target on the (virtual) dig stack."""
         n = 0
         for pid, c in reversed(sim.stacks[X]):
@@ -927,7 +927,7 @@ class RetrievalPlanner:
     # Extraction — the §9 apex big-air maneuver as plain intents
     # ------------------------------------------------------------------
 
-    def _emit_extraction(self, sim: _Sim, requested: set[int],
+    def _emit_extraction(self, sim: PlanSim, requested: set[int],
                          X: str) -> Optional[float]:
         """Grow big air by one: pick the big shelf Y (≠ X) whose most
         accessible non-big sits under the fewest bigs `k`, hop those bigs
@@ -989,7 +989,7 @@ class RetrievalPlanner:
             sim.restore(snap)
         return None
 
-    def _extraction_holders(self, sim: _Sim, yc: str) -> list[str]:
+    def _extraction_holders(self, sim: PlanSim, yc: str) -> list[str]:
         """Spare hands an extraction may park a hop-big on: free right now
         at this sim point, not the mule itself, not volatile/reserved, and
         chain-reachable from the mule. Deterministic order."""
@@ -1005,7 +1005,7 @@ class RetrievalPlanner:
             out.append(c)
         return out
 
-    def _emit_extraction_from(self, sim: _Sim, requested: set[int], X: str,
+    def _emit_extraction_from(self, sim: PlanSim, requested: set[int], X: str,
                               Y: str, hops: list[tuple[int, str]],
                               nonbig: tuple[int, str]) -> Optional[float]:
         """Emit one extraction from shelf Y (see _emit_extraction). On any
@@ -1086,7 +1086,7 @@ class RetrievalPlanner:
     # Destination choice (all against the virtual sim)
     # ------------------------------------------------------------------
 
-    def _pick_empty_dst(self, sim: _Sim, carrier: str, requested: set[int],
+    def _pick_empty_dst(self, sim: PlanSim, carrier: str, requested: set[int],
                         avoid: set[str], exclude: set[str]) -> Optional[str]:
         """Best shelf for a staging empty: any class, prefer near + benign.
         The chain must be hands-free at this plan sequence point (the
@@ -1102,7 +1102,7 @@ class RetrievalPlanner:
                 continue
             if not self._chain_free_sim(sim, chain, src_holder=carrier):
                 continue
-            s = self._dst_score(sim, sid, "empty", requested)
+            s = self.placement_score(sim, sid, "empty", requested)
             if s >= HARD:
                 continue
             s += 200.0 * (len(chain) - 1)   # prefer local parking
@@ -1112,7 +1112,7 @@ class RetrievalPlanner:
                 best = (s, sid)
         return best[1] if best else None
 
-    def _pick_blocker_dst(self, sim: _Sim, contents: str,
+    def _pick_blocker_dst(self, sim: PlanSim, contents: str,
                           requested: set[int], X: str, head: str,
                           exclude: Optional[set[str]] = None,
                           src_holder: Optional[str] = None) -> Optional[str]:
@@ -1134,7 +1134,7 @@ class RetrievalPlanner:
             chain = ex.chain_between(head, ex.shelf_carrier(sid))
             if not self._chain_free_sim(sim, chain, src_holder=src_holder):
                 continue
-            s = self._dst_score(sim, sid, contents, requested)
+            s = self.placement_score(sim, sid, contents, requested)
             if s >= HARD:
                 continue
             # Prefer disposals INSIDE the dig's own region: every extra
@@ -1146,7 +1146,7 @@ class RetrievalPlanner:
                 best = (s, sid)
         return best[1] if best else None
 
-    def _pick_nonbig_small_dst(self, sim: _Sim, contents: str,
+    def _pick_nonbig_small_dst(self, sim: PlanSim, contents: str,
                                requested: set[int], X: str, head: str,
                                exclude: set[str]) -> Optional[str]:
         """Small-shelf destination for an extracted non-big (landing it on
@@ -1161,7 +1161,7 @@ class RetrievalPlanner:
             chain = ex.chain_between(head, ex.shelf_carrier(sid))
             if not self._chain_free_sim(sim, chain):
                 continue
-            s = self._dst_score(sim, sid, contents, requested)
+            s = self.placement_score(sim, sid, contents, requested)
             if s >= HARD:
                 continue
             s += 200.0 * (len(chain) - 1)   # keep extractions region-local
@@ -1169,7 +1169,7 @@ class RetrievalPlanner:
                 best = (s, sid)
         return best[1] if best else None
 
-    def _dst_score(self, sim: _Sim, sid: str, contents: str,
+    def placement_score(self, sim: PlanSim, sid: str, contents: str,
                    requested: set[int]) -> float:
         """Placement badness (lower = better) — the v2.5 invariant table,
         evaluated against the virtual stacks."""
@@ -1237,7 +1237,7 @@ class RetrievalPlanner:
             chain = ex.chain_between(
                 chain_head, ex.shelf_carrier(dst[1])) or (chain_head,)
         try:
-            makespan, _busy = ex._estimate(
+            makespan, _busy = ex.estimate_makespan(
                 src[0], src[1], dst[0], dst[1], tuple(chain))
         except Exception:
             makespan = 60.0 * len(chain)

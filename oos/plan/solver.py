@@ -26,8 +26,8 @@ from __future__ import annotations
 from collections import deque
 from typing import Optional
 
-from oos.env.moves import Move, MoveExecutor, MoveState
-from oos.plan.planner import Intent, Plan, RetrievalPlanner, _Sim
+from oos.plan.moves import Move, MoveExecutor, MoveState
+from oos.plan.planner import Intent, Plan, PlanSim, RetrievalPlanner
 from oos.sim.facility import SimEngine
 from oos.sim.tasks import Retrieve, Store
 
@@ -762,11 +762,11 @@ class PlanSolver:
         end = mv.chain[-1]
         return ex.free_chain(head, end, holder=holder) is not None
 
-    def _rung_sim(self) -> _Sim:
+    def _rung_sim(self) -> PlanSim:
         """Fresh scoring view for rung placements (reservation-adjusted).
         Outstanding held SUVs reserve big air: a sedan placement that would
         starve them scores RESERVE_BIG (they'd wedge on their lifts)."""
-        sim = _Sim(self.planner, self.engine, self.pending_reserved_slots(),
+        sim = PlanSim(self.planner, self.engine, self.pending_reserved_slots(),
                    self.locked_shelves(), None)
         owned = self.owned_pallets()
         sim.big_need = sum(
@@ -776,13 +776,13 @@ class PlanSolver:
         return sim
 
     def _dst_score_live(self, mv: Move, requested: set[int],
-                        sim: Optional[_Sim] = None) -> float:
+                        sim: Optional[PlanSim] = None) -> float:
         """v2.5 dst_score against the live stacks (rung placements)."""
         if mv.dst_kind != "shelf":
             return mv.est_makespan
         if sim is None:
             sim = self._rung_sim()
-        s = self.planner._dst_score(sim, mv.dst_id, mv.contents, requested)
+        s = self.planner.placement_score(sim, mv.dst_id, mv.contents, requested)
         return s + mv.est_makespan
 
     def _op_done(self, other: Intent, shelf: str) -> bool:
@@ -836,10 +836,10 @@ class PlanSolver:
         n_empty += sum(
             1 for cs in self.engine.state.carriers.values()
             if cs.load is not None and cs.load.is_empty)
-        n_staged = sum(1 for rid in self.room_ids if self._room_staged(rid))
+        n_staged = sum(1 for rid in self.room_ids if self.room_staged(rid))
         return n_empty - n_staged
 
-    def _keep_on_lift(self, cid: str) -> bool:
+    def keep_on_lift(self, cid: str) -> bool:
         """Full-facility behavior (operator spec): when no free empty
         remains to re-stage with, a just-parked car STAYS on its serving
         lift — storing it would strand the room un-stageable anyway and
@@ -871,7 +871,7 @@ class PlanSolver:
             key=lambda c: (self.engine.state.carriers[c].load.contents
                            != "big"))
         for cid in held_cars:
-            if self._keep_on_lift(cid):
+            if self.keep_on_lift(cid):
                 continue
             cands = self._store_moves(cid, view, ctx, reserved, locked, slots)
             cands = [mv for mv in cands if self._startable_now(mv)]
@@ -916,14 +916,14 @@ class PlanSolver:
                 continue
             if self.ex.is_claimed(lift) or rid in inbound:
                 continue
-            if self._room_staged(rid):
+            if self.room_staged(rid):
                 lifts_used.add(lift)   # a lift stages one room at a time
                 continue
             out.append(rid)
             lifts_used.add(lift)
         return out
 
-    def _room_staged(self, rid: str) -> bool:
+    def room_staged(self, rid: str) -> bool:
         scs = self.engine.state.carriers[self.serving[rid]]
         return (scs.docked_at is not None and scs.docked_at.kind == "room"
                 and scs.docked_at.id == rid and scs.load is not None
@@ -1127,14 +1127,14 @@ class PlanSolver:
                 continue
             if cs.load is not None and not cs.load.is_empty \
                     and cs.load.id not in owned \
-                    and not self._keep_on_lift(cid):
+                    and not self.keep_on_lift(cid):
                 return True
         # Un-staged rooms are pending work only while a free empty exists to
         # stage them with (operator spec: stage min(rooms, empties) rooms;
         # beyond that the facility is legitimately at its full-state rest).
         if self.free_empties() <= 0:
             return False
-        return any(not self._room_staged(rid) for rid in self.room_ids)
+        return any(not self.room_staged(rid) for rid in self.room_ids)
 
     def dump_state(self) -> str:
         """Stuck-dump per SOLUTION_V3 §6: last rung/plan, per-class air,

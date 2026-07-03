@@ -20,7 +20,7 @@ from __future__ import annotations
 from typing import Optional
 
 from oos.env.action import ActionType
-from oos.env.moves import MoveExecutor
+from oos.plan.moves import MoveExecutor
 from oos.plan.oracle import SolvabilityOracle
 from oos.plan.solver import PlanSolver
 

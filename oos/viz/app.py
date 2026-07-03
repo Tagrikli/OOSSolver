@@ -72,10 +72,10 @@ _FONT_PATHS = (
 def _ui_glyphs() -> set[int]:
     """Every non-ASCII codepoint the UI can emit: scan the sources whose
     strings end up on buttons or in the event log (self-maintaining)."""
-    import oos.env.moves, oos.plan.planner, oos.plan.solver, oos.viz.session, oos.viz.solver_bridge
+    import oos.plan.moves, oos.plan.planner, oos.plan.solver, oos.viz.session, oos.viz.solver_bridge
     chars: set[int] = set()
     for mod in (None, oos.viz.session, oos.viz.solver_bridge,
-                oos.plan.solver, oos.plan.planner, oos.env.moves):
+                oos.plan.solver, oos.plan.planner, oos.plan.moves):
         path = __file__ if mod is None else (mod.__file__ or "")
         try:
             with open(path, encoding="utf-8") as f:

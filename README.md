@@ -29,7 +29,7 @@ load/unload, and concurrency — is in [`docs/PROBLEM.md`](docs/PROBLEM.md).
 |------|--------|----------------|
 | **SimEngine** | `oos/sim/facility.py` | The discrete-event world: topology, state, scheduler, task queue, dynamics, `advance_until`. |
 | **Plan solver** | `oos/plan/` | The control brain: `oracle.py` (solvability/admission oracle), `planner.py` (retrieval planning), `solver.py` (plan + rung dispatch), `runtime.py` (headless pump loop), `battery.py` (acceptance battery). |
-| **Move layer** | `oos/env/moves.py` | Pallet-move primitives (`Move`, `MoveExecutor`): compiles a move into carrier scripts and executes them against the live engine. |
+| **Move layer** | `oos/plan/moves.py` | Pallet-move primitives (`Move`, `MoveExecutor`): compiles a move into carrier scripts and executes them against the live engine. |
 | **Environment** | `oos/env/env.py` | The per-carrier decision loop over one SimEngine: action enumeration/decoding (`oos/env/action.py`), `advance_until` / `submit_action` / `needs_decision`. Used by the viz to drive the sim frame by frame. |
 | **Viz** | `oos/viz/` | Interactive DearPyGui visualizer: `Session` (headless logic) + `SolverBridge` (solver ↔ decision loop) + `app` (rendering glue). |
 
@@ -38,8 +38,9 @@ load/unload, and concurrency — is in [`docs/PROBLEM.md`](docs/PROBLEM.md).
 ```
 oos/
 ├── sim/         discrete-event SimEngine (state, scheduler, queue, dynamics, motion)
-├── plan/        the deterministic V3 plan solver: oracle, planner, solver, runtime, battery
-├── env/         decision-loop Environment + action enumeration + the pallet-move executor
+├── plan/        the deterministic V3 plan solver: oracle, planner, solver, runtime, battery,
+│                and the pallet-move executor (moves.py)
+├── env/         decision-loop Environment + action enumeration (drives the sim for the viz)
 ├── viz/         interactive DearPyGui visualizer / driver (solver-driven)
 ├── facilities/  hand-authored facility registry (name -> factory)
 ├── dsl/         facility-definition builder DSL (authors + validates topologies)

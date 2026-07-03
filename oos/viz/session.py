@@ -259,7 +259,7 @@ class Session:
                 1 for cid in solver.lifts
                 if (cs := self.env.engine.state.carriers[cid]).load is not None
                 and not cs.load.is_empty and not solver.ex.is_claimed(cid)
-                and solver._keep_on_lift(cid))
+                and solver.keep_on_lift(cid))
         except Exception:   # noqa: BLE001 — indicator must never break the UI
             return 0
 

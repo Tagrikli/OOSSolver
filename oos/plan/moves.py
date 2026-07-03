@@ -367,7 +367,7 @@ class MoveExecutor:
 
     def _make_move(self, src_kind, src_id, dst_kind, dst_id, chain, pid,
                    contents) -> Move:
-        makespan, busy = self._estimate(src_kind, src_id, dst_kind, dst_id, chain)
+        makespan, busy = self.estimate_makespan(src_kind, src_id, dst_kind, dst_id, chain)
         return Move(
             src_kind=src_kind, src_id=src_id, dst_kind=dst_kind, dst_id=dst_id,
             chain=chain, pallet_id=pid, contents=contents,
@@ -410,7 +410,7 @@ class MoveExecutor:
         some_shelf = next(iter(self.topo.shelves.values()))
         return self.engine.durations.shelf_op("take", some_shelf)
 
-    def _estimate(self, src_kind, src_id, dst_kind, dst_id,
+    def estimate_makespan(self, src_kind, src_id, dst_kind, dst_id,
                   chain: tuple[CarrierId, ...]) -> tuple[float, float]:
         """(makespan, total busy seconds) for the move, from current carrier
         positions, assuming receivers head to their poses immediately (which

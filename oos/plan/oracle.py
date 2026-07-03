@@ -347,7 +347,7 @@ class SolvabilityOracle:
     #   - held/pending materialization has spare margin ≥ |delta|.
     # Anything not provably safe falls through to the exact `move_ok` —
     # the accept/reject semantics are IDENTICAL, only recomputation is
-    # skipped (differential-tested in the fuzz suite).
+    # skipped (differential-tested in tests/test_oracle_differential.py).
 
     def refresh_ctx(self, view: FutureView) -> dict:
         free_by_shelf: dict[str, int] = {}

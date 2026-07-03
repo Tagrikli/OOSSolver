@@ -164,7 +164,7 @@ def test_no_staged_empty_ping_pong():
     assert not res.stuck, res.stuck_dump
     assert res.moves_completed <= 6, (
         f"staging churned {res.moves_completed} moves — ping-pong regression")
-    assert all(rt.solver._room_staged(rid) for rid in rt.room_ids)
+    assert all(rt.solver.room_staged(rid) for rid in rt.room_ids)
 
 
 def test_rest_state_no_churn():
@@ -182,7 +182,7 @@ def test_groom_converges_at_low_fullness():
     """Operator report: campus @0.35 groomed empties in circles (~200
     moves/h). Grooming must terminate: monotone violation descent +
     truthful empty-blocker scoring."""
-    from oos.env import moves as M
+    from oos.plan import moves as M
 
     rt = SolverRuntime(get_facility("campus"), seed=2)
     rt.seed_solvable(0.35, prioritize_big=True)
@@ -345,5 +345,5 @@ def test_stage_escalates_past_unreachable_top_empty():
 
     res = rt.run(until_idle=True, until_sim_time=1200.0, stuck_gap_s=300.0)
     assert not res.stuck, res.stuck_dump
-    staged = {r: rt.solver._room_staged(r) for r in rt.room_ids}
+    staged = {r: rt.solver.room_staged(r) for r in rt.room_ids}
     assert all(staged.values()), f"rooms left unstaged at rest: {staged}"

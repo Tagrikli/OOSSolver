@@ -21,7 +21,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from oos.env.moves import MoveExecutor
+from oos.plan.moves import MoveExecutor
 from oos.plan.oracle import SolvabilityOracle
 from oos.plan.solver import PlanSolver
 from oos.sim.durations import LinearDurations
@@ -310,7 +310,7 @@ class SolverRuntime:
                 break  # genuinely nothing left to happen
 
             n_staged = sum(1 for rid in self.room_ids
-                           if self.solver._room_staged(rid))
+                           if self.solver.room_staged(rid))
             n_unstaged = len(self.room_ids) - n_staged
             excused = self._excused_rooms()
             for cid, cs in engine.state.carriers.items():
@@ -365,7 +365,7 @@ class SolverRuntime:
         n = 0
         unstaged_plain = 0
         for rid in self.room_ids:
-            if self.solver._room_staged(rid):
+            if self.solver.room_staged(rid):
                 continue
             if rid in inbound or rid in plan_rooms or self.ex.is_claimed(
                     self.topo.rooms[rid].served_by):
