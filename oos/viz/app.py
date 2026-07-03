@@ -468,7 +468,7 @@ def _redraw(session: Session, ui: dict) -> None:
     # (drawn under the carrier sprites; the pose is otherwise invisible)
     for hm in geom.handoffs:
         for x, y in ((hm.ax, hm.ay), (hm.bx, hm.by)):
-            dpg.draw_circle((x, y), 4.0, fill=HANDOFF_DOT, color=HANDOFF_DOT,
+            dpg.draw_circle((x, y), 2.5, fill=HANDOFF_DOT, color=HANDOFF_DOT,
                             parent="canvas")
 
     # shelves: dark background frame + role-colored outline + borderless pallets
