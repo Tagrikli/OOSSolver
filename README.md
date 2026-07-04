@@ -8,7 +8,10 @@ dynamics are specified in [`docs/PROBLEM.md`](docs/PROBLEM.md).
 **Control is solved by the V3 plan solver** (no learning anywhere in the
 system): `oos/plan/planner.py` + `oos/plan/solver.py` + `oos/plan/runtime.py`,
 specified by [`docs/SOLUTION_V3.md`](docs/SOLUTION_V3.md) with the behavior
-contract in [`docs/AGENT_BEHAVIOR.md`](docs/AGENT_BEHAVIOR.md). Its acceptance
+contract in [`docs/AGENT_BEHAVIOR.md`](docs/AGENT_BEHAVIOR.md). A
+tutorial-style walkthrough of the algorithm — what it is, how the oracle,
+planner, solver, and executor fit together, with a traced example — is in
+[`docs/HOW_THE_SOLVER_WORKS.md`](docs/HOW_THE_SOLVER_WORKS.md). Its acceptance
 battery runs with `python -m oos.plan.battery --gate all`. An earlier RL
 training pipeline was removed once the solver passed the full battery; it
 survives in git history and in the docs under `docs/`.
