@@ -51,6 +51,7 @@ def compile_facility(fac: "Facility") -> tuple[Topology, SeedingConfig]:
                 position_for={c.name: s.position},
                 is_transfer=False,
                 orientation_for={c.name: s.orientation},
+                is_ev=s.ev,
             )
 
     # Transfer shelves: paired across two carriers. Each pair → one SimShelf
@@ -123,6 +124,7 @@ def compile_facility(fac: "Facility") -> tuple[Topology, SeedingConfig]:
 
     topo = Topology.build(
         carriers=carriers, shelves=shelves, rooms=rooms, handoffs=tuple(handoffs),
+        serve_exit_s=fac.serve_exit_s, serve_entry_s=fac.serve_entry_s,
     )
     validate_topology(topo)
 

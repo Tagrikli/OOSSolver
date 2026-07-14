@@ -52,6 +52,30 @@ class Retrieve(Task):
     already_staged: bool = False
 
 
+@dataclass(frozen=True)
+class Evict(Task):
+    """Service operation (SOLUTION_V3_1 §2): remove the specific car from
+    its current shelf and store it at any acceptable ordinary placement
+    (scored, oracle-gated). No room is involved — the car stays in the
+    system. Issued by an external policy (e.g. charger-shelf rotation);
+    the solver knows nothing about why."""
+
+    pallet: PalletId
+
+
+@dataclass(frozen=True)
+class Place(Task):
+    """Service operation (SOLUTION_V3_1 §2): bring the specific car to the
+    specific destination shelf, landing on top of its current stack. The
+    destination's occupants are untouchable — the solver never digs into
+    or hops through the destination. A destination with no free slot is an
+    immediate no-solution (the task is rejected; the issuing policy must
+    first Evict a specific car from that shelf and re-issue)."""
+
+    pallet: PalletId
+    shelf: str
+
+
 @dataclass
 class TaskQueue:
     pending: list[Task] = field(default_factory=list)

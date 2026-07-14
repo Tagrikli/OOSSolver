@@ -1,0 +1,128 @@
+{
+ "runs": [
+  {
+   "seed": 0,
+   "samples": [
+    {
+     "t": 0.0,
+     "nonbig_on_big": 5,
+     "big_air": 17,
+     "moves": 0
+    },
+    {
+     "t": 32.33316582808827,
+     "nonbig_on_big": 4,
+     "big_air": 18,
+     "moves": 1
+    },
+    {
+     "t": 68.43637222152199,
+     "nonbig_on_big": 2,
+     "big_air": 20,
+     "moves": 2
+    },
+    {
+     "t": 104.53957861495569,
+     "nonbig_on_big": 1,
+     "big_air": 21,
+     "moves": 4
+    },
+    {
+     "t": 135.90599402375474,
+     "nonbig_on_big": 0,
+     "big_air": 22,
+     "moves": 5
+    },
+    {
+     "t": 157.65340845744575,
+     "nonbig_on_big": 0,
+     "big_air": 22,
+     "moves": 7
+    }
+   ]
+  },
+  {
+   "seed": 1,
+   "samples": [
+    {
+     "t": 0.0,
+     "nonbig_on_big": 5,
+     "big_air": 17,
+     "moves": 0
+    },
+    {
+     "t": 32.33316582808827,
+     "nonbig_on_big": 4,
+     "big_air": 18,
+     "moves": 1
+    },
+    {
+     "t": 68.43637222152199,
+     "nonbig_on_big": 2,
+     "big_air": 20,
+     "moves": 2
+    },
+    {
+     "t": 104.53957861495569,
+     "nonbig_on_big": 1,
+     "big_air": 21,
+     "moves": 4
+    },
+    {
+     "t": 135.90599402375474,
+     "nonbig_on_big": 0,
+     "big_air": 22,
+     "moves": 5
+    },
+    {
+     "t": 157.65340845744575,
+     "nonbig_on_big": 0,
+     "big_air": 22,
+     "moves": 7
+    }
+   ]
+  },
+  {
+   "seed": 2,
+   "samples": [
+    {
+     "t": 0.0,
+     "nonbig_on_big": 5,
+     "big_air": 17,
+     "moves": 0
+    },
+    {
+     "t": 32.33316582808827,
+     "nonbig_on_big": 4,
+     "big_air": 18,
+     "moves": 1
+    },
+    {
+     "t": 68.43637222152199,
+     "nonbig_on_big": 2,
+     "big_air": 20,
+     "moves": 2
+    },
+    {
+     "t": 104.53957861495569,
+     "nonbig_on_big": 1,
+     "big_air": 21,
+     "moves": 4
+    },
+    {
+     "t": 135.90599402375474,
+     "nonbig_on_big": 0,
+     "big_air": 22,
+     "moves": 5
+    },
+    {
+     "t": 157.65340845744575,
+     "nonbig_on_big": 0,
+     "big_air": 22,
+     "moves": 7
+    }
+   ]
+  }
+ ],
+ "wall_s": 0.01081043399972259
+}

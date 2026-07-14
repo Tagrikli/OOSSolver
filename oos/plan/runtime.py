@@ -59,7 +59,10 @@ class GatedEngine(SimEngine):
 
     def _find_pending_store(self):
         for t in self.queue.pending:
-            if isinstance(t, Store):
+            # Skip in-service tasks (V3.1 serve dwell) — this override
+            # predates the dwell and silently dropped the check, letting
+            # EVERY staged lift start serving the same store at once.
+            if isinstance(t, Store) and id(t) not in self._serving_tasks:
                 if (self.store_serve_gate is None
                         or self.store_serve_gate(t.size)):
                     return t
@@ -254,7 +257,22 @@ class SolverRuntime:
                 had_work = work_now
                 probation_until = None
             elif engine.state.time - last_alive_t > stuck_gap_s:
-                if ex.n_inflight == 0 and solver.overload_quiescent():
+                if any(cs.is_busy for cs in engine.state.carriers.values()):
+                    # A serve dwell (or any commanded motion) is in
+                    # progress — an active customer interaction is not a
+                    # wedge, but it completes no *move*, so the move-based
+                    # clock above never saw it (tiny month day 22: the
+                    # verdict fired at the very instant a store's entry
+                    # dwell began).
+                    last_alive_t = engine.state.time
+                elif engine.retry_serves():
+                    # Gates are time-varying: a store refused at its
+                    # arrival event may be serveable now, and in a quiet
+                    # stretch no event re-asks. Retry before escalating —
+                    # service, not a stuck verdict, is the answer to a
+                    # lull.
+                    last_alive_t = engine.state.time
+                elif ex.n_inflight == 0 and solver.overload_quiescent():
                     # Facility legitimately full: queued stores can't be
                     # served until a retrieve frees an empty. Idle-wait.
                     last_alive_t = engine.state.time
@@ -303,6 +321,11 @@ class SolverRuntime:
                         if ex.n_inflight > 0 or \
                                 engine.scheduler.peek_time() is not None:
                             continue
+                        if not solver.work_pending():
+                            # The dropped plan WAS the only "work" (e.g. a
+                            # diverged groom plan at rest): its cleanup left
+                            # a legitimate rest state, not a wedge.
+                            break
                     res.stuck = True
                     res.stuck_dump = "no events, no startable move:\n" \
                         + solver.dump_state()
@@ -479,6 +502,21 @@ class SolverRuntime:
             initial_depth=pallet_depth(self.engine.state, pallet_id),
             already_staged=False,
         ))
+        self.engine.wake_waiting_carriers()
+
+    def request_evict(self, pallet_id: int) -> None:
+        """Queue an Evict service op (SOLUTION_V3_1 §2)."""
+        from oos.sim.tasks import Evict
+        self.engine.queue.add(Evict(
+            arrived_at=self.engine.state.time, pallet=pallet_id))
+        self.engine.wake_waiting_carriers()
+
+    def request_place(self, pallet_id: int, shelf: str) -> None:
+        """Queue a Place service op (SOLUTION_V3_1 §2)."""
+        from oos.sim.tasks import Place
+        self.engine.queue.add(Place(
+            arrived_at=self.engine.state.time, pallet=pallet_id,
+            shelf=shelf))
         self.engine.wake_waiting_carriers()
 
     def deepest_car(self, shelf_id: Optional[str] = None,

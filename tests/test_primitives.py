@@ -40,6 +40,21 @@ def _run_to_idle(engine: SimEngine, carrier: str) -> None:
     raise AssertionError(f"{carrier} never went idle")
 
 
+def _drain_serves(engine: SimEngine) -> list:
+    """V3.1: a serve occupies the lift for the facility's customer dwell —
+    advance the scheduler until every running interaction completes, and
+    return the completions it produced (they surface in AdvanceResults, not
+    `_pending_completions`, once a dwell is involved)."""
+    comps = list(engine._pending_completions)
+    engine._pending_completions.clear()
+    for _ in range(200):
+        if not any(cs.is_busy for cs in engine.state.carriers.values()):
+            break
+        res = engine.advance()
+        comps.extend(res.completions)
+    return comps
+
+
 # ---------------------------------------------------------------------------
 # 1. Canonical enumeration order
 # ---------------------------------------------------------------------------
@@ -165,13 +180,17 @@ def test_arrival_serves_store_into_held_empty():
     cs.load = Pallet(id=7, contents="empty")
     cs.docked_at = DockRef("room", room)   # carrier idle at the room, empty
 
-    # A car is queued while the carrier sits there → loaded immediately, no WAIT
-    # (enqueue_store scans rooms for a ready serve).
+    # A car is queued while the carrier sits there → the serve starts
+    # immediately, no WAIT (enqueue_store scans rooms for a ready serve).
+    # V3.1: the customer takes `serve_entry_s` to drive in and park — the
+    # lift is busy for the dwell and the pallet loads at serve completion.
     engine.enqueue_store("small")
 
+    assert cs.is_busy   # entry dwell running
+    comps = _drain_serves(engine)
     assert cs.load is not None and cs.load.contents == "small"
     assert not any(isinstance(t, Store) for t in engine.queue.pending)
-    assert any(isinstance(c.task, Store) for c in engine._pending_completions)
+    assert any(isinstance(c.task, Store) for c in comps)
 
 
 def test_camped_retrieve_is_not_an_agent_delivery():
@@ -186,10 +205,11 @@ def test_camped_retrieve_is_not_an_agent_delivery():
     cs.docked_at = DockRef("room", room)
     cs.load = Pallet(id=55, contents="big")   # a stored car camped at the room
 
-    # Requesting the car while it already sits at the room serves it at once,
-    # tagged not-agent-delivered (camped) → no DELIVER.
+    # Requesting the car while it already sits at the room serves it at once
+    # (the serve starts immediately; the customer drives out over the V3.1
+    # exit dwell), tagged not-agent-delivered (camped) → no DELIVER.
     assert engine.toggle_retrieve_for_pallet(55) is True
-    comps = [c for c in engine._pending_completions if isinstance(c.task, Retrieve)]
+    comps = [c for c in _drain_serves(engine) if isinstance(c.task, Retrieve)]
     assert comps and comps[0].agent_delivered is False
     assert cs.load is not None and cs.load.is_empty   # car handed to the customer
     # A target NOT sitting at a room (e.g. on a shelf) is a real delivery.
@@ -210,14 +230,15 @@ def test_arrival_serves_retrieve_from_held_target():
         already_staged=engine._target_already_staged(99),   # False: not at a room
     ))
 
-    # Carrier arrives at the room → arrival-triggered serve fires.
+    # Carrier arrives at the room → arrival-triggered serve fires (V3.1: the
+    # customer drives out over the exit dwell; outcome at serve completion).
     cs.docked_at = DockRef("room", room)
     assert engine._serve_ready_rooms(engine._pending_completions)
 
+    comps = [c for c in _drain_serves(engine) if isinstance(c.task, Retrieve)]
     # The target is consumed; an empty pallet is left on the carrier.
     assert cs.load is not None and cs.load.is_empty and cs.load.id == 99
     assert not any(isinstance(t, Retrieve) for t in engine.queue.pending)
-    comps = [c for c in engine._pending_completions if isinstance(c.task, Retrieve)]
     assert comps and comps[0].agent_delivered
 
 

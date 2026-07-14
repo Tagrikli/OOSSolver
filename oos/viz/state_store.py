@@ -26,6 +26,7 @@ class ViewState:
     random_room: bool = False        # stores land on a random staged room
     fullness: float = 0.5
     zoom: float = 1.0
+    serve_dwell: float = 45.0        # customer entering/leaving seconds
 
 
 def _path(state_dir: str) -> str:
@@ -67,6 +68,7 @@ def load_view_state(state_dir: str = ".") -> ViewState:
         fullness = data["randomize"].get("fullness")
     st.fullness = _clamp(fullness, 0.5, 0.0, 1.0)
     st.zoom = _clamp(data.get("zoom"), 1.0, 0.4, 8.0)
+    st.serve_dwell = _clamp(data.get("serve_dwell"), 45.0, 0.0, 300.0)
     return st
 
 

@@ -1,0 +1,77 @@
+{
+ "rows": [
+  {
+   "dwell": 0.0,
+   "seed": 0,
+   "served": 20,
+   "elapsed": 545.1949379392124,
+   "intake_per_h": 132.06285493433504,
+   "stuck": false
+  },
+  {
+   "dwell": 0.0,
+   "seed": 1,
+   "served": 20,
+   "elapsed": 545.1949379392124,
+   "intake_per_h": 132.06285493433504,
+   "stuck": false
+  },
+  {
+   "dwell": 0.0,
+   "seed": 2,
+   "served": 20,
+   "elapsed": 545.1949379392124,
+   "intake_per_h": 132.06285493433504,
+   "stuck": false
+  },
+  {
+   "dwell": 45.0,
+   "seed": 0,
+   "served": 20,
+   "elapsed": 974.7612834677623,
+   "intake_per_h": 73.8642385793744,
+   "stuck": false
+  },
+  {
+   "dwell": 45.0,
+   "seed": 1,
+   "served": 20,
+   "elapsed": 974.7612834677623,
+   "intake_per_h": 73.8642385793744,
+   "stuck": false
+  },
+  {
+   "dwell": 45.0,
+   "seed": 2,
+   "served": 20,
+   "elapsed": 974.7612834677623,
+   "intake_per_h": 73.8642385793744,
+   "stuck": false
+  },
+  {
+   "dwell": 90.0,
+   "seed": 0,
+   "served": 20,
+   "elapsed": 1497.4723602386964,
+   "intake_per_h": 48.08102100029628,
+   "stuck": false
+  },
+  {
+   "dwell": 90.0,
+   "seed": 1,
+   "served": 20,
+   "elapsed": 1497.4723602386964,
+   "intake_per_h": 48.08102100029628,
+   "stuck": false
+  },
+  {
+   "dwell": 90.0,
+   "seed": 2,
+   "served": 20,
+   "elapsed": 1497.4723602386964,
+   "intake_per_h": 48.08102100029628,
+   "stuck": false
+  }
+ ],
+ "wall_s": 0.26031447499917704
+}

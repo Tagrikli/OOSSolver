@@ -75,6 +75,10 @@ class Intent:
     # Landing intents that return a held blocker to the dig shelf must wait
     # until the target has been popped off it (else they would re-bury it).
     requires_target_off: bool = False
+    # The intent that takes the TARGET off the dig shelf: the retrieve/stage
+    # "deliver", or the evict/place "relocate" (V3.1). Landing readiness
+    # (`requires_target_off`) keys on this flag, not on the intent kind.
+    target_exit: bool = False
     status: str = "pending"          # "pending" | "running" | "done"
 
 
@@ -89,7 +93,8 @@ class Plan:
     reserved_slots: dict[str, int]   # shelf -> pending real-air commitments
     est_cost: float
     created_at: float = 0.0
-    kind: str = "retrieve"           # "retrieve" | "store" | "stage"
+    # "retrieve" | "store" | "stage" | "evict" | "place" (V3.1 §2)
+    kind: str = "retrieve"
 
     @property
     def done(self) -> bool:
@@ -126,6 +131,10 @@ TOP_EMPTY = 1e3     # buries a top empty (mild when plentiful)
 TOP_EMPTY_LAST = 3e6  # buries one of the LAST stageable empties — the
 #                       staging pipeline dies with it; outranks depth-k
 POLLUTE_BIG = 300.0  # a small car onto a scarce big shelf
+EV_SHELF = 250.0    # any scored placement onto a charger (EV) shelf — keep
+#                     charger slots free for charge work while a non-EV
+#                     alternative exists (SOLUTION_V3_1 §2.3). Explicit
+#                     Place destinations are fixed, not scored: no penalty.
 EMPTY_ON_BIG = 100.0  # an empty onto a big shelf when small air exists
 BURY_PROTECTED = 5e6  # bury a protected (head-window) request one deeper —
 #                       last resort when refusing would make planning
@@ -135,6 +144,9 @@ RESERVE_BIG = 8e6   # non-big placement would starve the dig's big-air need
 #                     — plan-FATAL, so it outranks every soft cost including
 #                     TOP_EMPTY_LAST (a buried empty is one uncover move;
 #                     starved big air kills the dig outright)
+
+
+PROJECT_INFLIGHT_HANDS = True   # bisect flag
 
 
 class PlanSim:
@@ -176,6 +188,39 @@ class PlanSim:
                   else None)
             for cid, cs in engine.state.carriers.items()
         }
+        # Project in-flight ROOM-destination tails onto the hands model
+        # (V3.1): a plan built while a stage/delivery move rides sees the
+        # lift empty-handed, but at rest it will HOLD the (staged) empty —
+        # the committed plan then has no park intent for it, its chains
+        # block, and only the 120 s stall watchdog un-wedges it (observed:
+        # place plan racing an in-flight stage). Only this direction is
+        # projected: it is the one case where empty hands become LOADED.
+        # Everything else ends empty-handed, and live reads are then merely
+        # conservative — a BLANKET projection (chain members → None, hold
+        # tails → loaded) measurably degraded the day-cycle drain (gate 6
+        # day-1 leftover=107) by letting planners commit chains through
+        # still-busy carriers on inconsistent models.
+        if PROJECT_INFLIGHT_HANDS:
+            for ms in ex.inflight:
+                mv = ms.move
+                if mv.dst_kind == "room":
+                    self.hands[mv.chain[-1]] = (mv.pallet_id, "empty")
+            # A lift mid-SERVE-DWELL is not running a move, so the loop
+            # above cannot see it — but its load is COMMITTED to change:
+            # an entry dwell turns the staged empty into the customer's
+            # car, an exit dwell turns the delivered car into an empty.
+            # Planning against the pre-dwell contents emits impossible
+            # intents (observed: park_empty for a pallet that finished
+            # its dwell as a car; the cleanup wedged permanently).
+            from oos.sim.facility import _ServeInteraction
+            for cid, cs in engine.state.carriers.items():
+                cmd = cs.current_command
+                if isinstance(cmd, _ServeInteraction) and cs.load is not None:
+                    if cmd.kind == "store":
+                        self.hands[cid] = (cs.load.id,
+                                           getattr(cmd.task, "size", "small"))
+                    else:
+                        self.hands[cid] = (cs.load.id, "empty")
         self.dig = dig_shelf
         # Small-shelf slots reserved as EXTRACTION FUEL for held SUVs whose
         # storage must create big air (set from the planner's ambient
@@ -202,6 +247,43 @@ class PlanSim:
         # Holds this plan's EXTRACTIONS parked on spare hands (pid → cid);
         # merged into the plan's holders so the carriers stay reserved.
         self.extraction_holds: dict[int, str] = {}
+        # Virtual SCHEDULE ledgers (V3.1 §4): per-carrier ready times and
+        # per-shelf op-completion times, advanced with every emission. The
+        # plan's est_cost is the schedule MAKESPAN (critical path) plus the
+        # flat structural surcharges — a plan whose carriers overlap beats
+        # the same moves executed one-after-another, and the destination
+        # pickers penalize chains that would idle waiting for a carrier
+        # this plan still has to unload.
+        self.t_carrier: dict[str, float] = {
+            cid: 0.0 for cid in engine.state.carriers}
+        self.t_shelf: dict[str, float] = {}
+        self.makespan: float = 0.0
+
+    def schedule(self, chain, dur: float,
+                 src_shelf: Optional[str] = None,
+                 dst_shelf: Optional[str] = None) -> float:
+        """Virtually run one emission: it starts when every chain carrier
+        and both touched shelves are ready, and occupies them for `dur`.
+        Returns the start time (== the wait this emission would incur)."""
+        start = 0.0
+        for c in chain:
+            start = max(start, self.t_carrier.get(c, 0.0))
+        for s in (src_shelf, dst_shelf):
+            if s is not None:
+                start = max(start, self.t_shelf.get(s, 0.0))
+        end = start + dur
+        for c in chain:
+            self.t_carrier[c] = end
+        for s in (src_shelf, dst_shelf):
+            if s is not None:
+                self.t_shelf[s] = end
+        self.makespan = max(self.makespan, end)
+        return start
+
+    def chain_ready(self, chain) -> float:
+        """When the last member of `chain` frees up on the virtual schedule
+        — the wait-aware term the destination pickers score with."""
+        return max((self.t_carrier.get(c, 0.0) for c in chain), default=0.0)
 
     def snapshot(self) -> tuple:
         """Cheap copy of every field the planner mutates — lets a caller
@@ -209,11 +291,13 @@ class PlanSim:
         return ({s: list(st) for s, st in self.stacks.items()},
                 dict(self.air), set(self.placed), dict(self.hands),
                 len(self.intents), dict(self.seq), self.x_air,
-                dict(self.extraction_holds))
+                dict(self.extraction_holds),
+                dict(self.t_carrier), dict(self.t_shelf), self.makespan)
 
     def restore(self, snap: tuple) -> None:
         (self.stacks, self.air, self.placed, self.hands,
-         n_intents, self.seq, self.x_air, self.extraction_holds) = snap
+         n_intents, self.seq, self.x_air, self.extraction_holds,
+         self.t_carrier, self.t_shelf, self.makespan) = snap
         del self.intents[n_intents:]      # truncate in place (shared ref)
 
     def push(self, sid: str, pid: int, contents: str,
@@ -255,6 +339,10 @@ class RetrievalPlanner:
         self.shelf_ids = list(self.topo.shelves.keys())
         self.is_big_shelf = {
             sid: self.topo.shelves[sid].size_class == "big"
+            for sid in self.shelf_ids
+        }
+        self.is_ev_shelf = {
+            sid: getattr(self.topo.shelves[sid], "is_ev", False)
             for sid in self.shelf_ids
         }
         self.big_shelf_ids = [s for s in self.shelf_ids if self.is_big_shelf[s]]
@@ -372,8 +460,9 @@ class RetrievalPlanner:
                         kind="dispose", pallet_id=load.id,
                         contents=load.contents, dst_kind="carrier",
                         dst_id=src))
-                    cost += self._est(("carrier", holder),
-                                      ("carrier", src), holder) + 10.0
+                    self._sched(sim, ("carrier", holder),
+                                ("carrier", src), holder)
+                    cost += 10.0
                 h_load = state.carriers[helper].load
                 if helper != holder and h_load is not None:
                     if not h_load.is_empty or h_load.id in owned_pallets:
@@ -389,8 +478,9 @@ class RetrievalPlanner:
                         kind="park_empty", pallet_id=h_load.id,
                         contents="empty", dst_kind="shelf", dst_id=e_dst,
                         dst_seq=dq))
-                    cost += self._est(("carrier", helper), ("shelf", e_dst),
-                                      helper) + 20.0
+                    self._sched(sim, ("carrier", helper),
+                                ("shelf", e_dst), helper)
+                    cost += 20.0
                 # The best-scored placement can fail the END-STATE oracle
                 # check while an alternative passes (where the car lands —
                 # and where its extraction dumped the non-big — changes
@@ -433,8 +523,8 @@ class RetrievalPlanner:
                         kind="store_car", pallet_id=load.id,
                         contents=load.contents, dst_kind="shelf",
                         dst_id=s_dst, dst_seq=dq))
-                    cost_try += self._est(("carrier", src),
-                                          ("shelf", s_dst), src)
+                    self._sched(sim, ("carrier", src),
+                                ("shelf", s_dst), src)
                     plan = self._finish(sim, engine, load.id,
                                         serving[helper], helper, None,
                                         dict(sim.extraction_holds), cost_try,
@@ -493,6 +583,132 @@ class RetrievalPlanner:
         return best
 
     # ------------------------------------------------------------------
+    # Evict / Place — charger-shelf service ops (SOLUTION_V3_1 §2)
+    # ------------------------------------------------------------------
+
+    def _anchor_candidates(self, loc, reserved_carriers: set[str]
+                           ) -> list[str]:
+        """Anchor carriers to try for a shelf-destination plan: the anchor
+        is exempted from the volatile set and reserved by the plan (it
+        plays the role the delivery lift plays in a retrieve). First the
+        target's own carrier (no lift threading needed), then every free
+        serving lift — a cross-region exit chain must run through one."""
+        ex = self.ex
+        own = loc[1] if loc[0] == "carrier" else ex.shelf_carrier(loc[1])
+        serving = {self.topo.rooms[rid].served_by
+                   for rid in sorted(self.topo.rooms)}
+        out = [own]
+        for c in sorted(serving):
+            if c == own or c in reserved_carriers or ex.is_claimed(c):
+                continue
+            out.append(c)
+        return out
+
+    def plan_evict(
+        self,
+        engine: SimEngine,
+        target: int,
+        requested: set[int],
+        *,
+        reserved_carriers: set[str],
+        locked_shelves: set[str],
+        reserved_slots: dict[str, int],
+        owned_pallets: set[int],
+        dest_exclude: Optional[set[str]] = None,
+    ) -> Optional[Plan]:
+        """Dig `target` free and store it at the best scored ordinary
+        placement — no room involved (SOLUTION_V3_1 §2.2). `dest_exclude`
+        restricts the landing (the groom rung passes the big shelves to
+        force a declutter onto small air)."""
+        loc = self._locate(engine, target)
+        if loc is None or target in owned_pallets:
+            return None
+        best: Optional[Plan] = None
+        for anchor in self._anchor_candidates(loc, reserved_carriers):
+            plan = None
+            for cars_first in (False, True):
+                plan = self._build(
+                    engine, target, requested, anchor, "", loc,
+                    reserved_carriers=reserved_carriers,
+                    locked_shelves=locked_shelves,
+                    reserved_slots=reserved_slots,
+                    owned_pallets=set(owned_pallets),
+                    cars_first=cars_first,
+                    dest_any=True, dest_exclude=dest_exclude,
+                )
+                if plan is not None:
+                    break
+            if plan is None:
+                continue
+            plan.kind = "evict"
+            if best is None or plan.est_cost < best.est_cost:
+                best = plan
+        return best
+
+    def plan_place(
+        self,
+        engine: SimEngine,
+        target: int,
+        dst_shelf: str,
+        requested: set[int],
+        *,
+        reserved_carriers: set[str],
+        locked_shelves: set[str],
+        reserved_slots: dict[str, int],
+        owned_pallets: set[int],
+    ) -> Optional[Plan]:
+        """Dig `target` free and land it on top of `dst_shelf`, touching
+        nothing already on that shelf (SOLUTION_V3_1 §2.2). Fails fast —
+        returns None — when the destination has no free slot net of
+        reservations; evicting from it first is the issuing policy's job."""
+        if dst_shelf not in self.topo.shelves:
+            return None
+        loc = self._locate(engine, target)
+        if loc is None or target in owned_pallets:
+            return None
+        if loc[0] == "shelf" and loc[1] == dst_shelf:
+            # Already on the destination: the contract is satisfied as-is
+            # (the charger serves any slot — no position requirement).
+            return Plan(target=target, room="",
+                        lift=self.ex.shelf_carrier(dst_shelf),
+                        dig_shelf=None, intents=[], holders={},
+                        reserved_slots={}, est_cost=0.0,
+                        created_at=engine.state.time, kind="place")
+        contents = (engine.state.shelves[loc[1]].stack[loc[2]].contents
+                    if loc[0] == "shelf"
+                    else engine.state.carriers[loc[1]].load.contents)
+        shelf = self.topo.shelves[dst_shelf]
+        if not shelf.accepts(None if contents == "empty" else contents):
+            return None
+        air = (shelf.capacity - len(engine.state.shelves[dst_shelf].stack)
+               - reserved_slots.get(dst_shelf, 0))
+        if dst_shelf in self.ex.dst_locked:
+            air -= 1
+        if dst_shelf in locked_shelves or air < 1:
+            return None   # destination full / spoken for: no solution
+        best: Optional[Plan] = None
+        for anchor in self._anchor_candidates(loc, reserved_carriers):
+            plan = None
+            for cars_first in (False, True):
+                plan = self._build(
+                    engine, target, requested, anchor, "", loc,
+                    reserved_carriers=reserved_carriers,
+                    locked_shelves=locked_shelves,
+                    reserved_slots=reserved_slots,
+                    owned_pallets=set(owned_pallets),
+                    cars_first=cars_first,
+                    dest_shelf=dst_shelf,
+                )
+                if plan is not None:
+                    break
+            if plan is None:
+                continue
+            plan.kind = "place"
+            if best is None or plan.est_cost < best.est_cost:
+                best = plan
+        return best
+
+    # ------------------------------------------------------------------
 
     def _locate(self, engine: SimEngine, target: int):
         """("shelf", sid, idx) | ("carrier", cid, -1) | None."""
@@ -540,7 +756,20 @@ class RetrievalPlanner:
         owned_pallets: set[int],
         cars_first: bool = False,
         allow_bury: bool = False,
+        dest_shelf: Optional[str] = None,
+        dest_any: bool = False,
+        dest_exclude: Optional[set[str]] = None,
     ) -> Optional[Plan]:
+        """Build one plan candidate. Three destination modes (V3.1):
+
+        - default: deliver the target to `room` via `lift` (retrieve/stage);
+        - `dest_shelf=T`: relocate the target onto shelf T ("place") — T's
+          occupants are untouchable (T is sim-locked: never popped, never a
+          scored destination, never hop space); `lift` is the ANCHOR carrier
+          this plan may thread through (exempt from volatile), `room` is "".
+        - `dest_any=True`: relocate the target to the best scored shelf
+          ("evict"), optionally excluding `dest_exclude` shelves.
+        """
         ex = self.ex
         state = engine.state
         # NOTE: a delivery lift holding a CAR is fine — the mandatory-path
@@ -562,58 +791,86 @@ class RetrievalPlanner:
             hold_load = state.carriers[holder].load
             if hold_load is None:
                 return None
-            chain = ex.chain_between(holder, lift)
+            if dest_shelf is not None:
+                chain = ex.chain_between(holder, ex.shelf_carrier(dest_shelf))
+            elif dest_any:
+                chain = (holder,)   # destination picked below; chain varies
+            else:
+                chain = ex.chain_between(holder, lift)
             avoid = (set(reserved_carriers) | volatile) - {holder, lift}
             if chain is None or not self._chain_ok(chain, avoid):
                 return None
-            sim = PlanSim(self, engine, reserved_slots, locked_shelves, None)
+            place_locked = (locked_shelves | {dest_shelf}
+                            if dest_shelf is not None else locked_shelves)
+            sim = PlanSim(self, engine, reserved_slots, place_locked, None)
             sim.volatile = volatile
             sim.reserved = set(reserved_carriers)
             sim.allow_bury = allow_bury
             cost = 30.0 * (len(chain) - 1)
             members = [c for c in dict.fromkeys(chain)
-                       if c != holder and state.carriers[c].load is not None]
+                       if c != holder and sim.hands.get(c) is not None]
             members.sort(key=lambda c: (
-                state.carriers[c].load.is_empty if cars_first
-                else not state.carriers[c].load.is_empty))
+                sim.hands[c][1] == "empty" if cars_first
+                else sim.hands[c][1] != "empty"))
             for c in members:
-                load = state.carriers[c].load
-                if load.id in owned_pallets:
+                m_pid, m_contents = sim.hands[c]
+                if m_pid in owned_pallets:
                     return None
-                if load.is_empty:
+                if m_contents == "empty":
                     e_dst = self._pick_empty_dst(sim, c, requested,
                                                  avoid=avoid, exclude=set())
                     if e_dst is None:
                         return None
-                    dq = sim.push(e_dst, load.id, "empty")
+                    dq = sim.push(e_dst, m_pid, "empty")
                     sim.hands[c] = None
                     sim.intents.append(Intent(
-                        kind="park_empty", pallet_id=load.id,
+                        kind="park_empty", pallet_id=m_pid,
                         contents="empty", dst_kind="shelf", dst_id=e_dst,
                         dst_seq=dq))
-                    cost += self._est(("carrier", c), ("shelf", e_dst),
-                                      c) + 20.0
+                    self._sched(sim, ("carrier", c), ("shelf", e_dst), c)
+                    cost += 20.0
                 else:
                     s_dst = self._pick_blocker_dst(
-                        sim, load.contents, requested, "__no_dig__", c,
+                        sim, m_contents, requested, "__no_dig__", c,
                         src_holder=c)
                     if s_dst is None:
                         return None
-                    dq = sim.push(s_dst, load.id, load.contents)
+                    dq = sim.push(s_dst, m_pid, m_contents)
                     sim.hands[c] = None
                     sim.intents.append(Intent(
-                        kind="store_car", pallet_id=load.id,
-                        contents=load.contents, dst_kind="shelf",
+                        kind="store_car", pallet_id=m_pid,
+                        contents=m_contents, dst_kind="shelf",
                         dst_id=s_dst, dst_seq=dq))
-                    cost += self._est(("carrier", c), ("shelf", s_dst),
-                                      c) + 20.0
+                    self._sched(sim, ("carrier", c), ("shelf", s_dst), c)
+                    cost += 20.0
+            if dest_shelf is not None or dest_any:
+                if dest_any:
+                    t_dst = self._pick_blocker_dst(
+                        sim, hold_load.contents, requested, "__no_dig__",
+                        holder, exclude=dest_exclude, src_holder=holder)
+                else:
+                    t_dst = dest_shelf
+                if t_dst is None:
+                    return None
+                dq = sim.push(t_dst, target, hold_load.contents)
+                sim.hands[holder] = None
+                sim.intents.append(Intent(
+                    kind="relocate", pallet_id=target,
+                    contents=hold_load.contents, dst_kind="shelf",
+                    dst_id=t_dst, dst_seq=dq, target_exit=True))
+                self._sched(sim, ("carrier", holder), ("shelf", t_dst),
+                            holder)
+                return self._finish(sim, engine, target, room, lift, None,
+                                    {}, cost, reserved_slots)
             sim.hands[holder] = None
             sim.hands[lift] = (target, "empty")
             sim.intents.append(Intent(
                 kind="deliver", pallet_id=target, contents=hold_load.contents,
-                dst_kind="room", dst_id=room))
-            cost += self._est(("carrier", holder), ("room", room), holder,
-                              via_lift=lift)
+                dst_kind="room", dst_id=room, target_exit=True))
+            self._sched(sim, ("carrier", holder), ("room", room), holder,
+                        via_lift=lift,
+                        extra_dur=(self.ex.engine.serve_exit_s
+                                   if hold_load.contents != "empty" else 0.0))
             plan = self._finish(sim, engine, target, room, lift, None, {},
                                 cost, reserved_slots)
             return plan
@@ -625,7 +882,25 @@ class RetrievalPlanner:
         xc = ex.shelf_carrier(X)
         if xc in reserved_carriers:
             return None      # dig carrier owned by another plan — wait
-        deliver_chain0 = ex.chain_between(xc, lift)
+        if dest_shelf is not None or dest_any:
+            # Shelf-destination modes: the dig carrier is plan-reserved for
+            # the whole run (reserved_carriers() includes it), so even when
+            # it is a serving lift the stage rung cannot load it — it is
+            # OURS, not volatile. (Room mode keeps the stricter candidate
+            # structure: the dig lift must BE the delivery lift.)
+            volatile = volatile - {xc}
+        if dest_shelf is not None:
+            # Place: the exit leg runs to the destination's carrier.
+            deliver_chain0 = ex.chain_between(xc, ex.shelf_carrier(dest_shelf))
+        elif dest_any:
+            # Evict: the exit destination is picked during the dig, but the
+            # corridor to the ANCHOR is opened up front (its loaded members
+            # get park/store intents below) — the anchor candidate exists
+            # precisely to make cross-region air reachable, which it only
+            # is once the carriers on the way have free hands.
+            deliver_chain0 = ex.chain_between(xc, lift)
+        else:
+            deliver_chain0 = ex.chain_between(xc, lift)
         if deliver_chain0 is None:
             return None
         # The delivery chain must be OURS end to end: intermediates that are
@@ -640,13 +915,30 @@ class RetrievalPlanner:
         essential = set(deliver_chain0) | {xc, lift}
         avoid_chain = (set(reserved_carriers) | volatile) - essential
 
-        sim = PlanSim(self, engine, reserved_slots, locked_shelves, X)
+        # Place: the destination shelf is sim-LOCKED — never popped, never a
+        # scored destination, never extraction hop space. Its occupants are
+        # untouchable by contract (SOLUTION_V3_1 §2.2); only the forced final
+        # relocation pushes onto it.
+        sim_locked = (locked_shelves | {dest_shelf}
+                      if dest_shelf is not None else locked_shelves)
+        sim = PlanSim(self, engine, reserved_slots, sim_locked, X)
         sim.volatile = volatile
         sim.reserved = set(reserved_carriers)
         sim.allow_bury = allow_bury
+        # An evicted big target needs one big-air slot for its own landing
+        # on top of whatever its big blockers need (a placed target's slot
+        # is already secured on the destination).
+        tgt_contents = (state.shelves[X].stack[idx].contents
+                        if loc[0] == "shelf" else "")
+        extra_big_need = 1 if (dest_any and tgt_contents == "big") else 0
 
         # Holder pool: unclaimed, empty-handed, not reserved, not essential,
         # with a usable chain from the dig carrier. Deterministic order.
+        # Routing is AVOID-AWARE (V3.1): the canonical shortest path may
+        # cross a volatile/reserved lift while a clean alternative exists
+        # one handoff over (observed: S1→S2 canonically via L1; L1
+        # volatile; the L2 route was free — every hold rejected and the
+        # dig unplannable).
         holders_avail: list[str] = []
         for cid in sorted(self.topo.carriers):
             if cid in essential or cid in reserved_carriers:
@@ -654,8 +946,8 @@ class RetrievalPlanner:
             cs = state.carriers[cid]
             if ex.is_claimed(cid) or cs.load is not None:
                 continue
-            ch = ex.chain_between(xc, cid)
-            if ch is None or not self._chain_ok(ch, avoid_chain - {cid}):
+            ch = ex.chain_avoiding(xc, cid, avoid_chain - {cid})
+            if ch is None:
                 continue
             holders_avail.append(cid)
         # Prefer holders whose LAND chain back to the dig shelf is short —
@@ -667,7 +959,17 @@ class RetrievalPlanner:
         holders: dict[int, str] = {}
         held_blockers: list[tuple[int, str, bool]] = []
         cost = 30.0 * (len(deliver_chain0) - 1)   # rendezvous overhead
-        sim.big_need = self._bigs_above_target(sim, X, target)
+        sim.big_need = (extra_big_need if dest_any else
+                        self._bigs_above_target(sim, X, target)
+                        + extra_big_need)
+        if dest_any:
+            sim.x_air = 0    # no extraction hops onto the dig shelf: the
+            #                  restore pass must only see TRUE blockers
+        # RESTORE ledger for dest_any (V3.1 §2 revision: an evict must
+        # leave its shelf unchanged apart from the removed car): every
+        # blocker is HELD or temp-hopped, then pushed back in reverse pop
+        # order once the target is out. (pid, contents, "hold" | temp sid)
+        dug: list[tuple[int, str, str]] = []
 
         def take_hold(pid: int, contents: str, is_req: bool) -> bool:
             nonlocal cost
@@ -677,8 +979,8 @@ class RetrievalPlanner:
             avoid_chain.add(holder)
             holders_avail[:] = [
                 h for h in holders_avail
-                if self._chain_ok(ex.chain_between(xc, h),
-                                  avoid_chain - {xc, h})
+                if ex.chain_avoiding(xc, h, avoid_chain - {xc, h})
+                is not None
             ]
             holders[pid] = holder
             held_blockers.append((pid, contents, is_req))
@@ -688,7 +990,7 @@ class RetrievalPlanner:
                 kind="dispose", pallet_id=pid, contents=contents,
                 dst_kind="carrier", dst_id=holder, src_shelf=X,
                 src_seq=sq))
-            cost += self._est(("shelf", X), ("carrier", holder), xc)
+            self._sched(sim, ("shelf", X), ("carrier", holder), xc)
             return True
 
         # 1. Free the hands of every carrier on the mandatory path — the
@@ -696,49 +998,50 @@ class RetrievalPlanner:
         #    is parked; a held CAR (e.g. an orphaned hold after a replan) is
         #    STORED to a scored placement — the plan is the only actor that
         #    can open the chains this needs, so it must absorb the job.
-        mandatory = [c for c in dict.fromkeys(deliver_chain0)
-                     if state.carriers[c].load is not None]
+        mandatory = [c for c in dict.fromkeys(deliver_chain0 + (lift,))
+                     if sim.hands.get(c) is not None]
         # Freeing order is state-dependent (an empty may need a chain a
         # held car blocks, and vice versa; one member's route may go
         # THROUGH another member's hands): iterate to a fixed point,
         # deferring members whose route is momentarily blocked. The caller
         # additionally tries both class orders.
         mandatory.sort(key=lambda c: (
-            state.carriers[c].load.is_empty if cars_first
-            else not state.carriers[c].load.is_empty))
+            sim.hands[c][1] == "empty" if cars_first
+            else sim.hands[c][1] != "empty"))
 
         def _free_member(c: str) -> bool:
             nonlocal cost
-            load = state.carriers[c].load
-            if load.is_empty:
+            m_pid, m_contents = sim.hands[c]
+            if m_contents == "empty":
                 e_dst = self._pick_empty_dst(sim, c, requested,
                                              avoid=avoid_chain, exclude={X})
                 if e_dst is None:
                     return False
-                dq = sim.push(e_dst, load.id, "empty")
+                dq = sim.push(e_dst, m_pid, "empty")
                 sim.hands[c] = None
                 sim.intents.append(Intent(
-                    kind="park_empty", pallet_id=load.id, contents="empty",
+                    kind="park_empty", pallet_id=m_pid, contents="empty",
                     dst_kind="shelf", dst_id=e_dst, dst_seq=dq))
                 # est + a flat surcharge: un-staging an extra room (or tying
                 # up a relay) must lose ties against a direct-room plan.
-                cost += self._est(("carrier", c), ("shelf", e_dst), c) + 20.0
+                self._sched(sim, ("carrier", c), ("shelf", e_dst), c)
+                cost += 20.0
             else:
-                s_dst = self._pick_blocker_dst(sim, load.contents, requested,
+                s_dst = self._pick_blocker_dst(sim, m_contents, requested,
                                                X, c, src_holder=c)
                 if s_dst is None:
                     return False
-                dq = sim.push(s_dst, load.id, load.contents)
+                dq = sim.push(s_dst, m_pid, m_contents)
                 sim.hands[c] = None
                 sim.intents.append(Intent(
-                    kind="store_car", pallet_id=load.id,
-                    contents=load.contents, dst_kind="shelf", dst_id=s_dst,
+                    kind="store_car", pallet_id=m_pid,
+                    contents=m_contents, dst_kind="shelf", dst_id=s_dst,
                     dst_seq=dq))
-                cost += self._est(("carrier", c), ("shelf", s_dst), c) + 20.0
+                self._sched(sim, ("carrier", c), ("shelf", s_dst), c)
+                cost += 20.0
             return True
 
-        if any(state.carriers[c].load.id in owned_pallets
-               for c in mandatory):
+        if any(sim.hands[c][0] in owned_pallets for c in mandatory):
             return None       # another plan owns a member's pallet
         left = list(mandatory)
         for _ in range(len(mandatory) + 1):
@@ -760,7 +1063,10 @@ class RetrievalPlanner:
                        if self.is_big_shelf[s] and s != X)
 
         for _ in range(64):
-            if _big_air_other() >= self._bigs_above_target(sim, X, target):
+            eager_need = (extra_big_need if dest_any else
+                          self._bigs_above_target(sim, X, target)
+                          + extra_big_need)
+            if _big_air_other() >= eager_need:
                 break
             got = self._emit_extraction(sim, requested, X)
             if got is None:
@@ -776,8 +1082,40 @@ class RetrievalPlanner:
             if guard < 0:
                 return None
             pid, contents = sim.stacks[X][-1]
-            sim.big_need = self._bigs_above_target(sim, X, target)
+            sim.big_need = (extra_big_need if dest_any else
+                            self._bigs_above_target(sim, X, target)
+                            + extra_big_need)
             is_req = pid in requested
+            if dest_any:
+                # Evict restore-semantics: blockers never move permanently.
+                if take_hold(pid, contents, is_req):
+                    dug.append((pid, contents, "hold"))
+                    continue
+                t_dst = self._pick_blocker_dst(
+                    sim, contents, requested, X, xc,
+                    exclude={w for _, _, w in dug if w != "hold"})
+                if t_dst is None and contents == "big":
+                    for _ in range(8):
+                        got = self._emit_extraction(sim, requested, X)
+                        if got is None:
+                            break
+                        cost += got
+                        t_dst = self._pick_blocker_dst(
+                            sim, contents, requested, X, xc,
+                            exclude={w for _, _, w in dug if w != "hold"})
+                        if t_dst is not None:
+                            break
+                if t_dst is None:
+                    return None   # neither hand nor temp slot for a blocker
+                _, _, sq = sim.pop(X)
+                dq = sim.push(t_dst, pid, contents)
+                sim.intents.append(Intent(
+                    kind="extract_hop", pallet_id=pid, contents=contents,
+                    dst_kind="shelf", dst_id=t_dst, src_shelf=X,
+                    src_seq=sq, dst_seq=dq))
+                self._sched(sim, ("shelf", X), ("shelf", t_dst), xc)
+                dug.append((pid, contents, t_dst))
+                continue
             if is_req and take_hold(pid, contents, True):
                 continue     # requested blockers prefer a hold (redeliverable)
             dst = self._pick_blocker_dst(sim, contents, requested, X, xc)
@@ -791,7 +1129,8 @@ class RetrievalPlanner:
                 # own-air hops add new bigs to the dig stack.
                 progressed = False
                 for _ in range(64):
-                    above = self._bigs_above_target(sim, X, target)
+                    above = self._bigs_above_target(sim, X, target) \
+                        + extra_big_need
                     big_air_now = sum(
                         a for s, a in sim.air.items()
                         if self.is_big_shelf[s] and s != X)
@@ -815,19 +1154,60 @@ class RetrievalPlanner:
                 kind="dispose", pallet_id=pid, contents=contents,
                 dst_kind="shelf", dst_id=dst, src_shelf=X,
                 src_seq=sq, dst_seq=dq))
-            cost += self._est(("shelf", X), ("shelf", dst), xc)
+            self._sched(sim, ("shelf", X), ("shelf", dst), xc)
         if not sim.stacks[X] or sim.stacks[X][-1][0] != target:
             return None              # target vanished — cannot happen
 
-        # 3. Deliver the target (removes it from the system).
-        _, _, sq = sim.pop(X)
-        sim.hands[lift] = (target, "empty")
-        sim.intents.append(Intent(
-            kind="deliver", pallet_id=target,
-            contents=next(p.contents for p in state.shelves[X].stack
-                          if p.id == target),
-            dst_kind="room", dst_id=room, src_shelf=X, src_seq=sq))
-        cost += self._est(("shelf", X), ("room", room), xc, via_lift=lift)
+        # 3. Target exit — deliver it to the room (retrieve/stage: removes
+        #    it from the system) or relocate it to a shelf (evict/place).
+        if dest_shelf is not None or dest_any:
+            if dest_any:
+                temp_shelves = {w for _, _, w in dug if w != "hold"}
+                t_dst = self._pick_blocker_dst(
+                    sim, tgt_contents, requested, X, xc,
+                    exclude=(dest_exclude or set()) | temp_shelves)
+                if t_dst is None and tgt_contents == "big":
+                    # Grow the big air the target's own landing needs. The
+                    # dig is over: X's top IS the target now, so extraction
+                    # hops must not use X's own air (a hop onto X would bury
+                    # the target with nothing left to re-pop it).
+                    saved_x_air = sim.x_air
+                    sim.x_air = 0
+                    for _ in range(8):
+                        got = self._emit_extraction(sim, requested, X)
+                        if got is None:
+                            break
+                        cost += got
+                        t_dst = self._pick_blocker_dst(
+                            sim, tgt_contents, requested, X, xc,
+                            exclude=(dest_exclude or set()) | temp_shelves)
+                        if t_dst is not None:
+                            break
+                    sim.x_air = saved_x_air
+            else:
+                t_dst = dest_shelf
+            if t_dst is None:
+                return None
+            _, _, sq = sim.pop(X)
+            dq = sim.push(t_dst, target, tgt_contents)
+            sim.intents.append(Intent(
+                kind="relocate", pallet_id=target, contents=tgt_contents,
+                dst_kind="shelf", dst_id=t_dst, src_shelf=X,
+                src_seq=sq, dst_seq=dq, target_exit=True))
+            self._sched(sim, ("shelf", X), ("shelf", t_dst), xc)
+        else:
+            _, _, sq = sim.pop(X)
+            sim.hands[lift] = (target, "empty")
+            sim.intents.append(Intent(
+                kind="deliver", pallet_id=target,
+                contents=next(p.contents for p in state.shelves[X].stack
+                              if p.id == target),
+                dst_kind="room", dst_id=room, src_shelf=X, src_seq=sq,
+                target_exit=True))
+            self._sched(sim, ("shelf", X), ("room", room), xc,
+                        via_lift=lift,
+                        extra_dur=(self.ex.engine.serve_exit_s
+                                   if tgt_contents != "empty" else 0.0))
 
         # 4. Land the holds back onto the dig shelf (slots freed by the dig
         #    itself: pops always exceed landings by one). Each land chain is
@@ -836,7 +1216,31 @@ class RetrievalPlanner:
         #    `park_delivered`, another lift's staging empty via an extra
         #    `park_empty` — or the candidate fails (better a planning
         #    failure than a runtime stall).
-        if held_blockers:
+        if dest_any and dug:
+            # RESTORE: push every blocker back in reverse pop order — the
+            # shelf ends exactly as it began, minus the evicted car.
+            for pid, contents, where in reversed(dug):
+                if where == "hold":
+                    holder = holders[pid]
+                    dq = sim.push(X, pid, contents)
+                    sim.hands[holder] = None
+                    sim.intents.append(Intent(
+                        kind="land", pallet_id=pid, contents=contents,
+                        dst_kind="shelf", dst_id=X,
+                        requires_target_off=True, dst_seq=dq))
+                    self._sched(sim, ("carrier", holder), ("shelf", X),
+                                holder)
+                else:
+                    _, _, sq2 = sim.pop(where)
+                    dq = sim.push(X, pid, contents, mark_placed=False)
+                    sim.intents.append(Intent(
+                        kind="extract_return", pallet_id=pid,
+                        contents=contents, dst_kind="shelf", dst_id=X,
+                        src_shelf=where, src_seq=sq2, dst_seq=dq,
+                        requires_target_off=True))
+                    self._sched(sim, ("shelf", where), ("shelf", X),
+                                self.ex.shelf_carrier(where))
+        if held_blockers and not dest_any:
             # Unrequested land first; requested land last (they end on top,
             # depth-0 for their own upcoming delivery).
             for pid, contents, _ in sorted(held_blockers, key=lambda h: h[2]):
@@ -851,10 +1255,31 @@ class RetrievalPlanner:
                     h_pid, h_contents = m_load
                     if h_contents != "empty":
                         return None   # a car on the land route — no plan
+                    if h_pid in owned_pallets:
+                        # ANOTHER plan already owns this staged empty (its
+                        # own pending park intent). Emitting a second park
+                        # for it double-books the pallet and its slot —
+                        # observed as two plans both holding
+                        # park_empty:40→A2 and deadlocking on the
+                        # double-promised air. This candidate fails; the
+                        # planner retries once the peer's park has run.
+                        return None
                     if m == lift and h_pid == target:
+                        # Exclude every shelf this plan touches: parking
+                        # the delivered empty onto one that still has a
+                        # PENDING pop creates a sequence edge (push after
+                        # pop) whose pop-chain may need exactly the hands
+                        # this park frees — a circular cleanup wait
+                        # (observed: extract pop on B2 needed L2's hands;
+                        # L2 was freed by park_delivered ... onto B2).
+                        plan_shelves = {i.src_shelf for i in sim.intents
+                                        if i.src_shelf is not None}
+                        plan_shelves |= {i.dst_id for i in sim.intents
+                                         if i.dst_kind == "shelf"}
                         e2_dst = self._pick_empty_dst(
                             sim, lift, requested,
-                            avoid=avoid_chain, exclude={X}) or X
+                            avoid=avoid_chain,
+                            exclude={X} | plan_shelves) or X
                         sim.hands[lift] = None
                         dq = sim.push(e2_dst, target, "empty")
                         sim.intents.append(Intent(
@@ -862,12 +1287,18 @@ class RetrievalPlanner:
                             contents="empty", dst_kind="shelf",
                             dst_id=e2_dst, requires_target_off=True,
                             dst_seq=dq))
-                        cost += self._est(("carrier", lift),
-                                          ("shelf", e2_dst), lift) + 10.0
+                        self._sched(sim, ("carrier", lift),
+                                    ("shelf", e2_dst), lift)
+                        cost += 10.0
                     else:
+                        plan_shelves = {i.src_shelf for i in sim.intents
+                                        if i.src_shelf is not None}
+                        plan_shelves |= {i.dst_id for i in sim.intents
+                                         if i.dst_kind == "shelf"}
                         e_dst = self._pick_empty_dst(
                             sim, m, requested,
-                            avoid=avoid_chain, exclude={X})
+                            avoid=avoid_chain,
+                            exclude={X} | plan_shelves)
                         if e_dst is None:
                             return None
                         sim.hands[m] = None
@@ -877,15 +1308,17 @@ class RetrievalPlanner:
                             contents="empty", dst_kind="shelf",
                             dst_id=e_dst, requires_target_off=True,
                             dst_seq=dq))
-                        cost += self._est(("carrier", m),
-                                          ("shelf", e_dst), m) + 20.0
+                        self._sched(sim, ("carrier", m),
+                                    ("shelf", e_dst), m)
+                        cost += 20.0
                 dq = sim.push(X, pid, contents)
                 sim.hands[holder] = None
                 sim.intents.append(Intent(
                     kind="land", pallet_id=pid, contents=contents,
                     dst_kind="shelf", dst_id=X, requires_target_off=True,
                     dst_seq=dq))
-                cost += self._est(("carrier", holder), ("shelf", X), holder)
+                self._sched(sim, ("carrier", holder), ("shelf", X),
+                            holder)
 
         return self._finish(sim, engine, target, room, lift, X,
                             {**holders, **sim.extraction_holds},
@@ -909,7 +1342,12 @@ class RetrievalPlanner:
             return None
         return Plan(target=target, room=room, lift=lift, dig_shelf=X,
                     intents=sim.intents, holders=holders,
-                    reserved_slots=my_reserved, est_cost=cost,
+                    reserved_slots=my_reserved,
+                    # V3.1 §4: critical-path cost — the virtual schedule's
+                    # makespan plus the flat structural surcharges. A plan
+                    # whose carriers work in parallel beats the same moves
+                    # serialized.
+                    est_cost=sim.makespan + cost,
                     created_at=engine.state.time)
 
     @staticmethod
@@ -1027,7 +1465,7 @@ class RetrievalPlanner:
                     kind="extract_hop", pallet_id=pid, contents=contents,
                     dst_kind="shelf", dst_id=dst, src_shelf=Y,
                     src_seq=sq, dst_seq=dq))
-                cost += self._est(("shelf", Y), ("shelf", dst), yc)
+                self._sched(sim, ("shelf", Y), ("shelf", dst), yc)
                 temps.append((pid, contents, "shelf", dst))
                 continue
             holders = self._extraction_holders(sim, yc)
@@ -1040,7 +1478,7 @@ class RetrievalPlanner:
             sim.intents.append(Intent(
                 kind="dispose", pallet_id=pid, contents=contents,
                 dst_kind="carrier", dst_id=h, src_shelf=Y, src_seq=sq))
-            cost += self._est(("shelf", Y), ("carrier", h), yc)
+            self._sched(sim, ("shelf", Y), ("carrier", h), yc)
             temps.append((pid, contents, "carrier", h))
         n_dst = self._pick_nonbig_small_dst(sim, nonbig[1], requested, X, yc,
                                              exclude={Y})
@@ -1052,7 +1490,7 @@ class RetrievalPlanner:
             kind="extract", pallet_id=nonbig[0], contents=nonbig[1],
             dst_kind="shelf", dst_id=n_dst, src_shelf=Y,
             src_seq=sq, dst_seq=dq))
-        cost += self._est(("shelf", Y), ("shelf", n_dst), yc)
+        self._sched(sim, ("shelf", Y), ("shelf", n_dst), yc)
         # RETURN the hops home (reverse order — LIFO on shared temps). The
         # oracle's closure counts extractions with return semantics: the
         # temp slots come back, Y nets exactly +1 air. One-way hops would
@@ -1068,7 +1506,7 @@ class RetrievalPlanner:
                 sim.intents.append(Intent(
                     kind="land", pallet_id=pid, contents=contents,
                     dst_kind="shelf", dst_id=Y, dst_seq=dq))
-                cost += self._est(("carrier", loc), ("shelf", Y), loc)
+                self._sched(sim, ("carrier", loc), ("shelf", Y), loc)
                 continue
             _, _, sq = sim.pop(loc)
             # A returned hop-big is HOME, not a placement: its shelf stays
@@ -1078,8 +1516,8 @@ class RetrievalPlanner:
                 kind="extract_return", pallet_id=pid, contents=contents,
                 dst_kind="shelf", dst_id=Y, src_shelf=loc,
                 src_seq=sq, dst_seq=dq))
-            cost += self._est(("shelf", loc), ("shelf", Y),
-                              self.ex.shelf_carrier(loc))
+            self._sched(sim, ("shelf", loc), ("shelf", Y),
+                        self.ex.shelf_carrier(loc))
         return cost
 
     # ------------------------------------------------------------------
@@ -1106,6 +1544,7 @@ class RetrievalPlanner:
             if s >= HARD:
                 continue
             s += 200.0 * (len(chain) - 1)   # prefer local parking
+            s += 2.0 * sim.chain_ready(chain)   # V3.1 §4: don't idle-wait
             s += 0.001 * self._est(("carrier", carrier), ("shelf", sid),
                                    carrier)
             if best is None or s < best[0]:
@@ -1141,6 +1580,9 @@ class RetrievalPlanner:
             # chain hop rides a carrier other plans contend for (the
             # day-cycle tail starved on exactly this).
             s += 200.0 * (len(chain) - 1)
+            # V3.1 §4: a destination reachable NOW through one extra hop
+            # beats one that waits for a carrier this plan must unload.
+            s += 2.0 * sim.chain_ready(chain)
             s += 0.001 * self._est(("shelf", X), ("shelf", sid), head)
             if best is None or s < best[0]:
                 best = (s, sid)
@@ -1165,6 +1607,7 @@ class RetrievalPlanner:
             if s >= HARD:
                 continue
             s += 200.0 * (len(chain) - 1)   # keep extractions region-local
+            s += 2.0 * sim.chain_ready(chain)   # V3.1 §4
             if best is None or s < best[0]:
                 best = (s, sid)
         return best[1] if best else None
@@ -1204,6 +1647,8 @@ class RetrievalPlanner:
             if c != "empty" and (len(stack) - 1 - i) + 1 > self.k:
                 s += SOFT_VIOLATION
                 break
+        if self.is_ev_shelf[sid]:
+            s += EV_SHELF                     # keep charger slots available
         if contents != "empty":
             if len(stack) + 1 >= self.cap[sid]:
                 s += 50.0                     # topping a stack off
@@ -1224,21 +1669,37 @@ class RetrievalPlanner:
     # Cost proxy
     # ------------------------------------------------------------------
 
+    def _est_chain(self, dst: tuple[str, str], chain_head: str,
+                   via_lift: Optional[str] = None) -> tuple:
+        ex = self.ex
+        if dst[0] == "carrier":
+            return ex.chain_between(chain_head, dst[1]) or (chain_head,)
+        if dst[0] == "room":
+            lift = via_lift or self.topo.rooms[dst[1]].served_by
+            return ex.chain_between(chain_head, lift) or (chain_head,)
+        return ex.chain_between(
+            chain_head, ex.shelf_carrier(dst[1])) or (chain_head,)
+
     def _est(self, src: tuple[str, str], dst: tuple[str, str],
              chain_head: str, via_lift: Optional[str] = None) -> float:
         """Deterministic makespan proxy for one intent (ranking only)."""
-        ex = self.ex
-        if dst[0] == "carrier":
-            chain = ex.chain_between(chain_head, dst[1]) or (chain_head,)
-        elif dst[0] == "room":
-            lift = via_lift or self.topo.rooms[dst[1]].served_by
-            chain = ex.chain_between(chain_head, lift) or (chain_head,)
-        else:
-            chain = ex.chain_between(
-                chain_head, ex.shelf_carrier(dst[1])) or (chain_head,)
+        chain = self._est_chain(dst, chain_head, via_lift)
         try:
-            makespan, _busy = ex.estimate_makespan(
+            makespan, _busy = self.ex.estimate_makespan(
                 src[0], src[1], dst[0], dst[1], tuple(chain))
         except Exception:
             makespan = 60.0 * len(chain)
         return makespan
+
+    def _sched(self, sim: PlanSim, src: tuple[str, str], dst: tuple[str, str],
+               chain_head: str, via_lift: Optional[str] = None,
+               extra_dur: float = 0.0) -> float:
+        """Schedule one emission on the sim's virtual ledgers (V3.1 §4):
+        the analytic duration, run on the chain _est would use, holding
+        the touched shelves. Plan cost = sim.makespan + flat surcharges."""
+        chain = self._est_chain(dst, chain_head, via_lift)
+        dur = self._est(src, dst, chain_head, via_lift=via_lift) + extra_dur
+        return sim.schedule(
+            chain, dur,
+            src_shelf=src[1] if src[0] == "shelf" else None,
+            dst_shelf=dst[1] if dst[0] == "shelf" else None)

@@ -1,0 +1,860 @@
+{
+ "rows": [
+  {
+   "fullness": 0.3,
+   "seed": 0,
+   "depth": 0,
+   "latency": 84.61658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0034332779978285544
+  },
+  {
+   "fullness": 0.3,
+   "seed": 0,
+   "depth": 2,
+   "latency": 168.097414433691,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.003014049001649255
+  },
+  {
+   "fullness": 0.3,
+   "seed": 1,
+   "depth": 0,
+   "latency": 90.11658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0015419869996549096
+  },
+  {
+   "fullness": 0.3,
+   "seed": 1,
+   "depth": 2,
+   "latency": 187.36220937942446,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002804797000862891
+  },
+  {
+   "fullness": 0.3,
+   "seed": 2,
+   "depth": 0,
+   "latency": 84.61658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.003874685000482714
+  },
+  {
+   "fullness": 0.3,
+   "seed": 3,
+   "depth": 0,
+   "latency": 92.33074776702432,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.001705966002191417
+  },
+  {
+   "fullness": 0.3,
+   "seed": 3,
+   "depth": 1,
+   "latency": 120.97799932828457,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0019495329979690723
+  },
+  {
+   "fullness": 0.3,
+   "seed": 3,
+   "depth": 2,
+   "latency": 174.31479031291926,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.004018648000055691
+  },
+  {
+   "fullness": 0.3,
+   "seed": 4,
+   "depth": 0,
+   "latency": 90.60570820712019,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0021483069976966362
+  },
+  {
+   "fullness": 0.3,
+   "seed": 4,
+   "depth": 1,
+   "latency": 139.21470656029663,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0019773620006162673
+  },
+  {
+   "fullness": 0.3,
+   "seed": 4,
+   "depth": 2,
+   "latency": 130.98324958071083,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0023212529995362274
+  },
+  {
+   "fullness": 0.3,
+   "seed": 5,
+   "depth": 0,
+   "latency": 81.74991624737747,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0015247719966282602
+  },
+  {
+   "fullness": 0.3,
+   "seed": 5,
+   "depth": 1,
+   "latency": 145.63333333333338,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0026429829995322507
+  },
+  {
+   "fullness": 0.3,
+   "seed": 5,
+   "depth": 2,
+   "latency": 157.21416485298022,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0021115489980729762
+  },
+  {
+   "fullness": 0.3,
+   "seed": 6,
+   "depth": 0,
+   "latency": 95.73333333333333,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0015223930022330023
+  },
+  {
+   "fullness": 0.3,
+   "seed": 6,
+   "depth": 2,
+   "latency": 153.32808308090716,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0035853389999829233
+  },
+  {
+   "fullness": 0.3,
+   "seed": 7,
+   "depth": 0,
+   "latency": 90.23333333333333,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0047116499990806915
+  },
+  {
+   "fullness": 0.3,
+   "seed": 7,
+   "depth": 2,
+   "latency": 140.5999162473775,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002475503002642654
+  },
+  {
+   "fullness": 0.5,
+   "seed": 0,
+   "depth": 0,
+   "latency": 81.74991624737747,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0019239680004830007
+  },
+  {
+   "fullness": 0.5,
+   "seed": 0,
+   "depth": 1,
+   "latency": 106.48324958071079,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0013947820007160772
+  },
+  {
+   "fullness": 0.5,
+   "seed": 0,
+   "depth": 2,
+   "latency": 139.70000000000002,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0016455289987789001
+  },
+  {
+   "fullness": 0.5,
+   "seed": 1,
+   "depth": 0,
+   "latency": 95.61658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0012041910013067536
+  },
+  {
+   "fullness": 0.5,
+   "seed": 1,
+   "depth": 1,
+   "latency": 114.84991624737748,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0015947399988363031
+  },
+  {
+   "fullness": 0.5,
+   "seed": 1,
+   "depth": 2,
+   "latency": 153.099832494755,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0030563179971068166
+  },
+  {
+   "fullness": 0.5,
+   "seed": 2,
+   "depth": 0,
+   "latency": 90.11658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002684565999516053
+  },
+  {
+   "fullness": 0.5,
+   "seed": 2,
+   "depth": 1,
+   "latency": 110.31666666666669,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002160392999940086
+  },
+  {
+   "fullness": 0.5,
+   "seed": 2,
+   "depth": 2,
+   "latency": 128.1162479035541,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002184109998779604
+  },
+  {
+   "fullness": 0.5,
+   "seed": 3,
+   "depth": 0,
+   "latency": 84.61658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0015831310010980815
+  },
+  {
+   "fullness": 0.5,
+   "seed": 3,
+   "depth": 2,
+   "latency": 192.68316582808825,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.004180440999334678
+  },
+  {
+   "fullness": 0.5,
+   "seed": 4,
+   "depth": 0,
+   "latency": 87.73895778783098,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002215340002294397
+  },
+  {
+   "fullness": 0.5,
+   "seed": 4,
+   "depth": 1,
+   "latency": 92.26141178142615,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0017228139986400492
+  },
+  {
+   "fullness": 0.5,
+   "seed": 4,
+   "depth": 2,
+   "latency": 152.74786775557067,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0023117199998523574
+  },
+  {
+   "fullness": 0.5,
+   "seed": 5,
+   "depth": 0,
+   "latency": 90.60570820712019,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0025594360013201367
+  },
+  {
+   "fullness": 0.5,
+   "seed": 5,
+   "depth": 1,
+   "latency": 95.12816220071534,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0016897169989533722
+  },
+  {
+   "fullness": 0.5,
+   "seed": 5,
+   "depth": 2,
+   "latency": 111.38041275653427,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002391203997831326
+  },
+  {
+   "fullness": 0.5,
+   "seed": 6,
+   "depth": 0,
+   "latency": 89.99749818631352,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0014177709999785293
+  },
+  {
+   "fullness": 0.5,
+   "seed": 6,
+   "depth": 1,
+   "latency": 123.1,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002617918002215447
+  },
+  {
+   "fullness": 0.5,
+   "seed": 6,
+   "depth": 2,
+   "latency": 136.71658291404418,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0029486319981515408
+  },
+  {
+   "fullness": 0.5,
+   "seed": 7,
+   "depth": 0,
+   "latency": 97.08083151964686,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.005726797997340327
+  },
+  {
+   "fullness": 0.5,
+   "seed": 7,
+   "depth": 2,
+   "latency": 183.44724692844608,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0040358100013691
+  },
+  {
+   "fullness": 0.7,
+   "seed": 0,
+   "depth": 0,
+   "latency": 84.61658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0023290219978662208
+  },
+  {
+   "fullness": 0.7,
+   "seed": 0,
+   "depth": 2,
+   "latency": 168.097414433691,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0024249379966931883
+  },
+  {
+   "fullness": 0.7,
+   "seed": 1,
+   "depth": 0,
+   "latency": 95.73333333333333,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0012677509985223878
+  },
+  {
+   "fullness": 0.7,
+   "seed": 1,
+   "depth": 2,
+   "latency": 136.48308207546575,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0030572280011256225
+  },
+  {
+   "fullness": 0.7,
+   "seed": 2,
+   "depth": 0,
+   "latency": 87.24991624737747,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0023303160014620516
+  },
+  {
+   "fullness": 0.7,
+   "seed": 2,
+   "depth": 2,
+   "latency": 139.34991624737748,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002431736000289675
+  },
+  {
+   "fullness": 0.7,
+   "seed": 3,
+   "depth": 0,
+   "latency": 84.61658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002388040000369074
+  },
+  {
+   "fullness": 0.7,
+   "seed": 3,
+   "depth": 1,
+   "latency": 128.48324958071083,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.001734100002067862
+  },
+  {
+   "fullness": 0.7,
+   "seed": 3,
+   "depth": 2,
+   "latency": 155.85537319663013,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002357871999265626
+  },
+  {
+   "fullness": 0.7,
+   "seed": 4,
+   "depth": 0,
+   "latency": 87.36666666666667,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0017421659977117088
+  },
+  {
+   "fullness": 0.7,
+   "seed": 4,
+   "depth": 1,
+   "latency": 111.98324958071083,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0019398290023673326
+  },
+  {
+   "fullness": 0.7,
+   "seed": 4,
+   "depth": 2,
+   "latency": 155.73862277734096,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0024359460003324784
+  },
+  {
+   "fullness": 0.7,
+   "seed": 5,
+   "depth": 0,
+   "latency": 84.49749818631352,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.001967922002222622
+  },
+  {
+   "fullness": 0.7,
+   "seed": 5,
+   "depth": 1,
+   "latency": 91.62212361591929,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.00194359200031613
+  },
+  {
+   "fullness": 0.7,
+   "seed": 5,
+   "depth": 2,
+   "latency": 142.39199204320548,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002438626001094235
+  },
+  {
+   "fullness": 0.7,
+   "seed": 6,
+   "depth": 0,
+   "latency": 95.61658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0016779290017439052
+  },
+  {
+   "fullness": 0.7,
+   "seed": 6,
+   "depth": 1,
+   "latency": 145.60070921256153,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0032908089997363277
+  },
+  {
+   "fullness": 0.7,
+   "seed": 6,
+   "depth": 2,
+   "latency": 159.56470192748242,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0026702069990278687
+  },
+  {
+   "fullness": 0.7,
+   "seed": 7,
+   "depth": 0,
+   "latency": 95.98895778783098,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.004604835001373431
+  },
+  {
+   "fullness": 0.85,
+   "seed": 0,
+   "depth": 0,
+   "latency": 76.24991624737747,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0020127069983573165
+  },
+  {
+   "fullness": 0.85,
+   "seed": 0,
+   "depth": 2,
+   "latency": 130.98308207546575,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002114760998665588
+  },
+  {
+   "fullness": 0.85,
+   "seed": 1,
+   "depth": 0,
+   "latency": 95.73333333333333,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0009267660025216173
+  },
+  {
+   "fullness": 0.85,
+   "seed": 1,
+   "depth": 2,
+   "latency": 136.48308207546575,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0027411809969635215
+  },
+  {
+   "fullness": 0.85,
+   "seed": 2,
+   "depth": 0,
+   "latency": 87.24991624737747,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002162789001886267
+  },
+  {
+   "fullness": 0.85,
+   "seed": 2,
+   "depth": 2,
+   "latency": 158.71658291404418,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.00248933800321538
+  },
+  {
+   "fullness": 0.85,
+   "seed": 3,
+   "depth": 0,
+   "latency": 95.73333333333333,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0014445749984588474
+  },
+  {
+   "fullness": 0.85,
+   "seed": 3,
+   "depth": 1,
+   "latency": 106.48324958071082,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0015162279996729922
+  },
+  {
+   "fullness": 0.85,
+   "seed": 3,
+   "depth": 2,
+   "latency": 139.88274706497572,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002122303998476127
+  },
+  {
+   "fullness": 0.85,
+   "seed": 4,
+   "depth": 0,
+   "latency": 76.24991624737747,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0017194300016853958
+  },
+  {
+   "fullness": 0.85,
+   "seed": 4,
+   "depth": 1,
+   "latency": 106.48324958071079,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002079480000247713
+  },
+  {
+   "fullness": 0.85,
+   "seed": 4,
+   "depth": 2,
+   "latency": 133.8497487421325,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0022046149970265105
+  },
+  {
+   "fullness": 0.85,
+   "seed": 5,
+   "depth": 0,
+   "latency": 84.49749818631352,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002212136998423375
+  },
+  {
+   "fullness": 0.85,
+   "seed": 5,
+   "depth": 1,
+   "latency": 134.1,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.001983474001463037
+  },
+  {
+   "fullness": 0.85,
+   "seed": 5,
+   "depth": 2,
+   "latency": 162.36641540879913,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0023959410027600825
+  },
+  {
+   "fullness": 0.85,
+   "seed": 6,
+   "depth": 0,
+   "latency": 95.61658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0016271070016955491
+  },
+  {
+   "fullness": 0.85,
+   "seed": 6,
+   "depth": 2,
+   "latency": 151.23308207546572,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0027807089973066468
+  },
+  {
+   "fullness": 0.85,
+   "seed": 7,
+   "depth": 0,
+   "latency": 95.49749818631352,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0044407320019672625
+  },
+  {
+   "fullness": 0.85,
+   "seed": 7,
+   "depth": 1,
+   "latency": 122.32300033372584,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0021641099992848467
+  },
+  {
+   "fullness": 0.95,
+   "seed": 0,
+   "depth": 0,
+   "latency": 76.24991624737747,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002143388999684248
+  },
+  {
+   "fullness": 0.95,
+   "seed": 0,
+   "depth": 2,
+   "latency": 130.98308207546575,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002123720001691254
+  },
+  {
+   "fullness": 0.95,
+   "seed": 1,
+   "depth": 0,
+   "latency": 95.73333333333333,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.000925371001358144
+  },
+  {
+   "fullness": 0.95,
+   "seed": 1,
+   "depth": 2,
+   "latency": 139.34974874213242,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0018047430021397304
+  },
+  {
+   "fullness": 0.95,
+   "seed": 2,
+   "depth": 0,
+   "latency": 87.24991624737747,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002334299002541229
+  },
+  {
+   "fullness": 0.95,
+   "seed": 2,
+   "depth": 2,
+   "latency": 164.21658291404418,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002548180000303546
+  },
+  {
+   "fullness": 0.95,
+   "seed": 3,
+   "depth": 0,
+   "latency": 95.61658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.001453206001315266
+  },
+  {
+   "fullness": 0.95,
+   "seed": 3,
+   "depth": 1,
+   "latency": 117.60000000000002,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0017167700025311206
+  },
+  {
+   "fullness": 0.95,
+   "seed": 3,
+   "depth": 2,
+   "latency": 139.88274706497572,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.00234601699776249
+  },
+  {
+   "fullness": 0.95,
+   "seed": 4,
+   "depth": 0,
+   "latency": 76.24991624737747,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0017069660025299527
+  },
+  {
+   "fullness": 0.95,
+   "seed": 4,
+   "depth": 1,
+   "latency": 106.48324958071079,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002041435000137426
+  },
+  {
+   "fullness": 0.95,
+   "seed": 4,
+   "depth": 2,
+   "latency": 133.8497487421325,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0022470399999292567
+  },
+  {
+   "fullness": 0.95,
+   "seed": 5,
+   "depth": 0,
+   "latency": 84.61658291404413,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.003207781002856791
+  },
+  {
+   "fullness": 0.95,
+   "seed": 6,
+   "depth": 0,
+   "latency": 90.23333333333333,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0017105240003729705
+  },
+  {
+   "fullness": 0.95,
+   "seed": 6,
+   "depth": 2,
+   "latency": 151.2330820754657,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0027509180035849568
+  },
+  {
+   "fullness": 0.95,
+   "seed": 7,
+   "depth": 0,
+   "latency": 95.49749818631352,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.002082684000924928
+  },
+  {
+   "fullness": 0.95,
+   "seed": 7,
+   "depth": 2,
+   "latency": 190.87862478822353,
+   "stuck": false,
+   "replans": 0,
+   "wall_s": 0.0035121190012432635
+  }
+ ],
+ "wall_s": 0.26311135699870647
+}

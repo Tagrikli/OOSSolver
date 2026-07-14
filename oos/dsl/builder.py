@@ -61,6 +61,9 @@ class Shelf:
     capacity: int
     size: SizeClass
     orientation: ShelfOrientation = "up"
+    # EV charger shelf (SOLUTION_V3_1 §2): mechanically identical; scored
+    # placements deprioritize it so charger slots stay free for charge work.
+    ev: bool = False
 
     # Set when registered to a Carrier; do not touch directly.
     _carrier: Optional["Carrier"] = field(default=None, repr=False, compare=False)
@@ -177,11 +180,18 @@ class Facility:
         max_chain_depth: Optional[int] = 2,
         lift_profile: MotionProfile = LIFT_PROFILE,
         shuttle_profile: MotionProfile = SHUTTLE_PROFILE,
+        serve_exit_s: float = 45.0,
+        serve_entry_s: float = 45.0,
     ) -> None:
         self.name = name
         self.max_chain_depth = max_chain_depth
         self.lift_profile = lift_profile
         self.shuttle_profile = shuttle_profile
+        # Customer service dwell (SOLUTION_V3_1 §1): fixed per-facility
+        # constants — the lift is occupied at the room while the customer
+        # drives out (exit / Retrieve) or drives in and parks (entry / Store).
+        self.serve_exit_s = serve_exit_s
+        self.serve_entry_s = serve_entry_s
 
         self._carriers: list[Carrier] = []
         self._pairs: list[_Pair] = []

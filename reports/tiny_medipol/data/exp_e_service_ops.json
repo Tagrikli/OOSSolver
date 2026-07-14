@@ -1,0 +1,140 @@
+{
+ "rows": [
+  {
+   "fullness": 0.5,
+   "seed": 0,
+   "evict_latency": 188.53316582808827,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 82.42237487378691,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.5,
+   "seed": 1,
+   "evict_latency": 184.5830820754657,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 133.01357858462256,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.5,
+   "seed": 2,
+   "evict_latency": 186.64941373164228,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 73.49482886738204,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.5,
+   "seed": 3,
+   "evict_latency": 176.58941574252486,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 76.950625459939,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.5,
+   "seed": 4,
+   "evict_latency": 162.46633165617652,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 157.8332495807109,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.7,
+   "seed": 0,
+   "evict_latency": 210.83904154045354,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 196.44983249475496,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.7,
+   "seed": 1,
+   "evict_latency": 190.0830820754657,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 75.34991624737751,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.7,
+   "seed": 2,
+   "evict_latency": 160.7444984897061,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 62.428078448092805,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.7,
+   "seed": 3,
+   "evict_latency": 162.69983249475496,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 206.03879028258598,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.7,
+   "seed": 4,
+   "evict_latency": 142.98291457022066,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 114.09991624737751,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.85,
+   "seed": 0,
+   "evict_latency": 196.58058026177926,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 107.55633366705925,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.85,
+   "seed": 1,
+   "evict_latency": 190.0830820754657,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 133.01357858462256,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.85,
+   "seed": 2,
+   "evict_latency": 184.71633165617652,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 172.41799207353864,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.85,
+   "seed": 3,
+   "evict_latency": 167.97187235805166,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 77.71141641424043,
+   "place_ok": true
+  },
+  {
+   "fullness": 0.85,
+   "seed": 4,
+   "evict_latency": 189.67791557566198,
+   "evict_ok": true,
+   "evict_depth": 0,
+   "place_latency": 94.94966498950998,
+   "place_ok": true
+  }
+ ],
+ "wall_s": 0.09792706599910161
+}

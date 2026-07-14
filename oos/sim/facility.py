@@ -56,6 +56,29 @@ class SeedingConfig:
     empties_on_shelf: dict[str, int] = field(default_factory=dict)
 
 
+@dataclass
+class _ServeInteraction:
+    """Pseudo-command marking a carrier busy for a customer service dwell
+    (SOLUTION_V3_1 §1): the customer is getting into a delivered car and
+    driving out (`kind="retrieve"`, `serve_exit_s`) or driving in and
+    parking onto the staged empty (`kind="store"`, `serve_entry_s`).
+
+    Installed as `CarrierState.current_command` so the whole stack —
+    executor claims, rung enumeration, viz busy-coloring — sees the lift as
+    busy at the room without any special-casing. It is NOT a submitted
+    Command: no `command_done` event ever targets it; its own `serve_done`
+    event completes it (state mutation + task completion happen there).
+    Once started, a serve is committed — the customer is physically present
+    — so canceling the underlying task mid-dwell does not stop it."""
+
+    kind: str            # "retrieve" | "store"
+    carrier: CarrierId
+    task: Task
+
+    def complete(self, state, topology) -> None:  # defensive no-op
+        pass
+
+
 class SimEngine:
     """The sim engine: owns topology, state, scheduler, and task stream. Steps
     via submit/advance. One engine serves many Environments (which configure
@@ -112,6 +135,20 @@ class SimEngine:
         #   that is not fundable right now simply waits at the entrance.
         self.admission_check: Optional[Callable[[str], bool]] = None
         self.store_serve_gate: Optional[Callable[[str], bool]] = None
+        # IDs of tasks whose serve dwell is running (SOLUTION_V3_1 §1).
+        # In-service tasks stay in the pending queue (the solver must keep
+        # seeing them as live work) but are excluded from serve matching,
+        # the unservable-big sweep, and cancellation — the customer is
+        # already in the room; the interaction is committed. Tracked by
+        # IDENTITY: Task dataclasses compare by value, and two same-instant
+        # stores are equal — a value set would let one block the other (or,
+        # inverted, let two lifts serve the same task; both observed).
+        self._serving_tasks: set[int] = set()
+        # Live serve-dwell values, initialized from the facility constants.
+        # Mutable on purpose (the viz exposes a dwell slider); everything
+        # that prices or runs a serve reads THESE, not the frozen topology.
+        self.serve_exit_s: float = float(topology.serve_exit_s)
+        self.serve_entry_s: float = float(topology.serve_entry_s)
         # Optional predicate `(carrier_id) -> bool` injected by the env layer:
         # "does this carrier have at least one non-WAIT action available?".
         # A waiting carrier is only treated as needing a decision when this is
@@ -267,8 +304,11 @@ class SimEngine:
         self.wake_waiting_carriers()
 
     def clear_queue(self) -> None:
-        """Drop every pending task. In-flight customer interactions continue."""
-        self.queue.pending.clear()
+        """Drop every pending task. In-flight customer interactions continue
+        — a task whose serve dwell is running is committed (the customer is
+        in the room) and stays until its serve completes."""
+        self.queue.pending[:] = [
+            t for t in self.queue.pending if id(t) in self._serving_tasks]
 
     def wake_waiting_carriers(self) -> None:
         """Re-open every waiting carrier's decision: clear the WAIT-hold flag
@@ -295,9 +335,12 @@ class SimEngine:
 
     def toggle_retrieve_for_pallet(self, pallet_id: PalletId) -> bool:
         """If a pending Retrieve for this pallet exists, remove it; else add
-        one. Returns True if a Retrieve is now pending for this pallet."""
+        one. Returns True if a Retrieve is now pending for this pallet. A
+        retrieve mid-serve-dwell is committed and cannot be canceled."""
         for t in self.queue.pending:
             if isinstance(t, Retrieve) and t.pallet == pallet_id:
+                if id(t) in self._serving_tasks:
+                    return True   # customer already getting in — committed
                 self.queue.remove(t)
                 return False
         if not _pallet_exists(self, pallet_id):
@@ -440,6 +483,8 @@ class SimEngine:
         kind = ev.kind
         if kind == "command_done":
             self._on_command_done(ev.payload)
+        elif kind == "serve_done":
+            self._on_serve_done(ev.payload, completions)
         elif kind == "task_arrival":
             self._on_task_arrival(arrivals, dropped, completions)
         elif kind == "scheduled_store_arrival":
@@ -480,8 +525,9 @@ class SimEngine:
         cs = self.state.carriers[carrier_id]
         cmd = cs.current_command
         # Idempotent guard: nothing to complete if the carrier holds no
-        # command (e.g. a transfer already cleared via its partner).
-        if cmd is None:
+        # command (e.g. a transfer already cleared via its partner). A serve
+        # dwell is completed by its own `serve_done` event, never here.
+        if cmd is None or isinstance(cmd, _ServeInteraction):
             return
         cmd.complete(self.state, self.topology)
         # Clear every carrier that shares this command instance — the initiator
@@ -587,6 +633,7 @@ class SimEngine:
         to_drop = [
             t for t in self.queue.pending
             if isinstance(t, Store) and t.size == "big"
+            and id(t) not in self._serving_tasks   # committed: entering
         ]
         for t in to_drop:
             self.queue.remove(t)
@@ -682,28 +729,93 @@ class SimEngine:
         # agent delivery — the only way a retrieve can complete now).
         retrieve = self._find_pending_retrieve(pallet.id)
         if retrieve is not None:
-            self._complete_retrieve(cs, retrieve, completions)
+            self._begin_serve(carrier_id, "retrieve", retrieve,
+                              self.serve_exit_s, completions)
             return True
         # Store: the held empty pallet absorbs the oldest pending Store.
         if pallet.is_empty:
             store = self._find_pending_store()
             self._serving_cid = None
             if store is not None:
-                cost = self.state.time - store.arrived_at
-                self.queue.remove(store)
-                self.queue.completed_costs.append(cost)
-                completions.append(TaskCompletion(task=store, cost=cost))
-                cs.load = Pallet(id=pallet.id, contents=store.size)
-                if self.dwell_sampler is not None:
-                    delay = self.dwell_sampler(pallet.id, store.size)
-                    if delay != float("inf"):
-                        self.scheduler.push(
-                            self.state.time + delay,
-                            "retrieve_arrival",
-                            {"pallet": pallet.id},
-                        )
+                self._begin_serve(carrier_id, "store", store,
+                                  self.serve_entry_s, completions)
                 return True
         return False
+
+    def _begin_serve(self, carrier_id: CarrierId, kind: str, task: Task,
+                     dwell_s: float,
+                     completions: list[TaskCompletion]) -> None:
+        """Start a customer service interaction (SOLUTION_V3_1 §1). All
+        gates have already passed for this instant. With a zero dwell the
+        serve completes in place (exact pre-V3.1 semantics); otherwise the
+        carrier goes busy under a `_ServeInteraction` pseudo-command and the
+        state mutation happens at the `serve_done` event."""
+        if dwell_s <= 0.0:
+            cs = self.state.carriers[carrier_id]
+            if isinstance(task, Retrieve):
+                self._complete_retrieve(cs, task, completions)
+            elif isinstance(task, Store):
+                self._complete_store(cs, task, completions)
+            return
+        marker = _ServeInteraction(kind=kind, carrier=carrier_id, task=task)
+        self._serving_tasks.add(id(task))
+        cs = self.state.carriers[carrier_id]
+        cs.current_command = marker
+        cs.busy_until = self.state.time + dwell_s
+        cs.command_started_at = self.state.time
+        cs.command_start_position = cs.position
+        cs.waiting = False
+        self.scheduler.push(self.state.time + dwell_s, "serve_done",
+                            carrier_id)
+
+    def _on_serve_done(self, carrier_id: CarrierId,
+                       completions: list[TaskCompletion]) -> None:
+        """The customer finished (drove out / parked): mutate the pallet,
+        complete the task, free the lift. Robust to the task having been
+        removed from the queue mid-dwell (clear-queue): the physical outcome
+        still happens — the customer was already in the room — only the
+        completion record is skipped."""
+        cs = self.state.carriers[carrier_id]
+        marker = cs.current_command
+        if not isinstance(marker, _ServeInteraction):
+            return   # aborted externally; nothing to complete
+        cs.current_command = None
+        cs.busy_until = None
+        cs.command_started_at = None
+        cs.command_start_position = None
+        self._serving_tasks.discard(id(marker.task))
+        task = marker.task
+        still_pending = any(t is task for t in self.queue.pending)
+        if isinstance(task, Retrieve):
+            if still_pending:
+                self._complete_retrieve(cs, task, completions)
+            elif cs.load is not None:
+                # Canceled mid-dwell: the customer still drove off.
+                cs.load = Pallet(id=cs.load.id, contents="empty")
+        elif isinstance(task, Store):
+            if still_pending:
+                self._complete_store(cs, task, completions)
+            # A store cleared mid-dwell simply doesn't happen: the pallet
+            # stays empty and no dwell-retrieve is scheduled.
+
+    def _complete_store(self, cs, store: "Store",
+                        completions: list[TaskCompletion]) -> None:
+        """Complete one Store: load the customer's car onto the held empty
+        pallet, record cost + completion, schedule its dwell retrieve."""
+        pallet = cs.load
+        cost = self.state.time - store.arrived_at
+        self.queue.remove(store)
+        self.queue.completed_costs.append(cost)
+        completions.append(TaskCompletion(task=store, cost=cost))
+        cs.load = Pallet(id=pallet.id, contents=store.size)
+        if self.dwell_sampler is not None:
+            delay = self.dwell_sampler(pallet.id, store.size)
+            if delay != float("inf"):
+                self.scheduler.push(
+                    self.state.time + delay,
+                    "retrieve_arrival",
+                    {"pallet": pallet.id},
+                )
 
     def _complete_retrieve(
         self, cs, retrieve: "Retrieve", completions: list[TaskCompletion]
@@ -791,13 +903,14 @@ class SimEngine:
 
     def _find_pending_retrieve(self, pallet_id: PalletId) -> "Retrieve | None":
         for t in self.queue.pending:
-            if isinstance(t, Retrieve) and t.pallet == pallet_id:
+            if isinstance(t, Retrieve) and t.pallet == pallet_id \
+                    and id(t) not in self._serving_tasks:
                 return t
         return None
 
     def _find_pending_store(self) -> "Store | None":
         for t in self.queue.pending:
-            if isinstance(t, Store):
+            if isinstance(t, Store) and id(t) not in self._serving_tasks:
                 if (self.store_serve_gate is None
                         or self.store_serve_gate(t.size)):
                     return t

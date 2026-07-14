@@ -1,0 +1,137 @@
+{
+ "rows": [
+  {
+   "fullness": 0.5,
+   "seed": 0,
+   "big_arrivals": 32,
+   "big_refused": 2,
+   "small_arrivals": 55,
+   "small_refused": 0,
+   "delivered": 65,
+   "stores": 83,
+   "stuck": false
+  },
+  {
+   "fullness": 0.5,
+   "seed": 1,
+   "big_arrivals": 29,
+   "big_refused": 1,
+   "small_arrivals": 45,
+   "small_refused": 0,
+   "delivered": 47,
+   "stores": 72,
+   "stuck": false
+  },
+  {
+   "fullness": 0.5,
+   "seed": 2,
+   "big_arrivals": 26,
+   "big_refused": 0,
+   "small_arrivals": 48,
+   "small_refused": 0,
+   "delivered": 56,
+   "stores": 74,
+   "stuck": false
+  },
+  {
+   "fullness": 0.7,
+   "seed": 0,
+   "big_arrivals": 32,
+   "big_refused": 0,
+   "small_arrivals": 55,
+   "small_refused": 0,
+   "delivered": 66,
+   "stores": 85,
+   "stuck": false
+  },
+  {
+   "fullness": 0.7,
+   "seed": 1,
+   "big_arrivals": 29,
+   "big_refused": 0,
+   "small_arrivals": 45,
+   "small_refused": 0,
+   "delivered": 47,
+   "stores": 72,
+   "stuck": false
+  },
+  {
+   "fullness": 0.7,
+   "seed": 2,
+   "big_arrivals": 26,
+   "big_refused": 0,
+   "small_arrivals": 48,
+   "small_refused": 0,
+   "delivered": 56,
+   "stores": 74,
+   "stuck": false
+  },
+  {
+   "fullness": 0.85,
+   "seed": 0,
+   "big_arrivals": 32,
+   "big_refused": 0,
+   "small_arrivals": 55,
+   "small_refused": 0,
+   "delivered": 65,
+   "stores": 85,
+   "stuck": false
+  },
+  {
+   "fullness": 0.85,
+   "seed": 1,
+   "big_arrivals": 29,
+   "big_refused": 0,
+   "small_arrivals": 45,
+   "small_refused": 0,
+   "delivered": 47,
+   "stores": 72,
+   "stuck": false
+  },
+  {
+   "fullness": 0.85,
+   "seed": 2,
+   "big_arrivals": 26,
+   "big_refused": 0,
+   "small_arrivals": 48,
+   "small_refused": 0,
+   "delivered": 55,
+   "stores": 74,
+   "stuck": false
+  },
+  {
+   "fullness": 0.95,
+   "seed": 0,
+   "big_arrivals": 32,
+   "big_refused": 2,
+   "small_arrivals": 55,
+   "small_refused": 0,
+   "delivered": 67,
+   "stores": 83,
+   "stuck": false
+  },
+  {
+   "fullness": 0.95,
+   "seed": 1,
+   "big_arrivals": 29,
+   "big_refused": 6,
+   "small_arrivals": 45,
+   "small_refused": 0,
+   "delivered": 47,
+   "stores": 66,
+   "stuck": false
+  },
+  {
+   "fullness": 0.95,
+   "seed": 2,
+   "big_arrivals": 26,
+   "big_refused": 0,
+   "small_arrivals": 48,
+   "small_refused": 0,
+   "delivered": 56,
+   "stores": 74,
+   "stuck": false
+  }
+ ],
+ "wall_s": 20.909485180000047
+}

@@ -162,35 +162,67 @@ def test_no_staged_empty_ping_pong():
     rt.engine.enqueue_store("small")
     res = rt.run(until_sim_time=1500.0, stuck_gap_s=600.0)
     assert not res.stuck, res.stuck_dump
-    assert res.moves_completed <= 6, (
+    # V3.1: the idle groom legitimately declutters big shelves after the
+    # store lands, so the old ≤6 bound no longer holds. Ping-pong shows as
+    # NON-CONVERGENCE: cap the total generously and require a second
+    # window to start nothing.
+    assert res.moves_completed <= 30, (
         f"staging churned {res.moves_completed} moves — ping-pong regression")
+    assert all(rt.solver.room_staged(rid) for rid in rt.room_ids)
+    moves_1 = rt.ex.completed_moves
+    rt.run(until_sim_time=3000.0, stuck_gap_s=600.0)
+    assert rt.ex.completed_moves == moves_1, "post-convergence churn"
     assert all(rt.solver.room_staged(rid) for rid in rt.room_ids)
 
 
-def test_rest_state_no_churn():
-    """§7.4: at rest (no requests, rooms staged) the solver starts NOTHING
-    at high fullness (grooming is load-gated off)."""
+def _nonbig_on_big(rt) -> int:
+    return sum(
+        1 for sid, sh in rt.topo.shelves.items() if sh.size_class == "big"
+        for p in rt.engine.state.shelves[sid].stack if p.contents != "big")
+
+
+def test_rest_state_groom_converges():
+    """V3.1 §3: at rest the groom may DECLUTTER big shelves (non-bigs →
+    small air) but must converge — the potential (non-bigs on big shelves)
+    is monotone, so a second idle hour starts NOTHING, and the world stays
+    solvable throughout."""
     rt = SolverRuntime(get_facility("tiny_medipol"), seed=4)
     rt.seed_solvable(0.75, prioritize_big=True)
     rt.stage_all_rooms()
-    res = rt.run(until_sim_time=3600.0, stuck_gap_s=1200.0)
-    assert res.moves_completed == 0, res.moves_completed
+    before = _nonbig_on_big(rt)
+    res = rt.run(until_sim_time=3600.0, stuck_gap_s=1e9)
     assert not res.stuck
+    assert _nonbig_on_big(rt) <= before          # monotone potential
+    moves_h1 = rt.ex.completed_moves             # cumulative counter
+    rt.run(until_sim_time=7200.0, stuck_gap_s=1e9)
+    delta = rt.ex.completed_moves - moves_h1
+    assert delta == 0, (
+        f"groom did not converge: {delta} moves in the second idle hour")
 
 
 def test_groom_converges_at_low_fullness():
-    """Operator report: campus @0.35 groomed empties in circles (~200
-    moves/h). Grooming must terminate: monotone violation descent +
-    truthful empty-blocker scoring."""
-    from oos.plan import moves as M
-
+    """Operator report (V3-era): campus @0.35 groomed empties in circles
+    (~200 moves/h). The V3.1 groom's potential is monotone by
+    construction; after the initial declutter burst the second idle hour
+    must be silent."""
     rt = SolverRuntime(get_facility("campus"), seed=2)
     rt.seed_solvable(0.35, prioritize_big=True)
     rt.stage_all_rooms()
-    res = rt.run(until_sim_time=3600.0, stuck_gap_s=1800.0)
+    before = _nonbig_on_big(rt)
+    res = rt.run(until_sim_time=3600.0, stuck_gap_s=1e9)
     assert not res.stuck
-    assert res.moves_completed <= 25, (
-        f"groom churned {res.moves_completed} moves in an idle hour")
+    assert _nonbig_on_big(rt) <= before
+    # Bounded by the potential: every groom-driven relocation either takes
+    # a non-big off a big shelf (≤ before) or is part of one evict plan's
+    # bounded dig; 4× the potential is a generous ceiling that still
+    # catches any loop.
+    assert res.moves_completed <= 4 * max(1, before), (
+        f"groom churned {res.moves_completed} moves (potential {before})")
+    moves_h1 = rt.ex.completed_moves             # cumulative counter
+    rt.run(until_sim_time=7200.0, stuck_gap_s=1e9)
+    delta = rt.ex.completed_moves - moves_h1
+    assert delta == 0, (
+        f"groom did not converge: {delta} moves in the second idle hour")
 
 
 def test_suv_overload_never_wedges():
@@ -217,7 +249,12 @@ def test_suv_overload_never_wedges():
         rt.stage_all_rooms()
         res = rt.run(until_sim_time=4000.0, stuck_gap_s=300.0)
         assert not res.stuck, res.stuck_dump
-        assert res.stores_served > 100 and res.delivered > 50
+        # Flow floors, dwell-adjusted (V3.1): every serve now occupies its
+        # lift for the 45 s customer dwell, so overload throughput is lower
+        # than the instant-serve calibration (observed ~71 stores / ~50
+        # deliveries). A wedge collapses these to near zero — the floors
+        # only need to separate "flowing" from "wedged".
+        assert res.stores_served > 50 and res.delivered > 32
 
 
 def test_dwell_never_requests_empties():
@@ -235,11 +272,16 @@ def test_dwell_never_requests_empties():
     for pid in rt.all_stored_cars():
         rt.request(pid)
     rt.run(until_sim_time=390.0, stuck_gap_s=600.0)
-    res = rt.run(until_sim_time=1200.0, stuck_gap_s=600.0)
+    rt.run(until_sim_time=1200.0, stuck_gap_s=600.0)
+    from oos.sim.facility import _pallet_has_car
     from oos.sim.tasks import Retrieve
-    for d in res.deliveries:
-        pass   # deliveries of real cars are fine
-    ghosts = [t for t in rt.engine.queue.pending if isinstance(t, Retrieve)]
+    # A pending retrieve whose pallet still CARRIES a car is legitimate
+    # in-progress work (the store stream keeps running; with the V3.1 serve
+    # dwell a late dwell-retrieve may not have delivered by the cutoff). A
+    # ghost is a retrieve for a pallet with NO car — the bug this guards.
+    ghosts = [t for t in rt.engine.queue.pending
+              if isinstance(t, Retrieve)
+              and not _pallet_has_car(rt.engine, t.pallet)]
     assert not ghosts, f"ghost retrieves for empty pallets: {ghosts}"
 
 

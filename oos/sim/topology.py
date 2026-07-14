@@ -69,6 +69,13 @@ class Shelf:
     # Transfer shelves are implicit single-slot buffers (capacity forced to 1).
     # For synchronous co-located swaps with no buffer, use a Handoff pose.
 
+    # EV charger shelf (SOLUTION_V3_1 §2): physically an ordinary shelf of
+    # its size class — the charger serves any slot, so the sim mechanics are
+    # identical. The flag only deprioritizes the shelf as a *scored*
+    # placement destination (planner EV_SHELF penalty); explicit Place
+    # operations target it at no cost.
+    is_ev: bool = False
+
     # Per-(shelf, carrier) visual orientation. Missing entries default to
     # "up", so existing facilities that don't specify orientation behave
     # exactly as before. This is purely a viz hint; the sim ignores it.
@@ -119,6 +126,13 @@ class Topology:
     accessible_rooms: Mapping[CarrierId, frozenset[RoomId]]
     handoff_partners: Mapping[CarrierId, frozenset[CarrierId]]
     handoff_positions: Mapping[tuple[CarrierId, CarrierId], tuple[Position, Position]]
+    # Customer service dwell (SOLUTION_V3_1 §1): fixed per-facility time a
+    # serve occupies the serving lift at the room. `serve_exit_s` = the
+    # customer gets into a delivered car and drives out (Retrieve);
+    # `serve_entry_s` = the customer drives in and parks (Store). 0.0 =
+    # instant serve (exact pre-V3.1 semantics; unit fixtures rely on it).
+    serve_exit_s: float = 0.0
+    serve_entry_s: float = 0.0
 
     @staticmethod
     def build(
@@ -126,6 +140,8 @@ class Topology:
         shelves: Mapping[ShelfId, Shelf],
         rooms: Mapping[RoomId, Room],
         handoffs: tuple[Handoff, ...],
+        serve_exit_s: float = 0.0,
+        serve_entry_s: float = 0.0,
     ) -> Topology:
         accessible_shelves: dict[CarrierId, set[ShelfId]] = {cid: set() for cid in carriers}
         for s in shelves.values():
@@ -154,6 +170,8 @@ class Topology:
             accessible_rooms={k: frozenset(v) for k, v in accessible_rooms.items()},
             handoff_partners={k: frozenset(v) for k, v in handoff_partners.items()},
             handoff_positions=handoff_positions,
+            serve_exit_s=float(serve_exit_s),
+            serve_entry_s=float(serve_entry_s),
         )
 
 

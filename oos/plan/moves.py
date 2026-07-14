@@ -57,6 +57,14 @@ class Move:
     # GIVE and no dst lock. Only the plan solver constructs these — it owns
     # the held pallet's future landing; the move enumeration never yields
     # them.
+    # park_at (HOLD only, V3.1 staging prefetch): after ending held, the
+    # holder additionally GOTOs its handoff pose TOWARD this carrier —
+    # pre-positioning for a relay whose other member is still busy. Safe
+    # against spontaneous auto-handoffs: a pose's docked_at names the
+    # partner, and the partner only ever GOTOs its matching pose inside a
+    # move whose chain includes the holder — impossible while the holder's
+    # hands are full (free_chain requires empty hands).
+    park_at: Optional[str] = None
 
     @property
     def src_shelf(self) -> Optional[str]:
@@ -268,23 +276,82 @@ class MoveExecutor:
     # Enumeration
     # ------------------------------------------------------------------
 
-    def free_chain(self, c_from: CarrierId, c_to: CarrierId,
-                   holder: Optional[CarrierId] = None) -> Optional[tuple[CarrierId, ...]]:
-        """The shortest carrier chain c_from→c_to if every member is
-        claimable: unclaimed, not busy, empty-handed (except `holder`, the
-        source carrier already holding the pallet)."""
-        chain = self._chains.get((c_from, c_to))
-        if chain is None:
+    def _claimable(self, cid: CarrierId,
+                   holder: Optional[CarrierId]) -> bool:
+        if cid in self.claimed:
+            return False
+        cs = self.engine.state.carriers[cid]
+        if cs.is_busy:
+            return False
+        return cs.load is None or cid == holder
+
+    def _bfs_chain(self, c_from: CarrierId, c_to: CarrierId, ok,
+                   max_len: int) -> Optional[tuple[CarrierId, ...]]:
+        """Shortest chain c_from→c_to over members passing `ok`, at most
+        `max_len` carriers long. Deterministic (sorted expansion)."""
+        if not ok(c_from):
             return None
-        for cid in chain:
-            if cid in self.claimed:
-                return None
-            cs = self.engine.state.carriers[cid]
-            if cs.is_busy:
-                return None
-            if cs.load is not None and cid != holder:
-                return None
-        return chain
+        if c_from == c_to:
+            return (c_from,)
+        prev: dict[CarrierId, CarrierId] = {}
+        seen = {c_from}
+        frontier = [c_from]
+        depth = 1
+        while frontier and depth < max_len:
+            depth += 1
+            nxt: list[CarrierId] = []
+            for c in frontier:
+                for nb in sorted(self.topo.handoff_partners[c]):
+                    if nb in seen or not ok(nb):
+                        continue
+                    seen.add(nb)
+                    prev[nb] = c
+                    if nb == c_to:
+                        path = [nb]
+                        while path[-1] != c_from:
+                            path.append(prev[path[-1]])
+                        return tuple(reversed(path))
+                    nxt.append(nb)
+            frontier = nxt
+        return None
+
+    def free_chain(self, c_from: CarrierId, c_to: CarrierId,
+                   holder: Optional[CarrierId] = None,
+                   avoid: Optional[set] = None) -> Optional[tuple[CarrierId, ...]]:
+        """A canonical-length chain c_from→c_to whose every member is
+        claimable RIGHT NOW: unclaimed, not busy, empty-handed (except
+        `holder`, the source carrier already holding the pallet) — and
+        outside `avoid` (foreign plan reservations: checking those only
+        AFTER a one-path search is routing blindness — the BFS happily
+        returns the reserved route while an equal-length clean one exists;
+        observed as a two-plan deadlock, each blocking the other's only
+        found path).
+
+        Equal-length alternate routing (V3.1): capped at the canonical
+        length — longer detours turn two-carrier relays into facility-
+        spanning ones under load and collapse staging uptime (measured:
+        87% → 23%). Blocked with no equal-length alternative still means
+        wait."""
+        canon = self._chains.get((c_from, c_to))
+        if canon is None:
+            return None
+        av = avoid or ()
+        return self._bfs_chain(
+            c_from, c_to,
+            lambda c: c not in av and self._claimable(c, holder),
+            max_len=len(canon))
+
+    def chain_avoiding(self, c_from: CarrierId, c_to: CarrierId,
+                       avoid: set) -> Optional[tuple[CarrierId, ...]]:
+        """A canonical-length STATIC chain c_from→c_to avoiding the given
+        carriers (planning-time routing around volatile/reserved lifts —
+        the canonical path may cross one while an equal-length alternative
+        exists). Same length cap as `free_chain`."""
+        canon = self._chains.get((c_from, c_to))
+        if canon is None:
+            return None
+        return self._bfs_chain(c_from, c_to, lambda c: c not in avoid,
+                               max_len=len(canon))
 
     def iter_startable(self) -> Iterator[Move]:
         """Every startable move right now: physical legality + reservations +
@@ -366,21 +433,32 @@ class MoveExecutor:
                     src_kind, src_id, "room", rid, chain, pid, contents)
 
     def _make_move(self, src_kind, src_id, dst_kind, dst_id, chain, pid,
-                   contents) -> Move:
+                   contents, park_at=None) -> Move:
         makespan, busy = self.estimate_makespan(src_kind, src_id, dst_kind, dst_id, chain)
+        if dst_kind == "room":
+            # The room leg ends in a customer interaction that keeps the
+            # lift busy for the serve dwell (SOLUTION_V3_1 §1; the ENGINE
+            # value — live-adjustable from the viz — not the frozen topo):
+            # a car → delivery (exit dwell); an empty → staging, which only
+            # pays a dwell if a store is absorbed — not this move's cost.
+            if contents != "empty":
+                dwell = self.engine.serve_exit_s
+                makespan += dwell
+                busy += dwell
         return Move(
             src_kind=src_kind, src_id=src_id, dst_kind=dst_kind, dst_id=dst_id,
             chain=chain, pallet_id=pid, contents=contents,
-            est_makespan=makespan, est_busy=busy,
+            est_makespan=makespan, est_busy=busy, park_at=park_at,
         )
 
     def make_move(self, src_kind, src_id, dst_kind, dst_id, chain, pid,
-                  contents) -> Move:
+                  contents, park_at=None) -> Move:
         """Public constructor for plan-layer moves (incl. dst_kind='carrier'
-        HOLDs). The caller is responsible for legality — plan steps are
-        validated at plan level, not by the enumeration's oracle filter."""
+        HOLDs, optionally parking at the handoff pose toward `park_at`).
+        The caller is responsible for legality — plan steps are validated
+        at plan level, not by the enumeration's oracle filter."""
         return self._make_move(src_kind, src_id, dst_kind, dst_id,
-                               tuple(chain), pid, contents)
+                               tuple(chain), pid, contents, park_at=park_at)
 
     def chain_between(self, a: CarrierId, b: CarrierId
                       ) -> Optional[tuple[CarrierId, ...]]:
@@ -512,6 +590,11 @@ class MoveExecutor:
                 )
             if move.src_kind == "carrier" and len(move.chain) == 1:
                 raise RuntimeError("HOLD move with src == dst is a no-op")
+            if move.park_at is not None:
+                # Staging prefetch (V3.1): pre-position at the handoff pose
+                # toward the busy relay partner, rendezvous-ready.
+                roles[last].steps.append(
+                    (_GOTO, DockRef("handoff", move.park_at)))
         if move.src_kind == "shelf":
             from_key: Optional[tuple[str, str]] = ("shelf", move.src_id)
         else:

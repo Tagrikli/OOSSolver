@@ -84,7 +84,10 @@ def test_setpoint_world_converges_holds_and_churns():
     for _ in range(60):
         s.tick(0.5)
     assert s.retrieve_stats()["total"]["n"] > n0    # cars left...
-    assert 0.45 <= _fullness(s) <= 0.75, _fullness(s)   # ...level held
+    # V3.1: entry dwells throttle intake (each store pins its lift 45 s),
+    # so the churn equilibrium sits slightly below the instant-serve
+    # calibration — band floor 0.45 → 0.40.
+    assert 0.40 <= _fullness(s) <= 0.75, _fullness(s)   # ...level held
 
     s.configure_setpoint(target=0.25, churn=0.0)    # drain back down
     for _ in range(120):
@@ -101,6 +104,15 @@ def test_random_room_spreads_stores():
     s.reroll_layout(fullness=0.3)
     s.set_speed(64.0)
     s.play()
+    # The idle groom (V3.1) can hold a lift mid-plan while it still LOOKS
+    # staged, deflecting a store to the other room via the serve gate —
+    # this test's premise is a groom-free world. The bridge binds the
+    # solver LAZILY (first decide/heartbeat, wall-throttled), so force the
+    # bind — a getattr-and-hope here silently leaves the groom enabled.
+    s.bridge._rebind()
+    solver = s.bridge.solver
+    assert solver is not None
+    solver.groom_enabled = False
 
     def staged():
         return {cid for cid, cs in s.state.carriers.items()
@@ -108,18 +120,33 @@ def test_random_room_spreads_stores():
                 and cs.docked_at is not None and cs.docked_at.kind == "room"}
 
     def wait_staged(n=2, ticks=400):
+        """Both rooms staged AND the solver plan-quiescent: right after an
+        absorption a lift can LOOK staged while its store/stage plan still
+        awaits the done-sweep — the serve gate then deflects the next
+        store to the other room, breaking the determinism premise."""
         for _ in range(ticks):
             s.tick(0.25)
-            if len(staged()) >= n:
+            if len(staged()) >= n and (solver is None or not solver.plans):
                 return True
         return False
 
     def absorb_once():
-        """Enqueue one store; return which staged carrier took the car."""
+        """Enqueue one store; return which staged carrier took the car.
+        V3.1: the serve runs an entry dwell, so at the enqueue instant the
+        absorber is the staged lift now running a _ServeInteraction (its
+        load flips to the car only when the customer finishes parking).
+        Plain `is_busy` is too loose — the solver may claim a staged lift
+        for unrelated work (e.g. a groom move) in the same instant."""
+        from oos.sim.facility import _ServeInteraction
         before = staged()
         s.enqueue_store("small")
-        got = {cid for cid in before
-               if not s.state.carriers[cid].load.is_empty}
+        got = set()
+        for cid in before:
+            cs = s.state.carriers[cid]
+            if isinstance(cs.current_command, _ServeInteraction):
+                got.add(cid)
+            elif cs.load is not None and not cs.load.is_empty:
+                got.add(cid)
         return next(iter(got), None)
 
     def sample(n_hits, budget):
@@ -242,3 +269,30 @@ def test_cancel_mid_delivery_recovers():
             f"{sum(solver.room_staged(r) for r in solver.room_ids)}"
             f"/{len(solver.room_ids)} inflight={solver.ex.n_inflight} "
             f"plans={len(solver.plans)}\n{solver.dump_state()}")
+
+
+def test_reroll_clears_stale_solver_state():
+    """Operator report: after a re-roll at high fullness the solver
+    'waits 10-30 s' or stalls. shuffle_state wipes the ENGINE but the
+    old executor claims / in-flight moves / plans survived, pinning
+    carriers until the watchdogs cleared them. Re-rolling MID-FLIGHT
+    must start work on the new world immediately."""
+    s = Session("dibaji")
+    s.set_speed(64.0)
+    s.play()
+    for roll in range(6):
+        s.reroll_layout(fullness=0.8)
+        s.bridge._rebind()
+        solver = s.bridge.solver
+        assert solver is not None
+        moves0 = solver.ex.completed_moves
+        started = False
+        for _ in range(400):
+            s.tick(1 / 30)
+            if solver.ex.n_inflight > 0 \
+                    or solver.ex.completed_moves > moves0:
+                started = True
+                break
+        assert started, (
+            f"roll {roll}: no move started after re-roll "
+            f"(stale claims={list(solver.ex.claimed)})")

@@ -199,9 +199,18 @@ tick():
     # Rung 3 — STAGE: keep every room supplied with an empty pallet
     #           (top empty → room; escalate to uncover / a stage-plan)
 
-    # Rung 4 — GROOM: only when totally idle and lightly loaded,
-    #           tidy depth violations one move at a time
+    # Rung 4 — GROOM (V3.1): only when totally idle, declutter big
+    #           shelves — move non-big pallets to small shelves so SUV
+    #           admission stays open — and park floating empties.
+    #           Strictly monotone (big air only grows) ⇒ cannot loop.
 ```
+
+New retrieves are not the only planned work: **Evict** ("remove this
+specific car from its shelf, store it anywhere sensible") and **Place**
+("bring this specific car to this specific shelf, touching nothing already
+on it") arrive as external service commands (charger-shelf rotation,
+SOLUTION_V3_1 §2) and reuse the same dig machinery at strictly lower
+priority than customer retrieves.
 
 And the planner, for one request:
 
@@ -299,9 +308,17 @@ the ordering):
 | `EMPTY_FLOOR` | 10⁴ | Spends the last class slot on an empty (re-movable, so much cheaper). |
 | `TOP_EMPTY` | 10³ | Buries a top empty when empties are plentiful. |
 | `POLLUTE_BIG` | 300 | A sedan onto a scarce big shelf. |
+| `EV_SHELF` | 250 | Any scored placement onto a charger (EV) shelf — keep charger slots free for charge work while a non-EV alternative exists. Explicit `Place` targets pay nothing. |
 | `EMPTY_ON_BIG` | 100 | An empty onto a big shelf while small air exists. |
 | chain length | 200/hop | Prefer disposals inside the dig's own region — every extra hop rides a carrier other plans contend for. |
+| start wait (V3.1) | 2/s | Time the candidate's chain would idle before it can begin, per the plan's virtual schedule — a destination reachable *now* through one extra hop beats one that waits a minute for a carrier this plan still has to unload. |
 | makespan | ×0.001 | Final tie-break: analytic seconds. |
+
+Since V3.1 the sim also keeps a **virtual schedule**: per-carrier
+ready-times and per-shelf op-completion times, advanced with every
+emission. A plan's `est_cost` is the schedule's *makespan* (critical
+path), not the serial sum of its moves — so candidate selection actively
+prefers plans whose carriers work in parallel (SOLUTION_V3_1 §4).
 
 Read bottom-up it is a story: *prefer near and tidy; never sacrifice the
 staging pipeline for tidiness; never sacrifice class-air correctness for
@@ -316,9 +333,9 @@ shelf while at most `d` holds land back. Requested blockers *prefer* a
 hold: they land back on top of the dig shelf (depth 0) — perfectly
 positioned for their own upcoming delivery.
 
-### 7.4 Three plan flavors
+### 7.4 Five plan flavors
 
-The same machinery builds three kinds of plan:
+The same machinery builds five kinds of plan:
 
 - **Retrieve** (`plan`) — the full dig described above.
 - **Store** (`plan_store`) — recovery for a held car no single move can
@@ -328,6 +345,15 @@ The same machinery builds three kinds of plan:
 - **Stage** (`plan_stage`) — staging *is* a retrieval whose target is an
   empty pallet: dig out the cheapest buried empty and deliver it to the
   room. Used when no empty is on top of any reachable stack.
+- **Evict** (`plan_evict`, V3.1) — dig a *specific* car free and store it
+  at any scored ordinary placement; no room involved. Issued by the
+  external charger-rotation policy, and reused by the groom rung to
+  declutter big shelves.
+- **Place** (`plan_place`, V3.1) — dig a specific car free and land it on
+  top of a *specific* destination shelf. The destination's occupants are
+  untouchable (no digging into it, no hop-space use); a full destination
+  is an immediate no-solution — evicting from it first is the issuing
+  policy's job (SOLUTION_V3_1 §2).
 
 ## 8. The solver, a level deeper
 
@@ -413,6 +439,10 @@ engine as callbacks):
   (`held_set_storable` — a tiny DFS that also models staging turnover and
   air-creating extractions). A store that is not serveable *right now*
   simply waits at the door; it never becomes an unstorable held car.
+  The held set counts **serve dwells in progress** as committed future
+  held cars (the customer mid-dwell is already parking) — otherwise two
+  concurrent dwells could race the last storable slot behind each
+  other's backs.
 
 ## 9. Worked example, step by step
 
@@ -479,10 +509,13 @@ reserved: lift L1, dig shelf A1, one air slot on A2, one on B2
   release) and immediately starts intent 4: `GOTO A1 · TAKE car7 · GOTO
   R1`.
 - L1 docks at R1 holding the requested car → the engine's
-  arrival-triggered **serve** fires: the customer drives off, and the
+  arrival-triggered **serve** fires: the customer gets in and drives off
+  — which takes the facility's fixed **exit dwell** (`serve_exit_s`,
+  V3.1), during which L1 is busy at the room. When the dwell ends the
   *pallet stays* — L1 is now holding a fresh empty at R1. **The delivery
   itself re-staged the room.** Conserved pallets make the rest state an
-  attractor.
+  attractor. (Store serves symmetrically pay `serve_entry_s` while the
+  customer drives in and parks.)
 
 Total: four moves, two of them overlapped, zero wasted motion, and the
 end state was proven solvable before the first carrier twitched.
@@ -538,12 +571,22 @@ hides:
 - **Overload quiescence is not a wedge.** A full facility with only
   stores queued is *supposed* to rest — customers wait at the door until
   a retrieval frees an empty. The liveness watchdogs must know this state
-  or they false-alarm on correct behavior.
-- **Grooming must provably terminate.** Idle tidying only makes moves
-  that *strictly reduce* the global depth-violation count — a bounded
-  non-negative potential can't descend forever, so no shuffle loops. And
-  it only runs below 45% load: depth-k is unmaintainable at high
-  fullness and must never fight the correctness machinery.
+  or they false-alarm on correct behavior. The same excuse covers
+  **big-air overload**: a queue holding only SUVs the admission oracle
+  currently refuses is a legitimate wait, not a stall (the campus
+  endurance run lost five healthy days to a 300 s stuck verdict tripped
+  by six such "zombie" bigs plus a natural post-rush arrival lull).
+  Corollary: those refused bigs also must not silence the groom — the
+  declutter that mints big air is the very thing they are waiting for.
+- **Grooming must provably terminate — so groom on a monotone resource.**
+  The V3 groom (depth-k tidying + idle uncovering) had no shared
+  potential across its move families and was observed to shuffle in
+  circles. The V3.1 groom declutters big shelves instead: every move
+  takes a non-big *off* a big shelf onto a small shelf, so free big air
+  strictly grows toward a bound — no loop is expressible. It also earns
+  its keep: SUV admission needs a *raw* free big slot, so decluttering
+  during idle time directly raises the SUV acceptance rate
+  (SOLUTION_V3_1 §3).
 - **Cancel-mid-delivery must abort, not wait.** A delivery whose request
   is canceled while the car rides to the room can *never* complete (the
   serve will never fire). The solver aborts the move; the carrier frees
@@ -566,6 +609,7 @@ hides:
 | [`oos/plan/runtime.py`](../oos/plan/runtime.py) | The headless pump loop + the stuck watchdog (how to *drive* the solver without the viz). |
 | [`oos/plan/battery.py`](../oos/plan/battery.py) | The acceptance battery — 7 gates from single deep digs to 7-day continuous operation. Run `python -m oos.plan.battery --gate 2` for a 30-second taste. |
 | [`docs/SOLUTION_V3.md`](SOLUTION_V3.md) | The design spec this implements. |
+| [`docs/SOLUTION_V3_1.md`](SOLUTION_V3_1.md) | The V3.1 revisions: service dwell, Evict/Place + EV shelves, big-air groom, concurrency-aware planning. |
 | [`docs/AGENT_BEHAVIOR.md`](AGENT_BEHAVIOR.md) | The behavior contract (what "correct" means, operator-approved). |
 
 ### Glossary
@@ -580,5 +624,9 @@ hides:
 | **extraction** | Pulling a non-big off a big shelf into small air to grow big air. |
 | **intent** | One planned relocation inside a plan. |
 | **rung** | One priority level of the dispatcher's ladder. |
+| **dwell (serve)** | Fixed per-facility time a customer occupies the room: `serve_exit_s` to get in and drive out, `serve_entry_s` to drive in and park. The lift is busy throughout. |
+| **EV shelf** | A regular shelf with an automatic charger (any slot). Deprioritized as a scored destination; targeted explicitly via Place. |
+| **evict / place** | V3.1 service ops: dig a specific car out and store it anywhere (evict) / land it on a specific shelf without touching that shelf's occupants (place). |
+| **declutter** | The V3.1 groom: idle-time relocation of non-bigs off big shelves to keep SUV admission open. |
 | **future view** | The world as it will be when all in-flight moves finish. |
 | **solvable** | Every stored car retrievable and every held car storable. |

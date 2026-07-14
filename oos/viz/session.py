@@ -178,10 +178,28 @@ class Session:
         info = self.env.advance_until(sim_time=None)
         self._record_advance(info)
 
+    def set_serve_dwell(self, seconds: float) -> None:
+        """Override the customer entering/leaving duration (both entry and
+        exit, SOLUTION_V3_1 §1) live. Remembered across reset / facility
+        swap (the rebuilt engine restores its topology constants; the
+        session reapplies the override)."""
+        self.serve_dwell_s = max(0.0, float(seconds))
+        self._apply_serve_dwell()
+
+    def _apply_serve_dwell(self) -> None:
+        dwell = getattr(self, "serve_dwell_s", None)
+        if dwell is None:
+            return
+        eng = self.env.engine
+        if hasattr(eng, "serve_exit_s"):
+            eng.serve_exit_s = dwell
+            eng.serve_entry_s = dwell
+
     def reset(self) -> None:
         """Re-roll the world from the session seed and clear playback state."""
         self.env.reset(seed=self._seed)
         self.env.set_auto_arrivals(self.auto_arrivals)
+        self._apply_serve_dwell()      # rebuilt engine restored topo dwells
         self.playing = False
         self.log.clear()
         self.dropped_suvs = 0
@@ -189,6 +207,7 @@ class Session:
         self.last_step = None
         self._ret_sizes = {}           # pallet id -> "small"|"big" (cached)
         self._ret_stats = {"small": [], "big": [], "?": []}
+        self._srv_stats = {"small": [], "big": [], "?": []}
         self._note(f"reset · facility={self.facility_name}")
         self._apply_random_room()      # the rebuilt engine reset the flag
         if self.auto_arrivals and hasattr(self, "_sp_target"):
@@ -279,6 +298,41 @@ class Session:
         self.env.wake_waiting_carriers()
         self._zero_refresh()
         self._note(f"+ STORE {size}")
+
+    def pending_relocation_ids(self) -> set[int]:
+        """Pallets with a pending Evict/Place service op — the canvas marks
+        them ORANGE (a relocation, not a customer request)."""
+        from oos.sim.tasks import Evict, Place
+        return {t.pallet for t in self.env.engine.queue.pending
+                if isinstance(t, (Evict, Place))}
+
+    def request_evict(self, pallet_id: int) -> None:
+        """Service op (SOLUTION_V3_1 §2): remove this specific car from its
+        shelf and store it anywhere sensible — no room involved."""
+        from oos.sim.tasks import Evict
+        if int(pallet_id) in self.pending_relocation_ids():
+            self._note(f"pallet {pallet_id}: relocation already queued")
+            return
+        self.env.engine.queue.add(Evict(
+            arrived_at=self.env.engine.state.time, pallet=int(pallet_id)))
+        self.env.wake_waiting_carriers()
+        self._zero_refresh()
+        self._note(f"+ EVICT pallet={pallet_id}")
+
+    def request_place(self, pallet_id: int, shelf: str) -> None:
+        """Service op (SOLUTION_V3_1 §2): bring this specific car to this
+        specific shelf (lands on top; destination occupants untouched). A
+        full destination is rejected by the solver with a note."""
+        from oos.sim.tasks import Place
+        if int(pallet_id) in self.pending_relocation_ids():
+            self._note(f"pallet {pallet_id}: relocation already queued")
+            return
+        self.env.engine.queue.add(Place(
+            arrived_at=self.env.engine.state.time, pallet=int(pallet_id),
+            shelf=shelf))
+        self.env.wake_waiting_carriers()
+        self._zero_refresh()
+        self._note(f"+ PLACE pallet={pallet_id} -> {shelf}")
 
     def request_retrieve(self, pallet_id: int) -> bool:
         """Customer asks for pallet `pallet_id` back (toggles the request).
@@ -483,7 +537,20 @@ class Session:
             self.env.engine, fullness=float(fullness),
             rng=np.random.default_rng(seed), require_solvable=True,
         )
+        # Mid-dwell serves are moot in the new world: forget them BEFORE
+        # clearing the queue (clear_queue deliberately keeps in-service
+        # tasks — committed customers — but a re-roll vaporized the room).
+        getattr(self.env.engine, "_serving_tasks", set()).clear()
         self.env.engine.clear_queue()
+        # The shuffle wiped the ENGINE's dynamic state, but the solver
+        # stack still references the old world: executor claims / shelf
+        # locks / in-flight MoveStates and committed plans all point at
+        # pallets that no longer exist. Left in place they pin carriers
+        # until the watchdogs clear them (120-1200 sim-s — the observed
+        # "solver waits 10-30 s after a re-roll" and occasional full
+        # stall). Drop the bridge state so the next query rebinds a FRESH
+        # executor + solver against the shuffled world.
+        self.bridge._drop_state()
         self.env.wake_waiting_carriers()
         self._zero_refresh()
         self._note(f"re-roll layout · fullness={fullness:.2f} · seed={seed}")
@@ -553,10 +620,8 @@ class Session:
                     and not cs.load.is_empty:
                 sizes[cs.load.id] = cs.load.contents
 
-    def retrieve_stats(self) -> dict:
-        """Since-reset retrieval latency stats per car class + total."""
-        stats = getattr(self, "_ret_stats", {"small": [], "big": [], "?": []})
-
+    @staticmethod
+    def _agg_stats(stats: dict) -> dict:
         def agg(xs):
             if not xs:
                 return {"n": 0}
@@ -568,6 +633,20 @@ class Session:
         total = stats["small"] + stats["big"] + stats["?"]
         return {"sedan": agg(stats["small"]), "suv": agg(stats["big"]),
                 "total": agg(total)}
+
+    def retrieve_stats(self) -> dict:
+        """Since-reset retrieval latency stats per car class + total."""
+        return self._agg_stats(
+            getattr(self, "_ret_stats", {"small": [], "big": [], "?": []}))
+
+    def serve_stats(self) -> dict:
+        """Since-reset SERVICE-time stats: delivery time minus the moment the
+        solver first assigned this car a plan (its turn in the queue came).
+        Strips the queue-position wait that stacks earlier requests' work
+        onto later ones; falls back to full latency when no plan was ever
+        assigned (e.g. camped deliveries)."""
+        return self._agg_stats(
+            getattr(self, "_srv_stats", {"small": [], "big": [], "?": []}))
 
     def inventory(self) -> dict:
         """Current facility contents for the status panel."""
@@ -630,9 +709,23 @@ class Session:
                 if stats is None:
                     stats = self._ret_stats = {"small": [], "big": [], "?": []}
                 stats.setdefault(size, stats["?"]).append(float(c.cost))
+                # Service time: delivery minus first plan assignment (the
+                # moment its turn came), not minus request arrival.
+                srv = float(c.cost)
+                solver = getattr(self.bridge, "solver", None)
+                if solver is not None:
+                    t0 = getattr(solver, "first_plan_t", {}).pop(
+                        task.pallet, None)
+                    if t0 is not None:
+                        srv = (task.arrived_at + float(c.cost)) - t0
+                sstats = getattr(self, "_srv_stats", None)
+                if sstats is None:
+                    sstats = self._srv_stats = {"small": [], "big": [],
+                                                "?": []}
+                sstats.setdefault(size, sstats["?"]).append(srv)
                 label = {"small": "sedan", "big": "SUV"}.get(size, "car")
                 self._note(f"✓ DELIVERED {label} pallet={task.pallet} "
-                           f"in {c.cost:.0f}s")
+                           f"in {c.cost:.0f}s (work {srv:.0f}s)")
         for t in info.get("dropped", []):
             if getattr(t, "size", "") == "big":
                 self.dropped_suvs = getattr(self, "dropped_suvs", 0) + 1

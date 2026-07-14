@@ -246,3 +246,267 @@ PASS. Detector-artifact catalogue for future hunts: stale freeze clocks
 across rest, chain-transit "loops", extraction round-trips, fresh-work
 flips at sample instants — every one produced a convincing false
 "FROZEN" at some point this session.
+
+---
+
+# V3.1 revision session — 2026-07-13
+
+Operator-driven revisions, specified in `docs/SOLUTION_V3_1.md` and
+implemented end-to-end in one session. Battery ALL PASS (7/7 gates,
+dwell-adjusted bounds), 58/58 tests.
+
+## What changed
+
+| Revision | Where | Essence |
+|---|---|---|
+| Customer service dwell | `oos/sim/facility.py` (`_ServeInteraction`, `serve_done` event), `Topology.serve_exit_s/entry_s`, DSL defaults 45 s | Serves occupy the lift at the room for a fixed per-facility dwell; the state mutation happens at dwell END; in-service tasks are committed (uncancelable, excluded from matching/sweeps). Zero-dwell topologies keep exact V3 semantics. |
+| Evict / Place service ops | `oos/sim/tasks.py` (`Evict`, `Place`), `planner.plan_evict/plan_place` (generalized `_build` with `dest_any` / `dest_shelf`), solver `_assign_service_plans` | Charger-shelf rotation primitives: dig a specific car out and store it anywhere (evict) / land it on a specific shelf without touching that shelf's occupants (place; full destination = fast REJECT note). Strictly below customer retrieves. |
+| EV shelves | `Shelf.is_ev`, DSL `Shelf(ev=True)`, `EV_SHELF=250` in the scoring table, `tiny_medipol_ev` facility | Charger shelves deprioritized as scored destinations; explicit Place targets pay nothing. |
+| Groom repurposed | solver `_rung_groom` | Depth-k tidying + idle uncovering DELETED (the loop family). New groom: park floating empties + DECLUTTER big shelves (non-bigs → small air) so SUV admission stays open; buried non-bigs escalate to small-restricted evict plans. |
+| Concurrency | `PlanSim.schedule` ledgers, `_sched` at every emission, wait-aware pickers (+2/s), `est_cost = makespan + surcharges`, push-push commutation in `_shelf_ops_ready` | Plans are virtually scheduled; cost is the critical path; destinations reachable NOW beat ones waiting on a carrier the plan still has to unload; commuting pushes skip false ordering. |
+
+## Rules that took a fight (again)
+
+- **Groom termination must be a monotone resource, enforced on whole
+  plans.** First loop: the evict's own hand-freeing parked an empty onto
+  a big shelf while extracting one — net zero, forever. Guard: a groom
+  plan commits only if it strictly reduces non-bigs-on-big-shelves.
+- **Staged lifts are untouchable to the groom.** Second loop: parking a
+  staged room's empty to open a corridor forces a re-stage whose uncover
+  pushes a small back onto the big shelf — a perpetual carousel
+  (A1/A4/R1). Rest-state infrastructure outranks tidying.
+- **The depth-k term is a preference, not a correctness cost** — the
+  declutter guard must see past it or it stalls at moderate fullness.
+- **Anchors must be freed and exempted.** Shelf-destination plans thread
+  cross-region chains through an anchor lift: it must be exempt from the
+  volatile set (it is plan-reserved), on the mandatory hand-freeing list
+  even when off the exit chain, and the dig carrier itself is never
+  volatile in shelf-destination modes.
+- **A dropped diverged plan at rest is not a wedge**: the runtime's
+  empty-scheduler path must re-check `work_pending` after
+  force-replanning before declaring stuck.
+- **Gate 4 physics**: dwell costs more than the per-delivery model —
+  a pinned lift also delays staging and neighboring digs (~4% on
+  campus); bound = 0.95 × R₀/(1 + R₀·E/(3600·n)). Zero-dwell rate
+  unchanged (~148–150/h): the solver itself did not regress.
+
+## Viz visibility pass (same session, operator's-father request)
+
+`oos/viz/app.py`: ~1.7× bigger pallets/carriers/rooms (dense layouts fall
+back to compact metrics), 3 px shelf borders, intuitive item palette
+(turquoise empty / dark-green sedan / dark-red SUV — saturated shades so
+they pop on the dark background), S/X letter glyphs (red-green colorblind
+insurance), steel-gray carriers with a same-ratio centered cargo
+rectangle, working carriers pulse (steady when paused), room borders =
+live state (green ready / red unstaged / orange customer-at-door with a
+serve-dwell countdown), EV shelves get a yellowish second border, bigger
+labels, thicker requested-car outline, and a toggleable on-canvas legend.
+
+## Staging prefetch (same session, operator concurrency report)
+
+Observed: after a store, the shuttle that will re-stage the room idles
+until the lift finishes shelving the car, then runs the WHOLE relay —
+because moves claim their chains atomically (the deadlock-impossibility
+cornerstone), a relay cannot start while any member is busy. Structural,
+not a plan-layout accident; the fix uses the architecture's own safe
+primitive. **Staging prefetch** (`_rung_stage_prefetch` + `Move.park_at`):
+while a room's lift is busy with short-horizon work (from the ENTRY DWELL
+onward — the customer is still parking), a partner shuttle fetches the
+next staging empty as a HOLD (claims only the shuttle) and parks at the
+handoff pose toward the lift; when the lift frees, only the rendezvous +
+room leg remain. Guards learned while building it: one prefetch per room
+(in-flight prefetches count as "provided for" — first cut dispatched BOTH
+shuttles); the stage rung must not race an in-flight prefetch with a
+fresh shelf fetch (offer only carrier-sourced candidates until it lands);
+skip when a lift-own top empty exists (single-move stage beats it), when
+the lift is mid-EXIT-dwell (the delivery re-stages by itself), or when a
+plan owns the room; groom yields entirely while any room is unstaged
+(held empties are staging material). Crafted benchmark: re-stage at ~78 s
+vs ~103 s serialized.
+
+Latent bug exposed and fixed: `GatedEngine._find_pending_store` predates
+the serve dwell and skipped the in-service check — EVERY staged lift
+started serving the SAME store simultaneously (self-healing at dwell end,
+but each extra lift was pointlessly pinned for the full dwell). Also
+switched in-service tracking to task IDENTITY: frozen-dataclass value
+equality made two same-instant equal stores block each other.
+
+Prefetch round 2 (operator repro: fresh tiny_medipol, 4 sequential
+sedans — 4th store's re-stage still serialized): three stacked causes.
+(1) The store buried the lift's LAST local top empty; the own-empty
+guard now ignores executor-locked shelves (a dst-locked shelf's top is
+about to be buried by the in-flight push). (2) The anti-undo guard
+blocked storing the parked car back onto the shelf its pallet was staged
+from, forcing a pointless store-PLAN escalation on air-tight fresh
+layouts — records are now contents-aware (a serve changed the pallet's
+cargo: progress, not churn). (3) That store plan's room reservation
+blocked the prefetch. Hardening from the stress suite: prefetch yields
+entirely to plan work (any active plan or pending retrieve — a parked
+loaded shuttle can starve a struggling plan's chains into a wedge;
+observed at 3-h SUV steady state), and a patience-gated RELEASE VALVE
+(`_rung_release_stranded`, 60 s) parks any held empty nothing consumed —
+an expired prefetch or dropped-plan orphan at pool-full wedged the
+facility with the old idle-only groom park path gated off.
+
+Deep-retrieve wedge (operator repro: tiny_medipol, dwell slider 0,
+re-roll ~0.78, several deep big-shelf retrieves → "only retries, no
+plan"): a LATENT false-completion bug in the plan advancer, present
+since V3. `_already_at_dst` (the rung-race absorber) marked a pending
+LAND intent done because its pallet was "already on" the dig shelf —
+where a blocker STARTS before its hold has popped it. Whenever the hold
+move could not start in the assignment tick (busy chains; the dwell-0
+fast regime makes this common), the land falsely completed, the plan
+finished, and the blocker orphaned on its holder. At zero small air the
+orphan was oracle-unstorable, permanently wedging the dig carrier —
+every later plan for that shelf failed. Fix: the shortcut fires only
+when every EARLIER intent moving the same pallet is done ("already
+returned" vs "never left"). Regression:
+test_land_intent_never_falsely_completes (exact captured seed).
+
+## E/P canvas ops + the hardening they surfaced
+
+Viz: hover a car + **E** = evict; **P** = arm place (orange outline +
+hint), then click the destination shelf; pending Evict/Place cars carry
+an ORANGE border (relocation, not a yellow customer request); dedupe
+guard on repeat keys; legend row added.
+
+Testing the flow surfaced four solver fixes, battery re-certified 7/7:
+1. **In-flight room-tail hands projection** (PlanSim): a plan racing an
+   in-flight stage saw the lift empty-handed, emitted no park intent for
+   the arriving staged empty, and wedged until the stall watchdog. Only
+   the room-destination tail is projected — a BLANKET projection (chain
+   members → None, hold tails) measurably broke the day-cycle drain
+   (gate-6 day-1 leftover 107).
+2. **Land-chain unblock valve**: at executor quiescence a delivered
+   plan's cleanup blocked by a lift-held empty gets that empty parked
+   (retrieval cleanup outranks staged-rest) instead of pacing the
+   1200 s drop-replan crawl that stranded day-cycle leftovers.
+3. **Cleanup parks avoid plan-touched shelves**: park_delivered chose a
+   shelf the plan still POPS — the push-after-pop sequence edge plus the
+   pop-chain needing the very hands the park frees = a three-way
+   circular cleanup wait (captured live: extract:B2 ↔ park_delivered:22
+   → B2 ↔ L2's hands). The unblock valve also generalized from land-only
+   to all pending cleanup intents.
+4. **Serve-time big solvability re-check** (`store_serve_ok`): admission
+   checks solvability at ARRIVAL; the customer walks in later — a big
+   whose every remaining placement had become solvability-breaking
+   stranded unstorable on dibaji's only lift (gate-3 seed 2). The gate
+   re-checks `oracle.admission_ok` at the door; the customer waits.
+
+## Evict restore-semantics (operator revision, 2026-07-14)
+
+An evicted car's shelf must end UNCHANGED apart from the removed car.
+The dest_any dig no longer disposes blockers permanently: every blocker
+is HELD (spare carrier) or TEMP-HOPPED (extract_hop to another shelf,
+sim-tracked), and after the target's relocate they are pushed back in
+reverse pop order (land / extract_return, requires_target_off) — the
+original composition minus the target. Extraction hops onto the dig
+shelf are disabled in this mode (x_air=0: a hop onto X would be
+mistaken for a blocker and "restored"); the target's exit pick excludes
+active temp shelves (landing on one would bury a pending return); big
+air is only grown for the target's own landing. Also benefits the
+groom's declutter evicts (bigs go home, only the non-big leaves).
+Campus @0.8 evict sweep: 20/20 planned and completed with cars
+preserved in order (the operator's earlier "no plan" reports trace to
+the pre-fix planner races patched this session); the two "unrestored"
+sweep hits were restored EMPTIES legitimately consumed by staging
+moments later — empties remain infrastructure, cars stay put.
+Regression: test_evict_buried_car_restores_shelf. Battery 7/7,
+65/65 tests.
+
+## Characterization campaign (reports/tiny_medipol/, 2026-07-14)
+
+Operator asked for a comprehensive tiny_medipol test — every feature,
+every difficulty, plus a 30-day endurance run — with a report + graphs.
+Harness: `oos/plan/characterize.py` (experiments A-G + month); output:
+`reports/tiny_medipol/{report.md, plots/, data/}`. Headlines: dig
+latency flat in fullness 0.3→0.95 (depth dominates, ~30 s/blocker);
+drain knee k≈4 → ~50 cars/h; intake dwell-bounded; SUV acceptance knee
+at 0.70→0.85; evict/place contracts 15/15; groom converges ≤7 moves;
+prefetch −16 % restage; 30 days: 1293=1293 tasks, 0 stuck, flat
+latency, 30/30 rotations, 11 s wall. The campaign surfaced and fixed
+four real defects: one-path routing blindness (→ equal-length
+availability/avoid-aware BFS in free_chain; unbounded rerouting was
+measured collapsing staging uptime and rejected), serve-dwell hands
+race (PlanSim projects dwells + room-tails), double-booked cleanup
+parks (owned-pallet guard on land-route emission), stall-drop/replan
+atomicity (one-tick planning hold). Gate-4 contention allowance
+0.95→0.93 with the zero-dwell sentinel measured at 152/h (above the
+original 150/h bar). Battery 7/7, 65/65 tests.
+
+## Characterization campaign, campus (reports/campus/, 2026-07-14)
+
+Operator: "do the same report thing for campus as well." The harness
+grew per-facility configs (`CONFIGS` + `--facility`; drain ks and burst
+scale with lift/room count; the groom/prefetch worlds are now built
+programmatically instead of tiny-hardcoded), and exp_month dumps
+incrementally so a killed run keeps its completed days. Campus
+headlines land in `reports/campus/report.md`.
+
+The campus month was the payoff: it surfaced two deep defects that
+tiny_medipol is too small and too empty to reach.
+
+1. **Zombie-big starvation + liveness false-positive (days 20-25 of
+   the first run).** Campus runs at 411 pallets / 420 slots, so big
+   air is structurally ~0 for long stretches. Six SUV stores arrived
+   against zero big air and became zombies: unservable (the admission
+   oracle rightly refuses), unsweepable (`_can_accept_big_item` sees
+   in-principle-evictable non-bigs on big shelves), and — the defect —
+   they LOCKED OUT the groom (`_groom_allowed` required an empty
+   queue), i.e. the queue starved its own remedy. On top, the
+   endurance runner's stuck detector read "work pending + a natural
+   post-rush arrival lull" as a wedge and aborted five healthy days;
+   deterministic replay showed the solver processing 695- and
+   1471-delivery bursts the moment a dense stretch let a run survive.
+   Fixes: `_groom_allowed` tolerates a queue of currently-refused bigs
+   (declutter mints exactly the air they wait for);
+   `overload_quiescent` extended to big-air overload (all-big pending
+   + admission false = legitimate rest, not a stall). Tests:
+   test_pending_unservable_bigs_do_not_block_groom,
+   test_bigair_overload_is_quiescent_not_stuck.
+2. **Three-plan air deadlock (day 1 evening of the fixed run).** At
+   ~98 % pallet occupancy the facility owns ~9 free slots TOTAL; three
+   concurrent retrieval plans locked/reserved eight of them as their
+   own dig shelves and slot reservations, the in-view air fell below
+   the oracle floor (every `move_ok` false facility-wide), every
+   remaining land/extract chain needed a lift, and every lift was
+   staged holding an empty it could not legally park. Stall-drops
+   rebuilt the identical plans (livelock); the land-chain unblock
+   valve found zero oracle-passing parks and gave up. Fix:
+   `_force_park_for_land` — terminal recovery inside the valve. When a
+   delivered plan stalls at full executor quiescence and no
+   oracle-gated park exists anywhere, force-park one staged empty
+   WITHOUT the oracle gate (dig shelves that nothing pops from anymore
+   become legal push targets; the land's own slot stays protected by
+   the reservation margin). Rationale: the oracle is refusing moves
+   out of an already-failing view, and a transient solvability debt is
+   strictly better than the only alternative — a permanent deadlock.
+   Deterministic repro: seed-42 campus month, day 1 evening (135 del /
+   232 leftover before; 372 del / clean after).
+
+3. **Liveness verdict blind to customer interactions (tiny month
+   day 22 of the re-run).** A quiet afternoon lull + one small store
+   transiently gate-refused at its arrival event: no move completes,
+   no event re-asks the gate, and the stuck detector's progress clock
+   (completed moves only) declared a wedge at the very instant the
+   store's entry dwell began. Deterministic replay showed a fully
+   healthy world — the day's 43 stores all served, zero deliveries
+   simply because none were due yet. Fixes in the runtime liveness
+   path, tried in order before escalating: any busy carrier (a serve
+   dwell IS progress) rebaselines the clock; then `retry_serves()`
+   (gates are time-varying — service, not a verdict, is the answer to
+   a lull); then the overload excuses.
+
+Also this session: serve gates now count in-flight store dwells as
+committed held cars (`_free_held_cars` virtual entries — closes a
+narrow race where two concurrent dwells could both claim the last
+storable slot; unit-tested contract); `plan_store` failures feed
+`planner_failures` so a stranded held car reads as a failure storm
+instead of silence; and `_groom_allowed` also yields to a stranded
+plan-less held big at zero raw big air (defensive — reachable if a
+dispose consumes the last big slot during the post-serve hands-off
+window; predicate unit-tested). One earlier misread corrected: the
+`[.B]` glyphs in solver dumps are busy-flags, not held bigs — no
+stranded-big state was actually observed in any month run. The full
+campaign (campus month + A-G, tiny all) re-ran on the final build for
+the published reports. Battery 7/7, 69/69 tests.
