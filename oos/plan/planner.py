@@ -75,6 +75,10 @@ class Intent:
     # Landing intents that return a held blocker to the dig shelf must wait
     # until the target has been popped off it (else they would re-bury it).
     requires_target_off: bool = False
+    # Start only after every land/extract_return in the plan is done (the
+    # stage re-deliver: its empty must not re-occupy the lift's hands
+    # while the lands still need them as a relay).
+    requires_lands_done: bool = False
     # The intent that takes the TARGET off the dig shelf: the retrieve/stage
     # "deliver", or the evict/place "relocate" (V3.1). Landing readiness
     # (`requires_target_off`) keys on this flag, not on the intent kind.
@@ -555,6 +559,7 @@ class RetrievalPlanner:
         locked_shelves: set[str],
         reserved_slots: dict[str, int],
         owned_pallets: set[int],
+        cross_region_ok: bool = False,
     ) -> Optional[Plan]:
         """Dig out the cheapest buried empty and deliver it to `room` —
         multi-move staging for when every empty is buried deeper than the
@@ -570,16 +575,26 @@ class RetrievalPlanner:
                     candidates.append((n - 1 - i, pal.id))
         candidates.sort()
         best: Optional[Plan] = None
-        for _depth, pid in candidates[:4]:
-            plan = self.plan(engine, pid, requested, [(lift, room)],
-                             reserved_carriers=reserved_carriers,
-                             locked_shelves=locked_shelves,
-                             reserved_slots=reserved_slots,
-                             owned_pallets=owned_pallets)
-            if plan is not None:
-                plan.kind = "stage"
-                if best is None or plan.est_cost < best.est_cost:
-                    best = plan
+        # Cross-region digs (the dig carrier is ANOTHER serving lift) are
+        # licensed only at quiescence: mid-rush they un-stage the partner
+        # room for a multi-move relay that patience would beat (gate 6
+        # rolled cars over exactly this), while at rest they are the ONLY
+        # way to stage a room whose region holds no empty (the operator's
+        # two-empty geometry).
+        self._stage_cross_region_ok = cross_region_ok
+        try:
+            for _depth, pid in candidates[:4]:
+                plan = self.plan(engine, pid, requested, [(lift, room)],
+                                 reserved_carriers=reserved_carriers,
+                                 locked_shelves=locked_shelves,
+                                 reserved_slots=reserved_slots,
+                                 owned_pallets=owned_pallets)
+                if plan is not None:
+                    plan.kind = "stage"
+                    if best is None or plan.est_cost < best.est_cost:
+                        best = plan
+        finally:
+            self._stage_cross_region_ok = False
         return best
 
     # ------------------------------------------------------------------
@@ -882,12 +897,25 @@ class RetrievalPlanner:
         xc = ex.shelf_carrier(X)
         if xc in reserved_carriers:
             return None      # dig carrier owned by another plan — wait
-        if dest_shelf is not None or dest_any:
-            # Shelf-destination modes: the dig carrier is plan-reserved for
-            # the whole run (reserved_carriers() includes it), so even when
-            # it is a serving lift the stage rung cannot load it — it is
-            # OURS, not volatile. (Room mode keeps the stricter candidate
-            # structure: the dig lift must BE the delivery lift.)
+        tgt_is_empty = any(p.id == target and p.is_empty
+                           for p in state.shelves[X].stack)
+        cross_ok = getattr(self, "_stage_cross_region_ok", False)
+        if dest_shelf is not None or dest_any \
+                or (tgt_is_empty and (xc == lift or cross_ok)):
+            # The dig carrier is plan-reserved for the whole run
+            # (reserved_carriers() includes it), so even when it is a
+            # serving lift the stage rung cannot load it — it is OURS,
+            # not volatile. Shelf-destination modes always need this;
+            # room mode needs it exactly for STAGE plans (empty target):
+            # plan_stage must dig wherever the pool's spare empty
+            # actually is (operator's two-empty geometry: the staged
+            # lift relays its region's buried spare to the partner room
+            # — with xc left volatile, every dispose/hold chain the dig
+            # needs was refused and the second room stayed unstaged
+            # forever). Retrieves keep the stricter own-region rule: the
+            # assign rung has candidate (lift, room) flexibility, and an
+            # unconditional exemption measurably freezes the SUV steady
+            # state (gate 6).
             volatile = volatile - {xc}
         if dest_shelf is not None:
             # Place: the exit leg runs to the destination's carrier.
@@ -1015,6 +1043,21 @@ class RetrievalPlanner:
             if m_contents == "empty":
                 e_dst = self._pick_empty_dst(sim, c, requested,
                                              avoid=avoid_chain, exclude={X})
+                if e_dst is None:
+                    # avoid_chain can exclude every shelf with air (the
+                    # operator's two-empty geometry: the staged lift must
+                    # relay the pool's other empty to its partner room,
+                    # and the only air sits on the deliver chain's own
+                    # carriers). Parking onto the MEMBER'S OWN shelf
+                    # contends with nobody — only this carrier pushes
+                    # there, and it is the one being freed.
+                    e_dst = next(
+                        (sid for sid in sorted(self.shelf_ids)
+                         if self.ex.shelf_carrier(sid) == c and sid != X
+                         and sim.air.get(sid, 0) > 0
+                         and self.placement_score(
+                             sim, sid, "empty", requested) < HARD),
+                        None)
                 if e_dst is None:
                     return False
                 dq = sim.push(e_dst, m_pid, "empty")
@@ -1240,6 +1283,7 @@ class RetrievalPlanner:
                         requires_target_off=True))
                     self._sched(sim, ("shelf", where), ("shelf", X),
                                 self.ex.shelf_carrier(where))
+        hop_spare = None
         if held_blockers and not dest_any:
             # Unrequested land first; requested land last (they end on top,
             # depth-0 for their own upcoming delivery).
@@ -1276,27 +1320,59 @@ class RetrievalPlanner:
                                         if i.src_shelf is not None}
                         plan_shelves |= {i.dst_id for i in sim.intents
                                          if i.dst_kind == "shelf"}
-                        e2_dst = self._pick_empty_dst(
-                            sim, lift, requested,
-                            avoid=avoid_chain,
-                            exclude={X} | plan_shelves)
-                        if tgt_contents == "empty" and e2_dst is None:
-                            # STAGE plan with nowhere else to put the
-                            # delivered empty: the `or X` fallback would
-                            # park the staging back onto the dig shelf
-                            # and the land would re-bury it — the plan
-                            # rebuilds its own starting world verbatim
-                            # and the stage rung re-forms it forever (the
-                            # operator's four-beat parking carousel,
-                            # dwell 0, after sedan parks consumed the
-                            # blocker's dispose air). No such plan: the
-                            # room waits for a retrieve to free real air.
-                            # With a real e2_dst the plan is PRODUCTIVE
-                            # even though it un-stages: the buried empty
-                            # ends on top of another shelf and the next
-                            # stage is a single move.
-                            return None
-                        e2_dst = e2_dst or X
+                        if tgt_contents == "empty":
+                            # STAGE plan: the delivered empty IS the
+                            # staging. Never send it back toward the dig
+                            # shelf (the `or X` fallback rebuilt the
+                            # starting world verbatim — the operator's
+                            # four-beat parking carousel). Preferred:
+                            # hop it onto a spare carrier's hands — zero
+                            # shelf air spent, and the stage rung
+                            # re-delivers it in ONE move right after the
+                            # lands (carrier-held empties are staging
+                            # sources). At 0.9 fullness this is often
+                            # the only shape whose end state the oracle
+                            # accepts (a shelf park either consumes the
+                            # last air or collides with the land route).
+                            spare = next(
+                                (c for c in sorted(engine.state.carriers)
+                                 if c != holder and c != lift
+                                 and c not in land_chain
+                                 and c not in reserved_carriers
+                                 and sim.hands.get(c) is None
+                                 and ex.chain_between(lift, c) is not None
+                                 and len(ex.chain_between(lift, c)) <= 2),
+                                None)
+                            if spare is not None:
+                                sim.hands[lift] = None
+                                sim.hands[spare] = (target, "empty")
+                                holders[target] = spare
+                                hop_spare = spare
+                                sim.intents.append(Intent(
+                                    kind="park_delivered",
+                                    pallet_id=target, contents="empty",
+                                    dst_kind="carrier", dst_id=spare))
+                                self._sched(sim, ("carrier", lift),
+                                            ("carrier", spare), lift)
+                                cost += 10.0
+                                continue
+                            e2_dst = self._pick_empty_dst(
+                                sim, lift, requested,
+                                avoid=avoid_chain,
+                                exclude={X} | plan_shelves)
+                            if e2_dst is None:
+                                # Nowhere at all: no plan — the room
+                                # waits for a retrieve to free real air.
+                                return None
+                            # A real e2_dst is PRODUCTIVE even though it
+                            # un-stages: the buried empty ends on top of
+                            # another shelf and the next stage is a
+                            # single move.
+                        else:
+                            e2_dst = self._pick_empty_dst(
+                                sim, lift, requested,
+                                avoid=avoid_chain,
+                                exclude={X} | plan_shelves) or X
                         sim.hands[lift] = None
                         dq = sim.push(e2_dst, target, "empty")
                         sim.intents.append(Intent(
@@ -1336,6 +1412,22 @@ class RetrievalPlanner:
                     dst_seq=dq))
                 self._sched(sim, ("carrier", holder), ("shelf", X),
                             holder)
+
+        if hop_spare is not None:
+            # The staged empty was hopped onto a spare carrier so the lands
+            # could relay through the lift. Finish the job INSIDE the plan:
+            # re-deliver it once the lands are done. A plan-terminal hop
+            # leaves an un-owned empty on shuttle hands — observed wedging
+            # the whole facility when the only free slots sat behind that
+            # very shuttle (tiny month day 15: both lifts holding
+            # un-shelvable cars, every route to D1/D2 needing the loaded
+            # holder's hands).
+            sim.hands[hop_spare] = None
+            sim.intents.append(Intent(
+                kind="deliver", pallet_id=target, contents="empty",
+                dst_kind="room", dst_id=room, requires_lands_done=True))
+            self._sched(sim, ("carrier", hop_spare), ("room", room),
+                        hop_spare, via_lift=lift)
 
         return self._finish(sim, engine, target, room, lift, X,
                             {**holders, **sim.extraction_holds},

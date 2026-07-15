@@ -550,6 +550,27 @@ seed 7, three sedan parks → 398 moves per idle 2.5 sim-h, unbounded):
   groom stays quiet. (One-move simulation was too weak — the zombie
   regression world needs multi-step grooming through buried empties.)
 
+- **Target-hop (operator's second report: "at 0.9 the parked sedan
+  sometimes gets stuck"):** with the carousel plan refused, a room
+  whose only diggable empty sat under blockers could stay unstageable
+  even with pool empties available — every shelf park for the staged
+  empty either consumed the last air slot or collided with the land
+  route (`_pick_empty_dst` None in all 8 dig combos at 0.9 seed 3).
+  The stage plan now prefers hopping its delivered empty onto a spare
+  carrier's HANDS (zero shelf air; carrier-held empties are staging
+  sources, so the stage rung re-delivers it in one move right after
+  the lands). First cut left the hop PLAN-TERMINAL — an un-owned
+  empty on shuttle hands — and the tiny month wedged on day 15: both
+  lifts holding un-shelvable cars, the only free slots (D1/D2) behind
+  the loaded holder's own hands, groom silenced by the pending
+  stores; days 16-21 dead. The hop now finishes INSIDE the plan: a
+  final `deliver` intent gated by a new `requires_lands_done` flag
+  re-delivers the empty to the room once the lands are through — no
+  orphan can exist. At 0.9 every seed serves all five physically
+  servable sedans and waits only at true pool exhaustion
+  (free_empties 0); the old carousel world stages BOTH rooms; day 15
+  clean.
+
 - **Staging-starved rest excuse (found by the month re-run):** with
   the carousel plan gone, the day-12 geometry (four empties, all
   buried at depth 2, air too tight for the end-state oracle to fund
@@ -560,6 +581,40 @@ seed 7, three sedan parks → 398 moves per idle 2.5 sim-h, unbounded):
   (test_staging_starved_rest_is_not_a_wedge). The pre-fix months
   "passed" this geometry only because the carousel accidentally
   served stores during its momentary staged flickers.
+
+- **Two-empty relay (operator's third report, with the exact geometry
+  in hand):** one empty staging R1, the pool's other empty buried on a
+  shelf ONLY that same lift reaches, partner region dry — staging R2
+  requires the staged lift to park its own staging, dig the spare, and
+  relay it across a shuttle. Two blockers, found by tracing `_build`'s
+  exits: (1) room-destination plans kept the dig carrier in the
+  VOLATILE set ("the dig lift must be the delivery lift" assumption —
+  true for retrieves, false for plan_stage, whose room fixes the lift
+  while the empty lives where it lives): every dispose/hold chain the
+  cross-region dig needed was refused. Exempting xc unconditionally
+  broke gate 6 + the SUV steady state; the shipped license is
+  empty-target AND (own-region OR cross_region_ok), where the stage
+  rung grants cross_region_ok only at executor quiescence WITH a store
+  actually waiting — a customer at the door is what justifies
+  un-staging the partner room (overnight rest-relays alone measurably
+  perturbed gate-6 mornings, leftover 5 > 2). (2) the mandatory
+  hand-freeing's `_pick_empty_dst(avoid=avoid_chain)` could exclude
+  every shelf with air; parking onto the member's OWN shelf contends
+  with nobody and is now the fallback. Regression:
+  test_staged_lift_relays_buried_spare_to_partner_room (depth-2
+  variant; store served at every burial depth).
+
+- **Steal-with-self-restore (operator's fourth report: "looping when
+  there are 2 empty pallets"):** at two empties the cross-region stage
+  plan's park-own-staging → dig → re-stage dance repeated per park and
+  read as bouncing on screen (transient 3-cycles flagged at 0.85
+  seed 2). The steal-protection ("a staged room's empty is never a
+  staging source") was written for the one-empty ping-pong; it now
+  yields exactly when the victim lift can re-stage ITSELF in one move
+  (a free top empty on its own region's shelves) — relaying the held
+  empty across is then strictly better (2 rung moves vs 4+ plan
+  moves) and ping-pong is impossible by construction. Loop sweep:
+  0 hits (was 1).
 
 Diagnosis notes: `last_rung` is stale on plan-advance moves (rung
 starters only) — don't trust it when attributing loop moves; and the

@@ -864,6 +864,10 @@ class PlanSolver:
         state = self.engine.state
         if it.requires_target_off and not self._target_off_dig(plan):
             return None
+        if it.requires_lands_done and any(
+                i.kind in ("land", "extract_return") and i.status != "done"
+                for i in plan.intents):
+            return None
         if not self._shelf_ops_ready(plan, it):
             return None
         src = self._locate_free(it.pallet_id)
@@ -1091,7 +1095,24 @@ class PlanSolver:
                 # un-staging another — an infinite ping-pong relay (observed
                 # live on tiny_medipol at 0.9 fullness). Buried empties are
                 # reached via uncover / stage plans instead.
-                continue
+                # EXCEPTION — steal-with-self-restore: when the victim can
+                # re-stage ITSELF in one move (a top empty sits on its own
+                # region's shelves), relaying its held empty across is
+                # strictly better than the stage plan's park-dig-restage
+                # dance (2 rung moves vs 4+ plan moves; the pallet stops
+                # visibly bouncing shelf↔room at low empty counts).
+                # Ping-pong is impossible: the steal only fires with the
+                # one-move restore available, and after both rooms stage
+                # there is no source left.
+                restore = any(
+                    ss.stack and ss.stack[-1].is_empty
+                    and ss.stack[-1].id not in owned
+                    and ex.shelf_carrier(sid2) == cid
+                    and sid2 not in locked and sid2 not in ex.src_locked
+                    and sid2 not in ex.dst_locked
+                    for sid2, ss in self.engine.state.shelves.items())
+                if not restore:
+                    continue
             chain = ex.free_chain(cid, lift, holder=cid, avoid=reserved)
             if chain is None:
                 continue
@@ -1545,6 +1566,18 @@ class PlanSolver:
                 # Every empty is buried deeper than one move reaches: dig
                 # one out with a full stage plan (staging = retrieving an
                 # empty). Only while no retrieval competes for the lifts.
+                # Cross-region stage digs only at quiescence AND with a
+                # store actually waiting: with moves in flight or
+                # retrieves queued, a delivery is about to mint a hand
+                # empty anyway — and even overnight rest-staging via a
+                # cross-region relay measurably perturbs the next
+                # morning (gate 6 rolled cars over both ways). A
+                # customer at the door is what licenses un-staging the
+                # partner room for the relay.
+                quiet = (stores_pending
+                         and self.ex.n_inflight == 0
+                         and not any(isinstance(t, Retrieve)
+                                     for t in self.engine.queue.pending))
                 for rid in stage_rooms:
                     lift = self.serving[rid]
                     if lift in self.reserved_carriers():
@@ -1555,6 +1588,7 @@ class PlanSolver:
                         locked_shelves=self.locked_shelves(),
                         reserved_slots=self.pending_reserved_slots(),
                         owned_pallets=self.owned_pallets(),
+                        cross_region_ok=quiet,
                     )
                     if plan is None:
                         continue

@@ -607,3 +607,47 @@ def test_staging_starved_rest_is_not_a_wedge():
     res = rt.run(until_sim_time=rt.engine.state.time + 1800.0,
                  stuck_gap_s=180.0)
     assert not res.stuck, "staging-starved rest misread as a wedge"
+
+
+def test_staged_lift_relays_buried_spare_to_partner_room():
+    """Operator geometry: two empties total — one staging R1 (in L1's
+    hands), the other buried at the BOTTOM of a shelf only L1 reaches;
+    L2's region has none. Staging R2 requires L1 to park its own staging,
+    dig the spare out, and relay it across a shuttle to L2. The dig
+    carrier used to stay in the volatile set for room-destination plans
+    (the 'dig lift must be the delivery lift' assumption), refusing every
+    chain the dig needed — R2 stayed unstaged forever."""
+    from oos.sim.state import DockRef
+
+    rt = SolverRuntime(get_facility("tiny_medipol"), seed=0)
+    layout = {
+        "A1": ["small", "small", "small"], "A2": ["small", "small", "small"],
+        "A3": ["small", "small"], "A4": ["empty", "small", "small"],
+        "E1": ["small", "small", "small"], "E2": ["small", "small", "small"],
+        "E3": ["small", "small", "small"], "E4": ["small", "small"],
+        "B1": ["small", "small", "small"], "B2": ["small", "small", "small"],
+        "B3": ["small", "small", "small"], "B4": ["small", "small"],
+        "D1": ["small", "small", "small"], "D2": ["small", "small", "small"],
+        "D3": ["small", "small", "small"], "D4": ["small", "small", "small"],
+    }
+    nid = iter(range(1, 100))
+    for sid, contents in layout.items():
+        rt.engine.state.shelves[sid].stack = [
+            Pallet(id=next(nid), contents=c) for c in contents]
+    st = rt.engine.state
+    st.carriers["L1"].load = Pallet(id=90, contents="empty")
+    st.carriers["L1"].docked_at = DockRef(kind="room", id="R1")
+    st.carriers["L2"].load = None
+    st.carriers["L2"].docked_at = DockRef(kind="room", id="R2")
+
+    # a customer at the door is what licenses the cross-region relay
+    rt.engine.enqueue_store("small")
+    res = rt.run(until_sim_time=rt.engine.state.time + 3600.0,
+                 stuck_gap_s=1e9)
+    assert res.stores_served == 1, "store never served"
+    assert rt.solver.room_staged("R2") or rt.solver.room_staged("R1"), (
+        "no room staged after the relay")
+    m1 = rt.ex.completed_moves
+    rt.run(until_sim_time=rt.engine.state.time + 3600.0, stuck_gap_s=1e9)
+    assert rt.ex.completed_moves == m1, "churn at rest"
+    assert _solvable(rt)
