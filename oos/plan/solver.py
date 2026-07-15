@@ -1605,11 +1605,66 @@ class PlanSolver:
         against zero big air locked out the groom whose next move would
         have served them — the queue starved its own remedy.) Anything
         else pending — a small, a retrieve, an admissible big — means real
-        work is imminent and the groom stays out of the way."""
+        work is imminent and the groom stays out of the way.
+
+        Grooming is only licensed when it can actually FIX the refusal:
+        at a packed pool the oracle refuses bigs no matter how much raw
+        big air a declutter mints (spare-empty rule, counting floors), so
+        an unconditioned unlock turns one refused SUV into a perpetual
+        declutter↔placement carousel against the live store stream
+        (observed in the viz at 0.92 target: single pallets relocated
+        16 times while the SUV never admitted). Simulate the mint first;
+        if even the optimistic world stays inadmissible, stay quiet."""
         if not all(isinstance(t, Store) and t.size == "big" for t in pend):
             return False
+        if self.free_empties() < 1:
+            return False    # spare-empty rule refuses bigs regardless of air
         self._refresh_view_hooks()
-        return not self.oracle.admission_ok(self.ex.future_view(), "big")
+        if self.oracle.admission_ok(self.ex.future_view(), "big"):
+            return False    # admissible now: serving, not grooming, is next
+        return self._mint_would_admit()
+
+    def _mint_would_admit(self) -> bool:
+        """Optimistic-but-attainable bound on the groom's usefulness for a
+        refused big: at its fixpoint the groom has relocated non-bigs off
+        the big shelves onto free small slots (declutter for tops,
+        restore-evicts for buried ones — every move monotone). Build that
+        virtual end state, capacity-bounded by today's free small slots,
+        and ask the oracle. False = even a completed grooming campaign
+        leaves bigs inadmissible, so grooming must stay quiet (at a packed
+        pool the unconditioned unlock turned one refused SUV into a
+        perpetual declutter↔placement carousel against the live store
+        stream). One oracle call."""
+        state = self.engine.state
+        budget = sum(
+            sh.capacity - len(state.shelves[sid].stack)
+            for sid, sh in self.topo.shelves.items()
+            if sh.size_class != "big")
+        if budget <= 0:
+            return False
+        stacks = {sid: [p.contents for p in ss.stack]
+                  for sid, ss in state.shelves.items()}
+        moved: list[str] = []
+        for sid, sh in sorted(self.topo.shelves.items()):
+            if sh.size_class != "big" or budget <= 0:
+                continue
+            kept = []
+            for c in stacks[sid]:
+                if c != "big" and budget > 0:
+                    moved.append(c)
+                    budget -= 1
+                else:
+                    kept.append(c)
+            stacks[sid] = kept
+        if not moved:
+            return False
+        for sid, sh in sorted(self.topo.shelves.items()):
+            if sh.size_class == "big":
+                continue
+            while moved and len(stacks[sid]) < sh.capacity:
+                stacks[sid].append(moved.pop())
+        view2 = self.oracle.view_from(stacks, [], ())
+        return self.oracle.admission_ok(view2, "big")
 
     def _stranded_held_big(self) -> bool:
         """An idle unclaimed carrier holds a plan-less big while raw big
@@ -1846,8 +1901,20 @@ class PlanSolver:
             return True
         if all(t.size == "big" for t in pend):
             self._refresh_view_hooks()
-            return not self.oracle.admission_ok(self.ex.future_view(),
-                                                "big")
+            if not self.oracle.admission_ok(self.ex.future_view(), "big"):
+                return True
+        # Staging-starved rest: empties exist but every one is buried
+        # beyond the stage escalations' reach (no top empty anywhere, and
+        # the rungs' uncover/plan_stage retries keep coming up dry — at
+        # air this tight the end-state oracle refuses the digs). Stores
+        # must wait for a retrieve to mint a staging source; that is a
+        # legitimate rest, not a wedge (tiny month day 12: four empties
+        # all at depth 2, three queued smalls, retrieves due within the
+        # hour — the old carousel plan masked this state by accidentally
+        # serving during its staged flickers).
+        if not self._any_top_empty() \
+                and not any(self.room_staged(r) for r in self.room_ids):
+            return True
         return False
 
     def work_pending(self) -> bool:

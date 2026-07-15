@@ -19,10 +19,10 @@ here reproduces exactly.
 | Completeness (all experiments) | **0 undelivered requests, 0 wedges** across 95 single digs, 25 concurrent drains, service ops, groom, prefetch runs |
 | Evict contract (shelf unchanged minus target) | **15/15** |
 | Place contract (occupants untouched, car on top) | **15/15** |
-| 30-day endurance | **0 stuck days**, drained to zero every night but one (1 car rolled over once), 1 300 deliveries = 1 300 stores |
+| 30-day endurance | **0 stuck days**, drained to zero every night but one (1 car rolled over once), 1 297 deliveries = 1 297 stores |
 | 30-day charger rotations | **30/30** completed |
 | Latency drift over the month | none (day-1 ≈ day-30 percentiles) |
-| Wall-time cost | a full simulated month runs in **≈ 9 s** (~280 000× real time) |
+| Wall-time cost | a full simulated month runs in **≈ 6 s** (~430 000× real time) |
 | Acceptance battery (campus + all facilities) | 7/7 gates PASS |
 
 ---
@@ -157,16 +157,16 @@ random stored car onto an EV shelf).
 
 | Metric | Value |
 |---|---|
-| Deliveries = stores | 1 300 = 1 300 (conservation holds) |
-| SUVs refused at the door | 32 (rush-hour big-air limit; see D) |
+| Deliveries = stores | 1 297 = 1 297 (conservation holds) |
+| SUVs refused at the door | 35 (rush-hour big-air limit; see D) |
 | Stuck days / leftover days | **0** / 1 (one car rolled over day 1→2) |
-| Delivery latency p50 / p95 / max | 141 s / 442 s / 1 847 s |
+| Delivery latency p50 / p95 / max | 142 s / 422 s / 968 s |
 | Latency drift day 1 → day 30 | none (see m2) |
-| Replans (whole month) | 38 (≈ 1.3/day — plans are cheap to discard by design) |
-| Moves | 13 232 (≈ 10.2 moves/delivery-pair incl. staging + groom) |
-| Staged-room uptime | 88 % (dips only during rushes, by design) |
+| Replans (whole month) | 43 (≈ 1.4/day — plans are cheap to discard by design) |
+| Moves | 8 838 (≈ 6.8 moves/delivery-pair — the stage-plan carousel fix removed ~4 400 silent loop moves from this same month) |
+| Staged-room uptime | 90 % (dips only during rushes, by design) |
 | Charger rotations | 30/30 OK |
-| Wall time | **9 s** for 30 simulated days |
+| Wall time | **6 s** for 30 simulated days |
 
 **Reading the graphs for diagnosis:**
 

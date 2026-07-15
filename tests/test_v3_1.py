@@ -578,3 +578,32 @@ def test_stranded_held_big_unlocks_groom_despite_pending_store():
             arrived_at=rt.engine.state.time, size="small"))
     assert rt.solver._groom_allowed(), (
         "pending store silenced the groom during a stranded-big state")
+
+
+def test_staging_starved_rest_is_not_a_wedge():
+    """Every empty buried at depth 2, air too tight for the end-state
+    oracle to fund a stage dig, stores queued: the correct behavior is to
+    WAIT for a retrieve to mint a staging source — the liveness verdict
+    must excuse it (tiny month day 12; the pre-fix stage-plan carousel
+    masked this state by accidentally serving during staged flickers)."""
+    rt = SolverRuntime(get_facility("tiny_medipol"), seed=0)
+    layout = {   # the day-12 geometry, verbatim shape
+        "A1": ["empty", "big", "big"], "A2": ["empty", "big", "small"],
+        "A3": ["small", "small", "small"], "A4": ["small"],
+        "B1": ["big", "big", "big"], "B2": ["big", "big", "big"],
+        "B3": ["small", "small", "small"], "B4": ["small", "small", "small"],
+        "D1": ["big", "big", "small"], "D2": ["small", "small", "small"],
+        "D3": ["small", "small", "small"], "D4": ["small", "small", "small"],
+        "E1": ["small", "small"], "E2": ["empty", "small", "big"],
+        "E3": ["empty", "small", "small"], "E4": ["small", "small", "small"],
+    }
+    nid = iter(range(1, 100))
+    for sid, contents in layout.items():
+        rt.engine.state.shelves[sid].stack = [
+            Pallet(id=next(nid), contents=c) for c in contents]
+    # rooms deliberately UNSTAGED; no top empty exists anywhere
+    assert not rt.solver._any_top_empty()
+    rt.engine.enqueue_store("small")
+    res = rt.run(until_sim_time=rt.engine.state.time + 1800.0,
+                 stuck_gap_s=180.0)
+    assert not res.stuck, "staging-starved rest misread as a wedge"

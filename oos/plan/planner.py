@@ -1279,7 +1279,24 @@ class RetrievalPlanner:
                         e2_dst = self._pick_empty_dst(
                             sim, lift, requested,
                             avoid=avoid_chain,
-                            exclude={X} | plan_shelves) or X
+                            exclude={X} | plan_shelves)
+                        if tgt_contents == "empty" and e2_dst is None:
+                            # STAGE plan with nowhere else to put the
+                            # delivered empty: the `or X` fallback would
+                            # park the staging back onto the dig shelf
+                            # and the land would re-bury it — the plan
+                            # rebuilds its own starting world verbatim
+                            # and the stage rung re-forms it forever (the
+                            # operator's four-beat parking carousel,
+                            # dwell 0, after sedan parks consumed the
+                            # blocker's dispose air). No such plan: the
+                            # room waits for a retrieve to free real air.
+                            # With a real e2_dst the plan is PRODUCTIVE
+                            # even though it un-stages: the buried empty
+                            # ends on top of another shelf and the next
+                            # stage is a single move.
+                            return None
+                        e2_dst = e2_dst or X
                         sim.hands[lift] = None
                         dq = sim.push(e2_dst, target, "empty")
                         sim.intents.append(Intent(

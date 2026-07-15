@@ -23,8 +23,8 @@ tiny_medipol, ~9× the slot count.
 | Evict contract (shelf unchanged minus target) | **15/15** |
 | Place contract (occupants untouched, car on top) | **15/15** |
 | 30-day endurance | **0 stuck days**, 30/30 charger rotations, month ends at 0 cars on-site (conservation exact) |
-| Saturated-evening rollover | 17 of 30 nights carry cars to the next morning — demand physics, quantified below |
-| Wall-time cost | 30 simulated days in **≈ 26 min** (~1 700× real time) |
+| Saturated-evening rollover | 15 of 30 nights carry cars to the next morning — demand physics, quantified below |
+| Wall-time cost | 30 simulated days in **≈ 17 min** (~2 500× real time) |
 | Acceptance battery | 7/7 gates PASS (gates 4–6 run on campus) |
 
 ---
@@ -156,15 +156,15 @@ role: evict the occupant if any, place a random stored car).
 
 | Metric | Value |
 |---|---|
-| Stores / deliveries | 10 789 / 10 817 (rotation-window completions count in the physical ledger only; final leftover **0**) |
-| SUVs refused at the door | 910 (rush-hour big-air scarcity; steady-state acceptance is D's ≥ 90 %) |
+| Stores / deliveries | 10 825 = 10 825 (conservation exact; final leftover **0**) |
+| SUVs refused at the door | 960 (rush-hour big-air scarcity; steady-state acceptance is D's ≥ 90 %) |
 | Stuck days | **0** |
-| Nights fully drained / rolled over | 13 / 17 |
-| Delivery latency p50 / p95 / max | 3 811 s / 50 755 s / 60 786 s (queueing — see the regime note) |
-| Replans (whole month) | 1 488 (≈ 50/day at 380 tasks/day) |
-| Moves | 66 422 |
-| Staged-room uptime | 76 % (rush dips by design) |
-| Charger rotations | 30/30 OK (05:00 evicts mostly found the shelves already empty — occupants leave with the evening rush; op latency is covered by experiment E) |
+| Nights fully drained / rolled over | 15 / 15 |
+| Delivery latency p50 / p95 / max | 4 101 s / 9 824 s / 60 100 s (queueing — see the regime note) |
+| Replans (whole month) | 1 491 (≈ 50/day at 380 tasks/day) |
+| Moves | 66 665 |
+| Staged-room uptime | 77 % (rush dips by design) |
+| Charger rotations | 30/30 OK (the 05:00 ops mostly found nothing to do — occupants leave with the evening rush; op latency is covered by experiment E) |
 
 **The saturated-evening regime (expected, by construction).** Campus
 runs the same protocol as tiny_medipol, and at target 0.8 that
@@ -175,9 +175,10 @@ then dominates the day's latency percentiles — the rush queue runs
 2+ hours deep, so the month-wide p50 sits near ~an hour while
 experiment A shows 76–134 s service latency for an uncontended dig.
 tiny_medipol's identical protocol only loads its ceiling to ~40 %,
-which is why its month reads 141 s p50. The p95 ≈ 12 h outliers are
+which is why its month reads 142 s p50. The max ≈ 17 h outliers are
 rollover cars (requested in the evening, delivered next morning) on
-nights the queue didn't fully drain. **Capacity rule:** for a commuter
+nights the queue didn't fully drain; p95 sits at ~2.7 h of rush
+queueing. **Capacity rule:** for a commuter
 profile, size the fleet so `stored cars / rush window ≤ drain
 ceiling` — campus at 0.8 needs either ~2× lifts/rooms or a rush window
 twice as wide.

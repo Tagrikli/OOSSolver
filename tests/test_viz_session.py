@@ -296,3 +296,38 @@ def test_reroll_clears_stale_solver_state():
         assert started, (
             f"roll {roll}: no move started after re-roll "
             f"(stale claims={list(solver.ex.claimed)})")
+
+
+def test_stage_plan_never_parks_its_own_staging():
+    """Operator repro (dwell 0, fullness ~0.78, sedan parks): when the only
+    spare empty is buried under a big whose dispose air the parks consumed,
+    the stage plan held the blocker and then parked its OWN delivered
+    empty back onto the dig shelf to free the land relay — rebuilding the
+    exact starting world and looping forever (deliver -> un-stage -> land
+    -> un-land, 300+ moves/idle-hour). Such a plan must not exist; the
+    room waits instead."""
+    s = Session("tiny_medipol")
+    s.reroll_layout(fullness=0.779, seed=7)
+    s.set_serve_dwell(0.0)
+    s.set_speed(60.0)
+    s.play()
+    for _ in range(6):
+        s._hb_t = 0.0
+        s.tick(0.5)
+    ex = s.bridge.solver.ex
+    for _ in range(3):
+        s.enqueue_store("small")
+        for i in range(120):
+            s._hb_t = 0.0
+            s.tick(0.5)
+            if s.pending_store_count() == 0 and ex.n_inflight == 0:
+                break
+    for i in range(60):
+        s._hb_t = 0.0
+        s.tick(0.5)
+    m0 = ex.completed_moves
+    for i in range(300):
+        s._hb_t = 0.0
+        s.tick(0.5)
+    assert ex.completed_moves - m0 <= 2, (
+        f"idle carousel: {ex.completed_moves - m0} moves at rest")

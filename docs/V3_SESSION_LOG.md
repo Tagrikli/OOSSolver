@@ -510,3 +510,61 @@ window; predicate unit-tested). One earlier misread corrected: the
 stranded-big state was actually observed in any month run. The full
 campaign (campus month + A-G, tiny all) re-ran on the final build for
 the published reports. Battery 7/7, 69/69 tests.
+
+## Viz parking carousel (operator report, 2026-07-15)
+
+"Severe loops in tiny_medipol and campus when i try to park a car" —
+carriers bouncing shelf ↔ handoff ↔ shelf forever, surviving zero
+demand. Reproduced deterministically (Session, dwell 0, fullness 0.779,
+seed 7, three sedan parks → 398 moves per idle 2.5 sim-h, unbounded):
+
+- **Root cause (planner):** the sedan parks consumed the big-shelf
+  dispose air, so the stage plan for the next room dug its buried empty
+  out from under a big by HOLDING the big on a shuttle. The hold's land
+  chain relays through the delivery lift — which, post-delivery, holds
+  the staged empty. The land-route freeing logic emitted
+  `park_delivered` for it, and `_pick_empty_dst(... exclude={X}) or X`
+  fell back to the excluded dig shelf itself. Net plan: dig the empty,
+  stage the room, un-stage the empty back onto the dig shelf, land the
+  big on top — the exact starting world, so the stage rung rebuilt the
+  identical plan forever (zero replans; the executor's anti-undo memory
+  only covers rung moves, and per-move each step was legal). Fix, refined after a first blunt
+  attempt wedged tiny month day 12 (refusing the plan outright left
+  both rooms unstageable all morning): the plan shape is only
+  pathological through the `or X` FALLBACK — parked to any OTHER
+  shelf, the "un-staging" plan productively uncovers the buried empty
+  so the next stage is a single move. Stage targets now forbid only
+  the dig-shelf fallback: with a real alternative destination the
+  two-phase uncover-then-stage runs; with none, no plan — the room
+  waits for a retrieve to free real air
+  (test_stage_plan_never_parks_its_own_staging).
+- **Second carousel closed while hunting (groom licensing):** the
+  campus-month groom unlock (`_only_unservable_bigs`) licensed grooming
+  whenever a queued big was refused — but at a packed pool the oracle
+  refuses bigs no matter how much raw big air a declutter mints, so a
+  zombie SUV + a live store stream re-polluting the big shelves =
+  perpetual declutter↔placement ping-pong. `_mint_would_admit` now
+  builds the groom's capacity-bounded FIXPOINT view (all non-bigs off
+  big shelves, bounded by free small slots) and asks the oracle once:
+  if even a completed grooming campaign leaves bigs inadmissible, the
+  groom stays quiet. (One-move simulation was too weak — the zombie
+  regression world needs multi-step grooming through buried empties.)
+
+- **Staging-starved rest excuse (found by the month re-run):** with
+  the carousel plan gone, the day-12 geometry (four empties, all
+  buried at depth 2, air too tight for the end-state oracle to fund
+  any stage dig) becomes an honest wait — retrieves due within the
+  hour mint the staging source — but the liveness verdict aborted it.
+  `overload_quiescent` now also recognizes all-pending-stores + no
+  staged room + no top empty anywhere as legitimate rest
+  (test_staging_starved_rest_is_not_a_wedge). The pre-fix months
+  "passed" this geometry only because the carousel accidentally
+  served stores during its momentary staged flickers.
+
+Diagnosis notes: `last_rung` is stale on plan-advance moves (rung
+starters only) — don't trust it when attributing loop moves; and the
+first "reproduction" (314 moves/5 sim-h at target 0.918) was actually
+the configured setpoint churn (~65 moves/h of legitimate exchange
+traffic) — always compare observed motion against configured demand
+before calling it a loop. Battery 7/7, 70/70 tests; both months re-run
+clean on the final build.
