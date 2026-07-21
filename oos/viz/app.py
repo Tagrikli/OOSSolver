@@ -279,30 +279,31 @@ def run_app(facility: str | None = None) -> None:
                                   horizontal_scrollbar=True):
                 dpg.add_drawlist(width=900, height=600, tag="canvas")
             with dpg.child_window(width=PANEL_W, height=-1, tag="controls"):
-                dpg.add_text("STATUS", color=HEAD)
-                with dpg.group(tag="status_grp"):
-                    dpg.add_text("", tag="st_state", wrap=PANEL_W - 20)
-                    dpg.add_text("", tag="st_fac")
-                    dpg.add_text("", tag="st_cap")
-                    dpg.add_text("", tag="st_sedans", color=C_SEDAN)
-                    dpg.add_text("", tag="st_suvs", color=C_SUV)
-                    dpg.add_text("", tag="st_take_s")
-                    dpg.add_text("", tag="st_take_b")
-                    dpg.add_text("", tag="st_wait_s", color=C_SEDAN)
-                    dpg.add_text("", tag="st_wait_b", color=C_SUV)
-                    dpg.add_text("", tag="st_wait_r", color=C_REQ)
-                    dpg.add_text("", tag="st_drop")
-                    dpg.add_text("", tag="full_state", wrap=PANEL_W - 20)
-                    dpg.add_text("RETRIEVALS (since reset, seconds)", color=HEAD)
-                    dpg.add_text("", tag="st_stat_sedan", color=C_SEDAN)
-                    dpg.add_text("", tag="st_stat_suv", color=C_SUV)
-                    dpg.add_text("", tag="st_stat_total")
-                    dpg.add_text("SERVICE (turn came → delivered, seconds)",
-                                 color=HEAD)
-                    dpg.add_text("", tag="st_srv_sedan", color=C_SEDAN)
-                    dpg.add_text("", tag="st_srv_suv", color=C_SUV)
-                    dpg.add_text("", tag="st_srv_total")
-                dpg.bind_item_theme("status_grp", "tight_theme")
+                with dpg.collapsing_header(label="STATUS", default_open=True,
+                                           tag="status_hdr"):
+                    with dpg.group(tag="status_grp"):
+                        dpg.add_text("", tag="st_state", wrap=PANEL_W - 20)
+                        dpg.add_text("", tag="st_fac")
+                        dpg.add_text("", tag="st_cap")
+                        dpg.add_text("", tag="st_sedans", color=C_SEDAN)
+                        dpg.add_text("", tag="st_suvs", color=C_SUV)
+                        dpg.add_text("", tag="st_take_s")
+                        dpg.add_text("", tag="st_take_b")
+                        dpg.add_text("", tag="st_wait_s", color=C_SEDAN)
+                        dpg.add_text("", tag="st_wait_b", color=C_SUV)
+                        dpg.add_text("", tag="st_wait_r", color=C_REQ)
+                        dpg.add_text("", tag="st_drop")
+                        dpg.add_text("", tag="full_state", wrap=PANEL_W - 20)
+                        dpg.add_text("RETRIEVALS (since reset, seconds)", color=HEAD)
+                        dpg.add_text("", tag="st_stat_sedan", color=C_SEDAN)
+                        dpg.add_text("", tag="st_stat_suv", color=C_SUV)
+                        dpg.add_text("", tag="st_stat_total")
+                        dpg.add_text("SERVICE (turn came → delivered, seconds)",
+                                     color=HEAD)
+                        dpg.add_text("", tag="st_srv_sedan", color=C_SEDAN)
+                        dpg.add_text("", tag="st_srv_suv", color=C_SUV)
+                        dpg.add_text("", tag="st_srv_total")
+                    dpg.bind_item_theme("status_grp", "tight_theme")
 
                 dpg.add_separator()
                 dpg.add_text("FACILITY", color=HEAD)
@@ -320,74 +321,77 @@ def run_app(facility: str | None = None) -> None:
                 dpg.add_text("", tag="status", wrap=PANEL_W - 20, color=DIM)
 
                 dpg.add_separator()
-                dpg.add_text("DEMAND  (you are the customer)", color=HEAD)
-                with dpg.group(horizontal=True):
-                    dpg.add_button(label="+1 sedan", callback=on_store_small, width=82)
-                    dpg.add_button(label="+5", callback=_store_n(5, "small"), width=48)
-                    dpg.add_button(label="+10", callback=_store_n(10, "small"), width=48)
-                    dpg.add_button(label="+20", callback=_store_n(20, "small"), width=-1)
-                with dpg.group(horizontal=True):
-                    dpg.add_button(label="+1 SUV", callback=on_store_big,
-                                   width=82, tag="store_big_btn")
-                    dpg.add_button(label="+2", callback=_store_n(2, "big"), width=48)
-                    dpg.add_button(label="+5", callback=_store_n(5, "big"), width=48)
-                    dpg.add_button(label="+10", callback=_store_n(10, "big"), width=-1)
-                with dpg.group(horizontal=True):
-                    dpg.add_text("request random")
-                    dpg.add_button(label="1", callback=_req_n(1), width=36)
-                    dpg.add_button(label="3", callback=_req_n(3), width=36)
-                    dpg.add_button(label="5", callback=_req_n(5), width=36)
-                    dpg.add_button(label="10", callback=_req_n(10), width=-1)
-                with dpg.group(horizontal=True):
-                    dpg.add_button(label="RUSH-OUT (all)", callback=on_rush_out, width=170)
-                    dpg.add_button(label="Clear queue", callback=on_clear, width=-1)
-                dpg.add_slider_float(
-                    label="customer dwell (s)", default_value=vs.serve_dwell,
-                    min_value=0.0, max_value=180.0, format="%.0f s",
-                    callback=on_dwell, width=-120, tag="serve_dwell")
-                dpg.add_text("click a pallet on the canvas → request it", color=DIM)
-                dpg.add_text("hover a car:  E = evict · P = arm place,\n"
-                             "then click the destination shelf", color=DIM)
+                with dpg.collapsing_header(label="DEMAND  (you are the customer)",
+                                           default_open=True, tag="demand_hdr"):
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="+1 sedan", callback=on_store_small, width=82)
+                        dpg.add_button(label="+5", callback=_store_n(5, "small"), width=48)
+                        dpg.add_button(label="+10", callback=_store_n(10, "small"), width=48)
+                        dpg.add_button(label="+20", callback=_store_n(20, "small"), width=-1)
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="+1 SUV", callback=on_store_big,
+                                       width=82, tag="store_big_btn")
+                        dpg.add_button(label="+2", callback=_store_n(2, "big"), width=48)
+                        dpg.add_button(label="+5", callback=_store_n(5, "big"), width=48)
+                        dpg.add_button(label="+10", callback=_store_n(10, "big"), width=-1)
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("request random")
+                        dpg.add_button(label="1", callback=_req_n(1), width=36)
+                        dpg.add_button(label="3", callback=_req_n(3), width=36)
+                        dpg.add_button(label="5", callback=_req_n(5), width=36)
+                        dpg.add_button(label="10", callback=_req_n(10), width=-1)
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(label="RUSH-OUT (all)", callback=on_rush_out, width=170)
+                        dpg.add_button(label="Clear queue", callback=on_clear, width=-1)
+                    dpg.add_slider_float(
+                        label="customer dwell (s)", default_value=vs.serve_dwell,
+                        min_value=0.0, max_value=180.0, format="%.0f s",
+                        callback=on_dwell, width=-120, tag="serve_dwell")
+                    dpg.add_text("click a pallet on the canvas → request it", color=DIM)
+                    dpg.add_text("hover a car:  E = evict · P = arm place,\n"
+                                 "then click the destination shelf", color=DIM)
 
                 dpg.add_separator()
-                dpg.add_text("AUTO WORLD  (set-point)", color=HEAD)
-                dpg.add_checkbox(label="auto-world", default_value=vs.auto_arrivals,
-                                 callback=on_auto, tag="auto")
-                dpg.add_slider_float(label="target fullness", default_value=vs.target_fullness,
-                                     min_value=0.0, max_value=1.0,
-                                     callback=on_world, width=-120, tag="target_full")
-                dpg.add_slider_float(label="change rate", default_value=vs.change_rate,
-                                     min_value=0.0, max_value=1.0,
-                                     callback=on_world, width=-120, tag="change_rate")
-                dpg.add_slider_float(label="dynamicity", default_value=vs.dynamicity,
-                                     min_value=0.0, max_value=1.0,
-                                     callback=on_world, width=-120, tag="dynamicity")
-                dpg.add_slider_float(label="SUV rate", default_value=vs.suv_rate,
-                                     min_value=0.0, max_value=1.0,
-                                     callback=on_world, width=-120, tag="suv_rate")
-                dpg.add_checkbox(label="random room", default_value=vs.random_room,
-                                 callback=on_random_room, tag="random_room")
-                dpg.add_text("", tag="world_hint", color=C_WARN, wrap=PANEL_W - 20)
-                dpg.add_text("fullness marches to the target at the change-rate\n"
-                             "pace; dynamicity = constant in-out exchange on top\n"
-                             "(1 = doors saturated, visits get short)",
-                             color=DIM, wrap=PANEL_W - 20)
+                with dpg.collapsing_header(label="AUTO WORLD  (set-point)",
+                                           default_open=True, tag="auto_hdr"):
+                    dpg.add_checkbox(label="auto-world", default_value=vs.auto_arrivals,
+                                     callback=on_auto, tag="auto")
+                    dpg.add_slider_float(label="target fullness", default_value=vs.target_fullness,
+                                         min_value=0.0, max_value=1.0,
+                                         callback=on_world, width=-120, tag="target_full")
+                    dpg.add_slider_float(label="change rate", default_value=vs.change_rate,
+                                         min_value=0.0, max_value=1.0,
+                                         callback=on_world, width=-120, tag="change_rate")
+                    dpg.add_slider_float(label="dynamicity", default_value=vs.dynamicity,
+                                         min_value=0.0, max_value=1.0,
+                                         callback=on_world, width=-120, tag="dynamicity")
+                    dpg.add_slider_float(label="SUV rate", default_value=vs.suv_rate,
+                                         min_value=0.0, max_value=1.0,
+                                         callback=on_world, width=-120, tag="suv_rate")
+                    dpg.add_checkbox(label="random room", default_value=vs.random_room,
+                                     callback=on_random_room, tag="random_room")
+                    dpg.add_text("", tag="world_hint", color=C_WARN, wrap=PANEL_W - 20)
+                    dpg.add_text("fullness marches to the target at the change-rate\n"
+                                 "pace; dynamicity = constant in-out exchange on top\n"
+                                 "(1 = doors saturated, visits get short)",
+                                 color=DIM, wrap=PANEL_W - 20)
 
                 dpg.add_separator()
-                dpg.add_text("LAYOUT", color=HEAD)
-                dpg.add_slider_float(label="fullness", default_value=vs.fullness, min_value=0.0,
-                                     max_value=1.0, width=-70, tag="fullness")
-                dpg.add_button(label="Re-roll layout", callback=on_reroll, width=-1)
-                dpg.add_checkbox(label="show legend", default_value=True,
-                                 callback=lambda _s, v, _u: ui.__setitem__("legend", v))
-                dpg.add_text("mouse-wheel over canvas → scale horizontally", color=DIM)
+                with dpg.collapsing_header(label="LAYOUT", default_open=True,
+                                           tag="layout_hdr"):
+                    dpg.add_slider_float(label="fullness", default_value=vs.fullness, min_value=0.0,
+                                         max_value=1.0, width=-70, tag="fullness")
+                    dpg.add_button(label="Re-roll layout", callback=on_reroll, width=-1)
+                    dpg.add_checkbox(label="show legend", default_value=True,
+                                     callback=lambda _s, v, _u: ui.__setitem__("legend", v))
+                    dpg.add_text("mouse-wheel over canvas → scale horizontally", color=DIM)
 
                 dpg.add_separator()
                 dpg.add_text("EVENT LOG", color=HEAD)
-                # Fixed height: the controls column scrolls as a whole, so a
-                # stretch (-1) here would collapse to nothing once the STATUS
-                # block grew. ~17 rows visible, the rest scroll inside.
-                with dpg.child_window(height=330, tag="logbox"):
+                # Stretch (-1) to fill the rest of the panel: collapse the
+                # sections above to hand the log more room. It still scrolls
+                # inside, so a fully-expanded panel just shows fewer rows.
+                with dpg.child_window(height=-1, tag="logbox"):
                     for i in range(LOG_LINES):
                         dpg.add_text("", tag=f"log{i}", wrap=PANEL_W - 30)
                 dpg.bind_item_theme("logbox", "tight_theme")
@@ -752,7 +756,8 @@ def _redraw(session: Session, ui: dict) -> None:
 
 
 def _draw_legend(geom) -> None:
-    """Fixed color key in the canvas's bottom-left corner."""
+    """Fixed key in the canvas's bottom-left corner: color swatches (left
+    column) and the full keyboard / mouse bindings (right column)."""
     rows = [
         ("fill", PALLET["empty"], "empty pallet"),
         ("fill", PALLET["small"], "sedan  (S)"),
@@ -767,8 +772,20 @@ def _draw_legend(geom) -> None:
         ("edge", SHELF_BIG, "big (SUV) shelf"),
         ("edge", SHELF_EV, "EV charger shelf"),
     ]
+    # Mirrors the handler_registry bindings + the canvas mouse actions.
+    keys = [
+        ("Space", "play / pause"),
+        ("S", "step one command"),
+        ("R", "reset"),
+        ("click", "request the pallet"),
+        ("E", "evict hovered car"),
+        ("P", "arm place, click shelf"),
+        ("wheel", "scale canvas (zoom)"),
+    ]
     row_h, sw = 17.0, 13.0
-    w, h = 178.0, len(rows) * row_h + 12.0
+    col2 = 190.0                          # right-column offset from the box left
+    w = 384.0
+    h = max(len(rows), len(keys) + 1) * row_h + 12.0
     x0, y0 = 8.0, geom.height - h - 8.0
     dpg.draw_rectangle((x0, y0), (x0 + w, y0 + h), fill=(10, 6, 24, 215),
                        color=DIM, thickness=1, parent="canvas")
@@ -781,4 +798,12 @@ def _draw_legend(geom) -> None:
             dpg.draw_rectangle((x0 + 7, ry + 1), (x0 + 7 + sw, ry + 1 + sw),
                                color=col, thickness=2, parent="canvas")
         dpg.draw_text((x0 + 26, ry), label, size=13, color=TEXT,
+                      parent="canvas")
+    # right column: keyboard / mouse bindings (key = yellow, action = text)
+    kx = x0 + col2
+    dpg.draw_text((kx, y0 + 7.0), "KEYS", size=13, color=HEAD, parent="canvas")
+    for i, (key, action) in enumerate(keys):
+        ry = y0 + 7.0 + (i + 1) * row_h
+        dpg.draw_text((kx, ry), key, size=13, color=HEAD, parent="canvas")
+        dpg.draw_text((kx + 48, ry), action, size=13, color=TEXT,
                       parent="canvas")
